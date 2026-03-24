@@ -1,0 +1,14 @@
+[package]
+name = "covert"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "libcovert"
+crate-type = ["cdylib"]
+
+[dependencies]
+etherparse = "0.19.0"
+serde = { version = "1.0.228", features = ["derive"] }
+socket2 = { version = "0.6.3", features = ["all"] }
+toml = "1.0.7"
