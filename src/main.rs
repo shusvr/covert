@@ -1,14 +1,12 @@
-#![allow(unused, dead_code)]
-
-use etherparse::{IcmpEchoHeader, Icmpv4Header, Icmpv4Slice, Icmpv4Type, IpSlice, PacketBuilder};
+use etherparse::{IcmpEchoHeader, Icmpv4Header, Icmpv4Slice, Icmpv4Type, IpSlice};
 use serde::{Deserialize, Deserializer};
-use socket2::{Domain, MaybeUninitSlice, Protocol, SockAddr, SockAddrStorage, Socket, Type};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
     env::args,
     error::Error,
     fs::read_to_string,
-    mem::{MaybeUninit, transmute},
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket},
+    mem::MaybeUninit,
+    net::{Ipv4Addr, SocketAddrV4, UdpSocket},
     str::FromStr,
     sync::Arc,
 };
@@ -16,8 +14,6 @@ use std::{
 #[derive(Debug, Deserialize)]
 struct Config {
     id: u16,
-    #[serde(deserialize_with = "read_addr")]
-    source: Ipv4Addr,
     #[serde(deserialize_with = "read_addr")]
     destination: Ipv4Addr,
     inbound_port: u16,
@@ -35,7 +31,7 @@ fn outbound(cfg: Arc<Config>, udp: UdpSocket, icmp: Socket) {
 
     let mut i = 1;
     loop {
-        let (len, from) = match udp.recv_from(&mut buf) {
+        let (len, _from) = match udp.recv_from(&mut buf) {
             Ok(x) => x,
             Err(e) => {
                 eprintln!("ERR: {e}");
@@ -55,7 +51,9 @@ fn outbound(cfg: Arc<Config>, udp: UdpSocket, icmp: Socket) {
         packet.resize(header.header_len() + payload.len(), 0);
         packet.clear();
 
-        header.write(&mut packet);
+        header
+            .write(&mut packet)
+            .expect("Failed to write icmp packet");
         packet.extend_from_slice(payload);
 
         let addr = SockAddr::from(SocketAddrV4::new(cfg.destination, 0));
@@ -70,7 +68,7 @@ fn outbound(cfg: Arc<Config>, udp: UdpSocket, icmp: Socket) {
 fn inbound(cfg: Arc<Config>, udp: UdpSocket, icmp: Socket) {
     let mut buf = MaybeUninit::<[u8; 1500]>::zeroed();
     loop {
-        let (len, from) = icmp
+        let (len, _from) = icmp
             .recv_from(buf.as_mut())
             .expect("Failed to recv from icmp");
 
@@ -80,7 +78,7 @@ fn inbound(cfg: Arc<Config>, udp: UdpSocket, icmp: Socket) {
 
         let [a, b, c, d] = x.bytes5to8();
         let id = ((a as u16) << 8) | (b as u16);
-        let seq = ((c as u16) << 8) | (d as u16);
+        let _seq = ((c as u16) << 8) | (d as u16);
 
         if id == cfg.id {
             let wg_packet = x.payload();
@@ -106,8 +104,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let t2 = std::thread::spawn(move || inbound(cfg, udp, icmp));
 
-    t1.join();
-    t2.join();
+    t1.join().unwrap();
+    t2.join().unwrap();
 
     Ok(())
 }
