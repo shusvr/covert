@@ -15,12 +15,13 @@ use std::{
 
 #[derive(Debug, Deserialize)]
 struct Config {
+    id: u16,
     #[serde(deserialize_with = "read_addr")]
     source: Ipv4Addr,
     #[serde(deserialize_with = "read_addr")]
-    endpoint: Ipv4Addr,
-    listen_port: u16,
-    wg_port: u16,
+    destination: Ipv4Addr,
+    inbound_port: u16,
+    outbound_port: u16,
 }
 
 fn read_addr<'de, D: Deserializer<'de>>(de: D) -> Result<Ipv4Addr, D::Error> {
@@ -29,8 +30,11 @@ fn read_addr<'de, D: Deserializer<'de>>(de: D) -> Result<Ipv4Addr, D::Error> {
 }
 
 fn outbound(cfg: Arc<Config>, udp: UdpSocket, icmp: Socket) {
+    let mut buf = [0; 1500];
+    let mut packet = Vec::with_capacity(1500);
+
+    let mut i = 1;
     loop {
-        let mut buf = [0; 1500];
         let (len, from) = match udp.recv_from(&mut buf) {
             Ok(x) => x,
             Err(e) => {
@@ -43,14 +47,18 @@ fn outbound(cfg: Arc<Config>, udp: UdpSocket, icmp: Socket) {
         let payload = &buf[..len];
 
         let header = Icmpv4Header::with_checksum(
-            Icmpv4Type::EchoRequest(IcmpEchoHeader { id: 3, seq: 1337 }),
+            Icmpv4Type::EchoRequest(IcmpEchoHeader { id: cfg.id, seq: i }),
             payload,
         );
-        let mut packet = Vec::with_capacity(header.header_len() + payload.len());
+        i += 1;
+
+        packet.resize(header.header_len() + payload.len(), 0);
+        packet.clear();
+
         header.write(&mut packet);
         packet.extend_from_slice(payload);
 
-        let addr = SockAddr::from(SocketAddrV4::new(cfg.endpoint, 0));
+        let addr = SockAddr::from(SocketAddrV4::new(cfg.destination, 0));
 
         match icmp.send_to(&packet, &addr) {
             Ok(_) => println!("Sent ICMP: plen={}", payload.len()),
@@ -70,12 +78,13 @@ fn inbound(cfg: Arc<Config>, udp: UdpSocket, icmp: Socket) {
         let ip = IpSlice::from_slice(packet).unwrap();
         let x = Icmpv4Slice::from_slice(ip.payload().payload).unwrap();
 
-        let [_, _, a, b] = x.bytes5to8();
-        let seq = ((a as u16) << 8) | (b as u16);
+        let [a, b, c, d] = x.bytes5to8();
+        let id = ((a as u16) << 8) | (b as u16);
+        let seq = ((c as u16) << 8) | (d as u16);
 
-        if seq == 1337 {
+        if id == cfg.id {
             let wg_packet = x.payload();
-            udp.send_to(wg_packet, (Ipv4Addr::LOCALHOST, cfg.wg_port))
+            udp.send_to(wg_packet, (Ipv4Addr::LOCALHOST, cfg.outbound_port))
                 .unwrap();
         }
     }
@@ -85,14 +94,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cfg_path = args().nth(1).expect("Expected config name");
     let cfg = Arc::new(toml::from_str::<Config>(&read_to_string(&cfg_path)?)?);
 
-    let udp = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, cfg.listen_port))?;
+    let udp = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, cfg.inbound_port))?;
     let icmp = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?;
 
-    let cfg2 = cfg.clone();
-    let udp2 = udp.try_clone()?;
-    let icmp2 = icmp.try_clone()?;
+    let t1 = std::thread::spawn({
+        let cfg = cfg.clone();
+        let udp = udp.try_clone()?;
+        let icmp = icmp.try_clone()?;
+        move || outbound(cfg, udp, icmp)
+    });
 
-    let t1 = std::thread::spawn(move || outbound(cfg2, udp2, icmp2));
     let t2 = std::thread::spawn(move || inbound(cfg, udp, icmp));
 
     t1.join();
