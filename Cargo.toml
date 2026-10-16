@@ -1,0 +1,21 @@
+[package]
+name = "covert"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+aws-lc-rs = "1.18.2"
+base64 = "0.23.1"
+dotenvy = "0.15.7"
+etherparse = "0.21.0"
+ipnet = { version = "2.12.2", features = ["serde"] }
+kameo = "0.22.2"
+serde = { version = "1.0.229", features = ["derive"] }
+socket2 = "0.6.5"
+tokio = { version = "1.53.1", features = ["full"] }
+toml = "1.1.5"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+tun = { package = "tun-rs", version = "2.8.9", features = ["async"] }
+uuid = { version = "1.28.0", features = ["v4"] }
