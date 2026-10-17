@@ -1,7 +1,8 @@
 use base64::prelude::*;
+use covert::transport::udp::{UdpTransportConfig, UdpTransportPeerConfig};
 use ipnet::IpNet;
 use serde::Deserialize;
-use std::{fmt::Debug, net::IpAddr};
+use std::{collections::HashMap, fmt::Debug, net::IpAddr};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -15,11 +16,13 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Interface {
-    #[serde(alias = "addresses", deserialize_with = "deserialize_addrs")]
-    pub address: Vec<IpNet>,
+    #[serde(alias = "Address", deserialize_with = "deserialize_addrs")]
+    pub addresses: Vec<IpNet>,
     #[serde(default = "default_mtu")]
     pub mtu: u16,
     pub private_key: PrivKey,
+
+    pub transport: Transport,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -28,8 +31,36 @@ pub struct Peer {
     #[serde(skip, default = "random_uuid")]
     pub peer_id: Uuid,
     pub public_key: PubKey,
+    pub pre_shared_key: Option<PrivKey>,
     #[serde(rename = "AllowedIPs", deserialize_with = "deserialize_addrs")]
     pub allowed_ips: Vec<IpNet>,
+    pub transport: PeerTransport,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum Transport {
+    Udp {
+        udp: UdpTransportConfig,
+    },
+    Other {
+        id: String,
+        #[serde(flatten)]
+        values: HashMap<String, toml::Value>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum PeerTransport {
+    Udp {
+        udp: UdpTransportPeerConfig,
+    },
+    Other {
+        id: String,
+        #[serde(flatten)]
+        values: HashMap<String, toml::Value>,
+    },
 }
 
 fn deserialize_addrs<'de, D>(deserializer: D) -> Result<Vec<IpNet>, D::Error>
