@@ -14,7 +14,7 @@ fastrand = "2.5.0"
 ipnet = { version = "2.12.2", features = ["serde"] }
 kameo = "0.22.2"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_urlencoded = "0.7.1"
+# serde_urlencoded = "0.7.1"
 socket2 = "0.6.5"
 thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["full"] }

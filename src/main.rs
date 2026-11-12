@@ -77,7 +77,10 @@ async fn main() -> Result<()> {
         .build_async()
         .context("failed to create a tun device")?;
 
-    let (_tun_out_tx, mut tun_out_rx) = mpsc::channel::<Bytes>(24);
+    const CHAN_LEN: usize = 512;
+
+    let (_tun_out_tx, mut tun_out_rx) = mpsc::channel::<Bytes>(CHAN_LEN);
+    let (tun_in_tx, _tun_in_rx) = mpsc::channel::<Bytes>(CHAN_LEN);
 
     let mut tun_buf = vec![0; config.interface.mtu as usize];
     loop {
@@ -85,7 +88,8 @@ async fn main() -> Result<()> {
             result = tun.recv(&mut tun_buf) => match result {
                 Ok(len) => {
                     debug!(len, "Received packet on tun");
-                    let _packet = &tun_buf[len];
+                    let packet = Bytes::copy_from_slice(&tun_buf[..len]);
+                    tun_in_tx.send(packet).await?;
                 }
                 Err(err) => error!("Failed to receive on tun: {err}"),
             },
