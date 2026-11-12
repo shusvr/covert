@@ -1,13 +1,20 @@
+use crate::transport::{
+    icmp::{IcmpTransportConfig, IcmpTransportPeerConfig},
+    udp::{UdpTransportConfig, UdpTransportPeerConfig},
+};
 use base64::prelude::*;
-use covert::transport::udp::{UdpTransportConfig, UdpTransportPeerConfig};
 use ipnet::IpNet;
 use serde::Deserialize;
-use std::{collections::HashMap, fmt::Debug, net::IpAddr};
+use std::{collections::HashMap, fmt::Debug, net::IpAddr, sync::Arc};
 use uuid::Uuid;
+
+pub type ArcConfig = Arc<Config>;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Config {
+    #[serde(skip, default)]
+    pub dev_name: String,
     pub interface: Interface,
     #[serde(rename = "Peer", default)]
     pub peers: Vec<Peer>,
@@ -43,6 +50,9 @@ pub enum Transport {
     Udp {
         udp: UdpTransportConfig,
     },
+    Icmp {
+        icmp: IcmpTransportConfig,
+    },
     Other {
         id: String,
         #[serde(flatten)]
@@ -55,6 +65,9 @@ pub enum Transport {
 pub enum PeerTransport {
     Udp {
         udp: UdpTransportPeerConfig,
+    },
+    Icmp {
+        icmp: IcmpTransportPeerConfig,
     },
     Other {
         id: String,

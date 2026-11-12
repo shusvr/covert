@@ -12,6 +12,7 @@ clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15.7"
 etherparse = "0.21.0"
 fastrand = "2.5.0"
+futures = "0.3.34"
 ipnet = { version = "2.12.2", features = ["serde"] }
 kameo = "0.22.2"
 serde = { version = "1.0.229", features = ["derive"] }

@@ -17,3 +17,5 @@ fn default_listen_port() -> u16 {
 pub struct UdpTransportPeerConfig {
     endpoint: Option<SocketAddr>,
 }
+
+async fn create_udp_transport(udp: UdpTransportPeerConfig) {}

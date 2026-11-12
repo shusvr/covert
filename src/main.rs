@@ -4,14 +4,18 @@ use anyhow::{Context, Result, bail};
 use base64::prelude::*;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
-use covert::crypto::{pk_to_bytes, random_sk, sk_to_bytes};
-use std::{fs, path::PathBuf, sync::Arc};
+use covert::{
+    config::{ArcConfig, Config, PeerTransport, Transport},
+    crypto::{pk_to_bytes, random_sk, sk_to_bytes},
+};
+use etherparse::{NetHeaders, PacketHeaders};
+use std::{
+    fs,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    path::{Path, PathBuf},
+};
 use tokio::sync::mpsc;
 use tracing::{debug, error};
-
-use crate::config::{PeerTransport, Transport};
-
-mod config;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -54,8 +58,8 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run(conf_path: PathBuf) -> Result<()> {
-    let file_name = conf_path
+fn read_config(path: &Path) -> anyhow::Result<ArcConfig> {
+    let file_name = path
         .file_name()
         .unwrap()
         .to_str()
@@ -72,15 +76,14 @@ async fn run(conf_path: PathBuf) -> Result<()> {
         bail!("Config file name must be [a-zA-Z0-9_=+.-]")
     }
 
-    if !conf_path.is_file() {
+    if !path.is_file() {
         bail!("Config is not a valid file or doesn't exit");
     }
 
-    let conf_text = fs::read_to_string(&conf_path).context("failed to read the file")?;
-    let config: Arc<config::Config> = toml::from_str::<config::Config>(&conf_text)
-        .context("invalid config")?
-        .into();
-    debug!(path=?conf_path, "Config: {config:#?}");
+    let conf_text = fs::read_to_string(&path).context("failed to read the file")?;
+    let mut config = toml::from_str::<Config>(&conf_text).context("invalid config")?;
+    config.dev_name = file_name.strip_suffix(".toml").unwrap().to_owned();
+    debug!(?path, "Config: {config:#?}");
 
     for p in &config.peers {
         let matches = match (&config.interface.transport, &p.transport) {
@@ -94,9 +97,14 @@ async fn run(conf_path: PathBuf) -> Result<()> {
         }
     }
 
+    Ok(config.into())
+}
+
+async fn run(conf_path: PathBuf) -> Result<()> {
+    let config = read_config(&conf_path)?;
     let mut builder = tun::DeviceBuilder::new()
         .mtu(config.interface.mtu)
-        .name(file_name.strip_suffix(".toml").unwrap())
+        .name(&config.dev_name)
         .layer(tun::Layer::L3)
         .enable(true);
 
@@ -113,8 +121,10 @@ async fn run(conf_path: PathBuf) -> Result<()> {
 
     const CHAN_LEN: usize = 512;
 
-    let (_tun_out_tx, mut tun_out_rx) = mpsc::channel::<Bytes>(CHAN_LEN);
-    let (tun_in_tx, _tun_in_rx) = mpsc::channel::<Bytes>(CHAN_LEN);
+    let (tun_out_tx, tun_out_rx) = mpsc::channel::<Bytes>(CHAN_LEN);
+    let (tun_in_tx, mut tun_in_rx) = mpsc::channel::<Bytes>(CHAN_LEN);
+
+    tokio::spawn(reader_task(config.clone(), tun_out_rx));
 
     let mut tun_buf = vec![0; config.interface.mtu as usize];
     loop {
@@ -123,16 +133,50 @@ async fn run(conf_path: PathBuf) -> Result<()> {
                 Ok(len) => {
                     debug!(len, "Received packet on tun");
                     let packet = Bytes::copy_from_slice(&tun_buf[..len]);
-                    tun_in_tx.send(packet).await?;
+                    tun_out_tx.send(packet).await?;
                 }
                 Err(err) => error!("Failed to receive on tun: {err}"),
             },
             // wack
-            opt = tun_out_rx.recv() => if let Some(packet) = opt {
+            opt = tun_in_rx.recv() => if let Some(packet) = opt {
+                debug!(len=packet.len(), "Received packet to tun");
+
                 tun.send(&packet).await?;
             } else {
                 break Ok(())
             }
+        }
+    }
+}
+
+async fn process_tun_packet(config: &Config, packet: Bytes) -> Result<()> {
+    let parsed = PacketHeaders::from_ip_slice(&packet)?;
+    let net = parsed.net.unwrap();
+    let dst = match net {
+        NetHeaders::Ipv4(ipv4, _) => IpAddr::V4(Ipv4Addr::from_octets(ipv4.destination)),
+        NetHeaders::Ipv6(ipv6, _) => IpAddr::V6(Ipv6Addr::from_octets(ipv6.destination)),
+        _ => unreachable!(),
+    };
+
+    for p in config.peers.iter() {
+        if p.allowed_ips.iter().any(|x| x.contains(&dst)) {
+            // todo send packet to peer
+        }
+    }
+
+    Ok(())
+}
+
+async fn reader_task(config: ArcConfig, mut tun_out_rx: mpsc::Receiver<Bytes>) {
+    loop {
+        let Some(packet) = tun_out_rx.recv().await else {
+            debug!("tun_out_rx was closed, exiting reader task");
+            break;
+        };
+
+        let len = packet.len();
+        if let Err(err) = process_tun_packet(&config, packet).await {
+            error!(packet_len = len, "process_tun_packet error: {err}");
         }
     }
 }

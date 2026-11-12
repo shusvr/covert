@@ -290,6 +290,7 @@ dependencies = [
  "dotenvy",
  "etherparse",
  "fastrand",
+ "futures",
  "ipnet",
  "kameo",
  "serde",
