@@ -192,6 +192,7 @@ dependencies = [
  "bytes",
  "dotenvy",
  "etherparse",
+ "fastrand",
  "ipnet",
  "kameo",
  "serde",

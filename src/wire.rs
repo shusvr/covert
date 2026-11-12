@@ -1,9 +1,8 @@
-use std::io;
-
 use crate::crypto::{Initiating, Replying};
 
 use bytes::{Buf, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
+use std::io;
 use thiserror::Error;
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -26,7 +25,7 @@ pub enum Grease {
     },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PacketLayout {
     #[serde(rename = "m")]
     pub mask: u32, // general field mask
@@ -38,8 +37,6 @@ pub struct PacketLayout {
     pub od_non: usize, // (data) offset of nonce
     pub od_dl: usize,  // (data) offset of data length
     pub od_d: usize,   // (data) offset of data itself
-    #[serde(rename = "g")]
-    pub grease: Vec<Grease>,
 }
 
 impl PacketLayout {
@@ -55,20 +52,10 @@ impl PacketLayout {
             r(self.od_dl, 4),
         ];
 
-        let grease_ranges = self
-            .grease
-            .iter()
-            .map(|g| match g {
-                Grease::Fixed { at, len } => r(*at, *len),
-                Grease::Vary { at, min: _, max } => r(*at, *max),
-            })
-            .collect::<Vec<_>>();
-
         // Data has a variable length, so reserve everything from od_d onward.
         if self.o_ty >= self.od_d
             || ranges[4..6]
                 .iter()
-                .chain(&grease_ranges)
                 .any(|range| range.start < range.end && range.end > self.od_d)
         {
             return Err("data overlaps packet fields");
@@ -82,13 +69,11 @@ impl PacketLayout {
         for group in [0..2, 2..4, 4..6] {
             for (i, r1) in ranges[group.clone()]
                 .iter()
-                .chain(&grease_ranges)
                 .chain(std::iter::once(&ty_range))
                 .enumerate()
             {
                 for (j, r2) in ranges[group.clone()]
                     .iter()
-                    .chain(&grease_ranges)
                     .chain(std::iter::once(&ty_range))
                     .enumerate()
                 {
@@ -132,7 +117,6 @@ impl Default for PacketLayout {
             od_non: 1,
             od_dl: 1 + 12,
             od_d: 1 + 12 + 4,
-            grease: vec![],
         }
     }
 }
@@ -147,6 +131,8 @@ pub enum Packet {
 pub enum Error {
     #[error("Received unexpected packet type {0}")]
     UnexpectedTy(u8),
+    #[error("Tried encoding a packet that is too large")]
+    PacketOverflow,
     #[error("Io: {0}")]
     Io(#[from] io::Error),
 }
@@ -205,6 +191,67 @@ pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet,
     }
 }
 
+/// Appends a packet using layout-relative offsets, randomizing unused bytes.
+/// The layout must have passed `PacketLayout::check`.
+pub fn append(buf: &mut BytesMut, packet: Packet, layout: &PacketLayout) -> Result<(), Error> {
+    let ty_end = layout.o_ty.checked_add(1).ok_or(Error::PacketOverflow)?;
+    let (ty, len) = match &packet {
+        Packet::Initiating(_) => (0, layout.ilen().max(ty_end)),
+        Packet::Reply(_) => (1, layout.rlen().max(ty_end)),
+        Packet::Data { data, .. } => {
+            u32::try_from(data.len()).map_err(|_| Error::PacketOverflow)?;
+            let len = layout
+                .od_d
+                .checked_add(data.len())
+                .ok_or(Error::PacketOverflow)?
+                .max(layout.od_non.checked_add(12).ok_or(Error::PacketOverflow)?)
+                .max(layout.od_dl.checked_add(4).ok_or(Error::PacketOverflow)?)
+                .max(ty_end);
+            (2, len)
+        }
+    };
+    let start = buf.len();
+    let end = start.checked_add(len).ok_or(Error::PacketOverflow)?;
+    buf.resize(end, 0);
+    fastrand::fill(&mut buf[start..end]);
+    let out = &mut buf[start..end];
+    out[layout.o_ty] = ty ^ layout.mask as u8;
+    match packet {
+        Packet::Initiating(Initiating {
+            enc_pub_key,
+            ephemeral,
+        }) => {
+            put_masked_at(out, layout.oi_eph, &ephemeral, layout.mask);
+            put_masked_at(out, layout.oi_epk, &enc_pub_key, layout.mask);
+        }
+        Packet::Reply(Replying { enc_ts, eph }) => {
+            put_masked_at(out, layout.or_eph, &eph, layout.mask);
+            put_masked_at(out, layout.or_ets, &enc_ts, layout.mask);
+        }
+        Packet::Data { nonce, data } => {
+            put_masked_at(out, layout.od_non, &nonce, layout.mask);
+            put_masked_at(
+                out,
+                layout.od_dl,
+                &(data.len() as u32).to_be_bytes(),
+                layout.mask,
+            );
+            out[layout.od_d..layout.od_d + data.len()].copy_from_slice(&data);
+        }
+    }
+    Ok(())
+}
+
+fn put_masked_at(buf: &mut [u8], pos: usize, value: &[u8], mask: u32) {
+    for ((dst, src), mask) in buf[pos..pos + value.len()]
+        .iter_mut()
+        .zip(value)
+        .zip(mask.to_be_bytes().iter().cycle())
+    {
+        *dst = *src ^ *mask;
+    }
+}
+
 fn get_masked_at<const N: usize>(buf: &[u8], pos: usize, mask: u32) -> Option<[u8; N]> {
     let mut k: [u8; N] = buf.get(pos..)?.get(..N)?.try_into().ok()?;
     for (b, m) in k.iter_mut().zip(mask.to_be_bytes().iter().cycle()) {
@@ -231,7 +278,7 @@ impl Encoder<Packet> for Codec {
     type Error = Error;
 
     fn encode(&mut self, item: Packet, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        todo!()
+        append(dst, item, &self.layout)
     }
 }
 
@@ -291,24 +338,6 @@ mod tests {
             };
             assert!(layout.check().is_err(), "type offset {o_ty}");
         }
-        for grease in [
-            Grease::Fixed { at: 81, len: 4 },
-            Grease::Vary {
-                at: 81,
-                min: 1,
-                max: 4,
-            },
-        ] {
-            let mut layout = PacketLayout {
-                o_ty: 84,
-                od_d: 100,
-                grease: vec![grease],
-                ..PacketLayout::default()
-            };
-            assert!(layout.check().is_err());
-            layout.o_ty = 85;
-            assert!(layout.check().is_ok());
-        }
     }
 
     #[test]
@@ -325,24 +354,6 @@ mod tests {
             ..PacketLayout::default()
         };
         assert!(layout.check().is_err());
-
-        for grease in [
-            Grease::Fixed { at: 81, len: 4 },
-            Grease::Vary {
-                at: 81,
-                min: 1,
-                max: 4,
-            },
-        ] {
-            let mut layout = PacketLayout {
-                od_d: 84,
-                grease: vec![grease],
-                ..PacketLayout::default()
-            };
-            assert!(layout.check().is_err());
-            layout.od_d = 85;
-            assert!(layout.check().is_ok());
-        }
     }
 
     #[test]
@@ -415,5 +426,74 @@ mod tests {
             Err(Error::UnexpectedTy(3))
         ));
         assert_eq!(&src[..], &[3]);
+    }
+
+    #[test]
+    fn test_encode_round_trip() {
+        for mask in [0, 0x12345678] {
+            let mut codec = Codec {
+                layout: PacketLayout {
+                    mask,
+                    o_ty: 2,
+                    oi_eph: 5,
+                    oi_epk: 40,
+                    or_eph: 6,
+                    or_ets: 40,
+                    od_non: 5,
+                    od_dl: 20,
+                    od_d: 28,
+                },
+            };
+            codec.layout.check().unwrap();
+            let mut buf = BytesMut::from(&b"prefix"[..]);
+            codec
+                .encode(
+                    Packet::Initiating(Initiating {
+                        enc_pub_key: [8; 48],
+                        ephemeral: [7; 32],
+                    }),
+                    &mut buf,
+                )
+                .unwrap();
+            codec
+                .encode(
+                    Packet::Reply(Replying {
+                        enc_ts: [10; 24],
+                        eph: [9; 32],
+                    }),
+                    &mut buf,
+                )
+                .unwrap();
+            for data in [Bytes::from_static(b"payload"), Bytes::new()] {
+                codec
+                    .encode(
+                        Packet::Data {
+                            nonce: [11; 12],
+                            data,
+                        },
+                        &mut buf,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(&buf.split_to(6)[..], b"prefix");
+            let Some(Packet::Initiating(packet)) = codec.decode(&mut buf).unwrap() else {
+                panic!("expected initiation")
+            };
+            assert_eq!(packet.enc_pub_key, [8; 48]);
+            assert_eq!(packet.ephemeral, [7; 32]);
+            let Some(Packet::Reply(packet)) = codec.decode(&mut buf).unwrap() else {
+                panic!("expected reply")
+            };
+            assert_eq!(packet.enc_ts, [10; 24]);
+            assert_eq!(packet.eph, [9; 32]);
+            for expected in [&b"payload"[..], &b""[..]] {
+                let Some(Packet::Data { nonce, data }) = codec.decode(&mut buf).unwrap() else {
+                    panic!("expected data")
+                };
+                assert_eq!(nonce, [11; 12]);
+                assert_eq!(data, expected);
+            }
+            assert!(buf.is_empty());
+        }
     }
 }
