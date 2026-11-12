@@ -11,6 +11,10 @@ use aws_lc_rs::{
     rand::SystemRandom,
 };
 
+pub fn random_sk() -> Result<PrivateKey, Unspecified> {
+    PrivateKey::generate(&X25519)
+}
+
 pub fn to_sk(k: &Key) -> PrivateKey {
     PrivateKey::from_private_key(&X25519, k).unwrap()
 }

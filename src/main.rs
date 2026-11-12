@@ -1,8 +1,11 @@
 #![allow(dead_code)]
 
 use anyhow::{Context, Result, bail};
+use base64::prelude::*;
 use bytes::Bytes;
-use std::{env::args, fs, path::PathBuf, sync::Arc};
+use clap::{Parser, Subcommand};
+use covert::crypto::{pk_to_bytes, random_sk, sk_to_bytes};
+use std::{fs, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc;
 use tracing::{debug, error};
 
@@ -10,17 +13,48 @@ use crate::config::{PeerTransport, Transport};
 
 mod config;
 
+#[derive(Parser)]
+#[command(version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run the tunnel with a TOML configuration file.
+    Run { config: PathBuf },
+    /// Generate a base64-encoded X25519 private and public key pair.
+    Genkey,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
     _ = dotenvy::dotenv();
     tracing_subscriber::fmt::init();
 
-    let conf_path: PathBuf = args()
-        .nth(1)
-        .expect("config path is required")
-        .try_into()
-        .expect("not a valid path");
+    match cli.command {
+        Command::Run { config } => run(config).await,
+        Command::Genkey => {
+            let private_key = random_sk().context("failed to generate private key")?;
+            let public_key = private_key
+                .compute_public_key()
+                .context("failed to derive public key")?;
+            println!(
+                "Private key: {}",
+                BASE64_STANDARD.encode(sk_to_bytes(&private_key))
+            );
+            println!(
+                "Public key: {}",
+                BASE64_STANDARD.encode(pk_to_bytes(&public_key))
+            );
+            Ok(())
+        }
+    }
+}
 
+async fn run(conf_path: PathBuf) -> Result<()> {
     let file_name = conf_path
         .file_name()
         .unwrap()
