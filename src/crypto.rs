@@ -30,8 +30,8 @@ pub fn sk_to_bytes(sk: &PrivateKey) -> Key {
 
 #[derive(Debug)]
 pub struct Initiating {
-    enc_pub_key: SealedKey,
-    ephemeral: Key,
+    pub(crate) enc_pub_key: SealedKey,
+    pub(crate) ephemeral: Key,
 }
 
 pub fn initiate(local_sk: &Key, remote_pk: &Key) -> Result<Initiating, Unspecified> {
@@ -96,8 +96,8 @@ pub fn pre_reply(
 
 #[derive(Debug)]
 pub struct Replying {
-    enc_ts: SealedTimestamp,
-    eph: Key,
+    pub(crate) enc_ts: SealedTimestamp,
+    pub(crate) eph: Key,
 }
 
 pub fn post_reply(
