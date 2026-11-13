@@ -16,7 +16,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::mpsc;
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -137,7 +137,7 @@ async fn run(conf_path: PathBuf, chanlen: Option<u16>) -> Result<()> {
         tokio::select! {
             result = tun.recv(&mut tun_buf) => match result {
                 Ok(len) => {
-                    debug!(len, "Received packet on tun");
+                    trace!(len, "Received packet on tun");
 
                     if let Err(err) = process_tun_packet(&state, &config, &mut listener, &tun_buf[..len]).await {
                         error!("Failed to process tun packet: {err}");
@@ -147,7 +147,7 @@ async fn run(conf_path: PathBuf, chanlen: Option<u16>) -> Result<()> {
             },
             // wack
             opt = tun_in_rx.recv() => if let Some(packet) = opt {
-                debug!(len=packet.len(), "Received packet to tun");
+                trace!(len=packet.len(), "Received packet to tun");
 
                 tun.send(&packet).await?;
             } else {

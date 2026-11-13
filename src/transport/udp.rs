@@ -13,9 +13,12 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime},
 };
-use tokio::net::UdpSocket;
+use tokio::{
+    net::UdpSocket,
+    time::{MissedTickBehavior, interval},
+};
 use tokio_util::udp::UdpFramed;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -42,7 +45,7 @@ pub struct UdpListener {
 
 impl UdpListener {
     pub async fn initiate(&mut self, state: &State, config: &Config, peer_id: Uuid) -> Result<()> {
-        debug!(?peer_id, "Initiating");
+        debug!(?peer_id, "Handshake initiation requested");
 
         let Some(addr) = self.peer_addresses.get(&peer_id).map(|e| *e.value()) else {
             debug!(
@@ -52,12 +55,10 @@ impl UdpListener {
             return Ok(());
         };
 
-        if let Some(when) = state.peering.get(&peer_id).map(|p| p.when)
-            && when.elapsed() < Duration::from_secs(20)
-        {
+        if has_live_connection(state, peer_id) {
             debug!(
                 ?peer_id,
-                "Initiated within last 20 seconds, skipping another initiation attempt"
+                "Peer already has a live connection, skipping initiation"
             );
             return Ok(());
         }
@@ -85,11 +86,13 @@ impl UdpListener {
                     initiating.clone(),
                 ),
             );
+            debug!(?peer_id, remote_addr = %addr, local_idx = sender_idx, "Sending handshake initiation");
             let packet = Packet::Initiating(initiating);
             if let Err(err) = self.framed.send((packet, addr)).await {
                 state.initiated.remove(&sender_idx);
                 return Err(err.into());
             }
+            debug!(?peer_id, remote_addr = %addr, local_idx = sender_idx, "Handshake initiation sent");
         } else {
             warn!(?peer_id, "Trying to initiate by unknown peer id");
         }
@@ -184,6 +187,28 @@ pub(super) async fn create_udp_listener(
     })
 }
 
+fn has_live_connection(state: &State, peer_id: Uuid) -> bool {
+    let index = state.peering.get(&peer_id).map(|entry| entry.index);
+    index
+        .and_then(|index| state.established.get(&index))
+        .is_some_and(|handle| handle.handle.upgrade().is_some())
+}
+
+async fn initiate_disconnected_peers(listener: &mut UdpListener, state: &State, config: &Config) {
+    state
+        .initiated
+        .retain(|_, pending| pending.when.elapsed() < Duration::from_secs(60));
+    for peer in &config.peers {
+        if listener.peer_addresses.contains_key(&peer.peer_id)
+            && !has_live_connection(state, peer.peer_id)
+        {
+            if let Err(err) = listener.initiate(state, config, peer.peer_id).await {
+                error!(peer_id = ?peer.peer_id, "Failed to initiate handshake: {err}");
+            }
+        }
+    }
+}
+
 async fn socket_listener_task(
     state: Arc<State>,
     socket: Arc<UdpSocket>,
@@ -191,26 +216,30 @@ async fn socket_listener_task(
     peer_addresses: Arc<DashMap<Uuid, SocketAddr>>,
 ) {
     let mut framed = UdpFramed::new(socket.clone(), Codec::new(PacketLayout::default()));
+    let mut outgoing = UdpListener {
+        framed: UdpFramed::new(socket, Codec::new(PacketLayout::default())),
+        peer_addresses: peer_addresses.clone(),
+    };
+    let mut retries = interval(Duration::from_secs(5));
+    retries.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
-        if let Some(result) = framed.next().await {
-            match result {
-                Ok((packet, addr)) => {
-                    debug!(?addr, "Received a packet on udp socket");
-
-                    if let Err(err) = process_incoming(
-                        &state,
-                        &mut framed,
-                        &config,
-                        &peer_addresses,
-                        packet,
-                        addr,
-                    )
-                    .await
-                    {
-                        error!("Failed to process incoming packet: {err}");
+        tokio::select! {
+            _ = retries.tick() => {
+                initiate_disconnected_peers(&mut outgoing, &state, &config).await;
+            }
+            result = framed.next() => {
+                match result {
+                    Some(Ok((packet, addr))) => {
+                        trace!(?addr, "Received a packet on udp socket");
+                        if let Err(err) = process_incoming(
+                            &state, &mut framed, &config, &peer_addresses, packet, addr,
+                        ).await {
+                            error!("Failed to process incoming packet: {err}");
+                        }
                     }
+                    Some(Err(err)) => error!("Failed to parse the packet on udp socket: {err}"),
+                    None => break,
                 }
-                Err(err) => error!("Failed to parse the packet on udp socket: {err}"),
             }
         }
     }
@@ -227,6 +256,7 @@ async fn process_incoming(
 ) -> Result<()> {
     match packet {
         Packet::Initiating(initiating) => {
+            debug!(remote_addr = %from, remote_idx = initiating.sender_idx, "Handshake initiation received");
             let (remote_pk, timestamp) = pre_reply(
                 &config.interface.private_key.0,
                 initiating.enc_pub_key,
@@ -243,6 +273,8 @@ async fn process_incoming(
                 warn!(?pubkey, "Received initiating from an unknown peer");
                 return Ok(());
             };
+
+            debug!(peer_id = ?peer.peer_id, remote_addr = %from, remote_idx = initiating.sender_idx, timestamp, "Handshake initiation accepted");
 
             // Established sessions are indexed by our own index, not the sender's.
             let local_idx = state.peering.get(&peer.peer_id).map(|entry| entry.index);
@@ -267,9 +299,17 @@ async fn process_incoming(
             let peering = Peering::new(sender_idx);
             state.peering.insert(peer.peer_id, peering);
 
+            debug!(peer_id = ?peer.peer_id, remote_addr = %from, local_idx = sender_idx,
+                remote_idx = initiating.sender_idx, "Sending handshake reply");
             framed.send((Packet::Reply(replying), from)).await?;
+            debug!(peer_id = ?peer.peer_id, remote_addr = %from, local_idx = sender_idx,
+                remote_idx = initiating.sender_idx, "Handshake reply sent");
+            debug!(peer_id = ?peer.peer_id, remote_addr = %from, local_idx = sender_idx,
+                remote_idx = initiating.sender_idx, role = "responder", "Connection established");
         }
         Packet::Reply(replying) => {
+            debug!(remote_addr = %from, local_idx = replying.receiver_idx,
+                remote_idx = replying.sender_idx, "Handshake reply received");
             let Some((_, initiated)) = state.initiated.remove(&replying.receiver_idx) else {
                 warn!(
                     receiver_idx = replying.receiver_idx,
@@ -302,6 +342,9 @@ async fn process_incoming(
             state.established.insert(replying.receiver_idx, handle);
             let peering = Peering::new(replying.receiver_idx);
             state.peering.insert(initiated.peer_id, peering);
+            debug!(peer_id = ?initiated.peer_id, remote_addr = %from,
+                local_idx = replying.receiver_idx, remote_idx = replying.sender_idx,
+                role = "initiator", "Connection established");
         }
         Packet::Data {
             receiver_idx,
@@ -349,172 +392,4 @@ async fn process_incoming(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        config::{Interface, ListenerConfig, Peer, PeerTransport},
-        crypto::{pk_to_bytes, random_sk, sk_to_bytes},
-    };
-    use tokio::{sync::mpsc, time::timeout};
-
-    fn config(local_sk: crate::Key, remote_pk: crate::Key, endpoint: SocketAddr) -> Config {
-        Config {
-            dev_name: String::new(),
-            interface: Interface {
-                addresses: vec![],
-                mtu: 1460,
-                private_key: local_sk.into(),
-                listener: ListenerConfig::Udp {
-                    udp: UdpListenerConfig { port: 0 },
-                },
-            },
-            peers: vec![Peer {
-                peer_id: Uuid::new_v4(),
-                public_key: remote_pk.into(),
-                pre_shared_key: Some([7; 32].into()),
-                allowed_ips: vec![],
-                transport: PeerTransport::Udp {
-                    udp: UdpTransportPeerConfig {
-                        endpoint: Some(endpoint),
-                    },
-                },
-            }],
-        }
-    }
-
-    async fn receive(listener: &mut UdpListener) -> (Packet, SocketAddr) {
-        timeout(Duration::from_secs(3), listener.framed.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
-        let socket_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let socket_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let key_a = random_sk().unwrap();
-        let key_b = random_sk().unwrap();
-        let config_a = config(
-            sk_to_bytes(&key_a),
-            pk_to_bytes(&key_b.compute_public_key().unwrap()),
-            socket_b.local_addr().unwrap(),
-        );
-        let config_b = config(
-            sk_to_bytes(&key_b),
-            pk_to_bytes(&key_a.compute_public_key().unwrap()),
-            socket_a.local_addr().unwrap(),
-        );
-        let peer_a = config_a.peers[0].peer_id;
-        let peer_b = config_b.peers[0].peer_id;
-        let (tx_a, mut rx_a) = mpsc::channel(4);
-        let (tx_b, mut rx_b) = mpsc::channel(4);
-        let state_a = Arc::new(State::new(tx_a));
-        let state_b = Arc::new(State::new(tx_b));
-        let mut a = UdpListener {
-            framed: UdpFramed::new(socket_a, Codec::new(PacketLayout::default())),
-            peer_addresses: Arc::new(
-                [(peer_a, socket_b.local_addr().unwrap())]
-                    .into_iter()
-                    .collect(),
-            ),
-        };
-        let mut b = UdpListener {
-            framed: UdpFramed::new(socket_b, Codec::new(PacketLayout::default())),
-            peer_addresses: Arc::new(DashMap::new()),
-        };
-
-        a.initiate(&state_a, &config_a, peer_a).await.unwrap();
-        let (packet, from) = receive(&mut b).await;
-        let Packet::Initiating(ref initiation) = packet else {
-            panic!("expected initiation")
-        };
-        let local_a = initiation.sender_idx;
-        assert!(state_a.initiated.contains_key(&local_a));
-        process_incoming(
-            &state_b,
-            &mut b.framed,
-            &config_b,
-            &b.peer_addresses,
-            packet,
-            from,
-        )
-        .await
-        .unwrap();
-        let (packet, from) = receive(&mut a).await;
-        let Packet::Reply(ref reply) = packet else {
-            panic!("expected reply")
-        };
-        let local_b = reply.sender_idx;
-        assert_eq!(reply.receiver_idx, local_a);
-        process_incoming(
-            &state_a,
-            &mut a.framed,
-            &config_a,
-            &a.peer_addresses,
-            packet,
-            from,
-        )
-        .await
-        .unwrap();
-        assert!(state_a.initiated.is_empty());
-        assert_eq!(state_a.peering.get(&peer_a).unwrap().index, local_a);
-        assert_eq!(state_b.peering.get(&peer_b).unwrap().index, local_b);
-        assert_eq!(
-            state_a.established.get(&local_a).unwrap().receiver_idx,
-            local_b
-        );
-        assert_eq!(
-            state_b.established.get(&local_b).unwrap().receiver_idx,
-            local_a
-        );
-
-        a.transmit(&state_a, &config_a, peer_a, b"hello")
-            .await
-            .unwrap();
-        let (packet, from) = receive(&mut b).await;
-        assert!(matches!(packet, Packet::Data { receiver_idx, .. } if receiver_idx == local_b));
-        process_incoming(
-            &state_b,
-            &mut b.framed,
-            &config_b,
-            &b.peer_addresses,
-            packet,
-            from,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            timeout(Duration::from_secs(3), rx_b.recv())
-                .await
-                .unwrap()
-                .unwrap(),
-            b"hello"
-        );
-
-        assert_eq!(*b.peer_addresses.get(&peer_b).unwrap(), from);
-        b.transmit(&state_b, &config_b, peer_b, b"reply")
-            .await
-            .unwrap();
-        let (packet, from) = receive(&mut a).await;
-        assert!(matches!(packet, Packet::Data { receiver_idx, .. } if receiver_idx == local_a));
-        process_incoming(
-            &state_a,
-            &mut a.framed,
-            &config_a,
-            &a.peer_addresses,
-            packet,
-            from,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            timeout(Duration::from_secs(3), rx_a.recv())
-                .await
-                .unwrap()
-                .unwrap(),
-            b"reply"
-        );
-    }
-}
+mod tests;

@@ -59,6 +59,7 @@ impl PeerHandle {
 }
 
 pub struct Initiated {
+    when: Instant,
     peer_id: Uuid,
     psk: Option<Key>,
     initiating: Initiating,
@@ -70,21 +71,18 @@ impl Initiated {
             peer_id,
             psk,
             initiating,
+            when: Instant::now(),
         }
     }
 }
 
 pub struct Peering {
     index: u32,
-    when: Instant,
 }
 
 impl Peering {
     pub fn new(index: u32) -> Self {
-        Self {
-            index,
-            when: Instant::now(),
-        }
+        Self { index }
     }
 }
 
@@ -225,7 +223,7 @@ fn establish(cipher: Cipher, timestamp: u64, peer_id: Uuid, receiver_idx: u32) -
     let actor = PeerActor { cipher };
 
     let handle = PeerActor::spawn(actor);
-    tokio::spawn(retain(handle.clone(), notify.clone(), 300, 60));
+    tokio::spawn(upkeep(handle.clone(), notify.clone(), 300, 60));
 
     let weak = handle.downgrade();
     PeerHandle::new(peer_id, receiver_idx, weak, timestamp)
