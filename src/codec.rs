@@ -104,6 +104,46 @@ impl FromStr for PacketLayout {
 }
 
 impl PacketLayout {
+    pub fn random() -> Self {
+        const MAX_PADDING: usize = 16;
+
+        fn offsets<const N: usize>(oty: usize, sizes: [usize; N]) -> ([usize; N], usize) {
+            let mut order = std::array::from_fn::<_, N, _>(|i| i);
+            fastrand::shuffle(&mut order);
+            let mut offsets = [0; N];
+            let mut end = 0;
+            for i in order {
+                let mut start = end + fastrand::usize(0..=MAX_PADDING);
+                if start <= oty && oty < start + sizes[i] {
+                    start = oty + 1;
+                }
+                offsets[i] = start;
+                end = start + sizes[i];
+            }
+            (offsets, end.max(oty + 1))
+        }
+
+        let oty = fastrand::usize(0..=MAX_PADDING);
+        let ([oieph, oiepk, oiets, oisi], _) = offsets(oty, [32, 48, 24, 4]);
+        let ([oreph, orsi, orri], _) = offsets(oty, [32, 4, 4]);
+        let ([odri, odct, oddl], data_end) = offsets(oty, [4, 8, 4]);
+        Self {
+            mask: fastrand::u32(..),
+            oty,
+            oieph,
+            oiepk,
+            oiets,
+            oisi,
+            oreph,
+            orsi,
+            orri,
+            odri,
+            odct,
+            oddl,
+            odd: data_end + fastrand::usize(0..=MAX_PADDING),
+        }
+    }
+
     pub fn check(&self) -> Result<(), Error> {
         let r = |s: &'static str, x: usize, o: usize| (s, x..x + o);
         #[rustfmt::skip]
@@ -407,6 +447,16 @@ mod tests {
     }
 
     #[test]
+    fn test_random_layout_wf() {
+        fastrand::seed(100);
+
+        for _ in 0..1024 {
+            let layout = PacketLayout::random();
+            assert!(layout.check().is_ok(), "{layout:?}");
+        }
+    }
+
+    #[test]
     fn test_parse_handshake_packets() {
         let layout = PacketLayout::default();
         let mut initiation = vec![0; layout.ilen()];
@@ -588,24 +638,26 @@ mod tests {
 
     #[test]
     fn test_encode_round_trip() {
-        for mask in [0, 0x12345678] {
-            let mut codec = Codec {
-                layout: PacketLayout {
-                    mask,
-                    oty: 2,
-                    oieph: 5,
-                    oiepk: 40,
-                    oreph: 6,
-                    oiets: 100,
-                    oisi: 90,
-                    orsi: 70,
-                    orri: 80,
-                    odri: 14,
-                    odct: 5,
-                    oddl: 20,
-                    odd: 28,
-                },
-            };
+        let layouts = [0, 0x12345678].map(|mask| PacketLayout {
+            mask,
+            oty: 2,
+            oieph: 5,
+            oiepk: 40,
+            oreph: 6,
+            oiets: 100,
+            oisi: 90,
+            orsi: 70,
+            orri: 80,
+            odri: 14,
+            odct: 5,
+            oddl: 20,
+            odd: 28,
+        });
+        for layout in layouts
+            .into_iter()
+            .chain((0..128).map(|_| PacketLayout::random()))
+        {
+            let mut codec = Codec::new(layout);
             codec.layout.check().unwrap();
             let mut buf = BytesMut::from(&b"prefix"[..]);
             codec

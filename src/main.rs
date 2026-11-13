@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use base64::prelude::*;
 use clap::{Parser, Subcommand};
 use covert::{
+    codec::PacketLayout,
     config::{Config, ListenerConfig, PeerTransport},
     crypto::{pk_to_bytes, random_sk, sk_to_bytes},
     transport::{Listener, State, create_listener},
@@ -37,6 +38,8 @@ enum Command {
     },
     /// Generate a base64-encoded X25519 private and public key pair.
     Genkey,
+    /// Generate a random packet layout
+    Genlayout,
 }
 
 #[tokio::main]
@@ -60,6 +63,11 @@ async fn main() -> Result<()> {
                 "Public key: {}",
                 BASE64_STANDARD.encode(pk_to_bytes(&public_key))
             );
+            Ok(())
+        }
+        Command::Genlayout => {
+            let layout = PacketLayout::random().to_string();
+            println!("{layout}");
             Ok(())
         }
     }
