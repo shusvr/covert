@@ -13,11 +13,12 @@ pub struct PacketLayout {
     pub o_ty: usize,    // offset of packet ty
     pub oi_eph: usize,  // (initiating) offset of ephemeral key
     pub oi_epk: usize,  // (initiating) offset of encrypted public key
-    pub or_eph: usize,  // (replying) offset of ephemeral key
-    pub or_ets: usize,  // (replying) offset of encrypted timestamp
+    pub oi_ets: usize,  // (initiating) offset of encrypted timestamp
     pub oi_sidx: usize, // (initiating) offset of sender index
+    pub or_eph: usize,  // (replying) offset of ephemeral key
     pub or_sidx: usize, // (replying) offset of sender index
     pub or_ridx: usize, // (replying) offset of receiver index
+    pub od_ridx: usize, // (data) offset of receiver index
     pub od_ctr: usize,  // (data) offset of counter
     pub od_dl: usize,   // (data) offset of data length
     pub od_d: usize,    // (data) offset of data itself
@@ -31,17 +32,18 @@ impl PacketLayout {
             r(self.oi_eph, 32),
             r(self.oi_epk, 48),
             r(self.oi_sidx, 4),
+            r(self.oi_ets, 24),
             r(self.or_eph, 32),
-            r(self.or_ets, 24),
             r(self.or_sidx, 4),
             r(self.or_ridx, 4),
+            r(self.od_ridx, 4),
             r(self.od_ctr, 8),
             r(self.od_dl, 4),
         ];
 
         // Data has a variable length, so reserve everything from od_d onward.
         if self.o_ty >= self.od_d
-            || ranges[7..9]
+            || ranges[7..10]
                 .iter()
                 .any(|range| range.start < range.end && range.end > self.od_d)
         {
@@ -53,7 +55,7 @@ impl PacketLayout {
                 .o_ty
                 .checked_add(1)
                 .ok_or("packet type offset overflows")?;
-        for group in [0..3, 3..7, 7..9] {
+        for group in [0..4, 4..7, 7..10] {
             for (i, r1) in ranges[group.clone()]
                 .iter()
                 .chain(std::iter::once(&ty_range))
@@ -78,22 +80,22 @@ impl PacketLayout {
 
 impl PacketLayout {
     fn ilen(&self) -> usize {
-        [self.oi_eph + 32, self.oi_epk + 48, self.oi_sidx + 4]
-            .into_iter()
-            .max()
-            .unwrap()
-    }
-
-    fn rlen(&self) -> usize {
         [
-            self.or_eph + 32,
-            self.or_ets + 24,
-            self.or_sidx + 4,
-            self.or_ridx + 4,
+            self.oi_eph + 32,
+            self.oi_epk + 48,
+            self.oi_sidx + 4,
+            self.oi_ets + 24,
         ]
         .into_iter()
         .max()
         .unwrap()
+    }
+
+    fn rlen(&self) -> usize {
+        [self.or_eph + 32, self.or_sidx + 4, self.or_ridx + 4]
+            .into_iter()
+            .max()
+            .unwrap()
     }
 }
 
@@ -105,13 +107,14 @@ impl Default for PacketLayout {
             oi_eph: 1,
             oi_epk: 1 + 32,
             or_eph: 1,
-            or_ets: 1 + 32,
+            oi_ets: 85,
             oi_sidx: 81,
-            or_sidx: 57,
-            or_ridx: 61,
-            od_ctr: 1,
-            od_dl: 1 + 8,
-            od_d: 1 + 8 + 4,
+            or_sidx: 33,
+            or_ridx: 37,
+            od_ridx: 1,
+            od_ctr: 5,
+            od_dl: 1 + 4 + 8,
+            od_d: 1 + 4 + 8 + 4,
         }
     }
 }
@@ -120,7 +123,11 @@ impl Default for PacketLayout {
 pub enum Packet {
     Initiating(Initiating),
     Reply(Replying),
-    Data { counter: u64, ciphertext: Vec<u8> },
+    Data {
+        receiver_idx: u32,
+        counter: u64,
+        ciphertext: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -147,7 +154,9 @@ pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet,
             let enc_pub_key = get_masked_at(buf, layout.oi_epk, layout.mask)?;
 
             let sender_idx = u32::from_be_bytes(get_masked_at(buf, layout.oi_sidx, layout.mask)?);
+            let enc_ts = get_masked_at(buf, layout.oi_ets, layout.mask)?;
             let packet = Packet::Initiating(Initiating {
+                enc_ts,
                 sender_idx,
                 enc_pub_key,
                 ephemeral,
@@ -159,7 +168,6 @@ pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet,
         // reply
         1 => {
             let ephemeral = get_masked_at(buf, layout.or_eph, layout.mask)?;
-            let enc_ts = get_masked_at(buf, layout.or_ets, layout.mask)?;
 
             let sender_idx = u32::from_be_bytes(get_masked_at(buf, layout.or_sidx, layout.mask)?);
             let receiver_idx = u32::from_be_bytes(get_masked_at(buf, layout.or_ridx, layout.mask)?);
@@ -167,7 +175,6 @@ pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet,
                 sender_idx,
                 receiver_idx,
                 eph: ephemeral,
-                enc_ts,
             });
             let consumed = layout.rlen().max(layout.o_ty + 1);
             buf.advance(consumed);
@@ -175,10 +182,12 @@ pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet,
         }
         // data
         2 => {
+            let receiver_idx = u32::from_be_bytes(get_masked_at(buf, layout.od_ridx, layout.mask)?);
             let counter = u64::from_be_bytes(get_masked_at(buf, layout.od_ctr, layout.mask)?);
             let len = u32::from_be_bytes(get_masked_at(buf, layout.od_dl, layout.mask)?);
             let end = layout.od_d.checked_add(usize::try_from(len).ok()?)?;
             let consumed = end
+                .max(layout.od_ridx.checked_add(4)?)
                 .max(layout.od_ctr.checked_add(8)?)
                 .max(layout.od_dl.checked_add(4)?)
                 .max(layout.o_ty.checked_add(1)?);
@@ -189,6 +198,7 @@ pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet,
             buf.advance(consumed);
 
             return Some(Ok(Packet::Data {
+                receiver_idx,
                 counter,
                 ciphertext: data,
             }));
@@ -212,6 +222,7 @@ pub fn append(buf: &mut BytesMut, packet: Packet, layout: &PacketLayout) -> Resu
                 .od_d
                 .checked_add(data.len())
                 .ok_or(Error::PacketOverflow)?
+                .max(layout.od_ridx.checked_add(4).ok_or(Error::PacketOverflow)?)
                 .max(layout.od_ctr.checked_add(8).ok_or(Error::PacketOverflow)?)
                 .max(layout.od_dl.checked_add(4).ok_or(Error::PacketOverflow)?)
                 .max(ty_end);
@@ -229,13 +240,14 @@ pub fn append(buf: &mut BytesMut, packet: Packet, layout: &PacketLayout) -> Resu
             enc_pub_key,
             ephemeral,
             sender_idx,
+            enc_ts,
         }) => {
+            put_masked_at(out, layout.oi_ets, &enc_ts, layout.mask);
             put_masked_at(out, layout.oi_sidx, &sender_idx.to_be_bytes(), layout.mask);
             put_masked_at(out, layout.oi_eph, &ephemeral, layout.mask);
             put_masked_at(out, layout.oi_epk, &enc_pub_key, layout.mask);
         }
         Packet::Reply(Replying {
-            enc_ts,
             eph,
             sender_idx,
             receiver_idx,
@@ -248,12 +260,18 @@ pub fn append(buf: &mut BytesMut, packet: Packet, layout: &PacketLayout) -> Resu
                 layout.mask,
             );
             put_masked_at(out, layout.or_eph, &eph, layout.mask);
-            put_masked_at(out, layout.or_ets, &enc_ts, layout.mask);
         }
         Packet::Data {
+            receiver_idx,
             counter,
             ciphertext: data,
         } => {
+            put_masked_at(
+                out,
+                layout.od_ridx,
+                &receiver_idx.to_be_bytes(),
+                layout.mask,
+            );
             put_masked_at(out, layout.od_ctr, &counter.to_be_bytes(), layout.mask);
             put_masked_at(
                 out,
@@ -329,14 +347,16 @@ mod tests {
         let mut initiation = vec![0; layout.ilen()];
         initiation[layout.oi_eph..layout.oi_eph + 32].fill(7);
         initiation[layout.oi_epk..layout.oi_epk + 48].fill(8);
+        initiation[layout.oi_ets..layout.oi_ets + 24].fill(10);
         let mut buf = BytesMut::from(initiation.as_slice());
         let Packet::Initiating(packet) = parse(&mut buf, &layout).unwrap().unwrap() else {
             panic!("expected initiation");
         };
         assert_eq!(packet.ephemeral, [7; 32]);
         assert_eq!(packet.enc_pub_key, [8; 48]);
+        assert_eq!(packet.enc_ts, [10; 24]);
         assert!(buf.is_empty());
-        let mut partial = BytesMut::from(&initiation[..84]);
+        let mut partial = BytesMut::from(&initiation[..108]);
         let original = partial.clone();
         assert!(parse(&mut partial, &layout).is_none());
         assert_eq!(partial, original);
@@ -344,15 +364,13 @@ mod tests {
         let mut reply = vec![0; layout.rlen()];
         reply[layout.o_ty] = 1;
         reply[layout.or_eph..layout.or_eph + 32].fill(9);
-        reply[layout.or_ets..layout.or_ets + 24].fill(10);
         let mut buf = BytesMut::from(reply.as_slice());
         let Packet::Reply(packet) = parse(&mut buf, &layout).unwrap().unwrap() else {
             panic!("expected reply");
         };
         assert_eq!(packet.eph, [9; 32]);
-        assert_eq!(packet.enc_ts, [10; 24]);
         assert!(buf.is_empty());
-        let mut partial = BytesMut::from(&reply[..64]);
+        let mut partial = BytesMut::from(&reply[..40]);
         let original = partial.clone();
         assert!(parse(&mut partial, &layout).is_none());
         assert_eq!(partial, original);
@@ -387,14 +405,25 @@ mod tests {
                 ..PacketLayout::default()
             },
             PacketLayout {
-                or_ridx: 55,
+                or_ridx: 31,
                 ..PacketLayout::default()
             },
             PacketLayout {
-                or_ridx: 60,
+                or_ridx: 36,
                 ..PacketLayout::default()
             },
         ] {
+            assert!(layout.check().is_err());
+        }
+    }
+
+    #[test]
+    fn test_data_receiver_index_overlap() {
+        for od_ridx in [0, 4, 12, 16, 17] {
+            let layout = PacketLayout {
+                od_ridx,
+                ..PacketLayout::default()
+            };
             assert!(layout.check().is_err());
         }
     }
@@ -425,6 +454,9 @@ mod tests {
             for payload in [&b"hello"[..], &b""[..]] {
                 let mut packet = vec![0; layout.od_d];
                 packet[layout.o_ty] = 2 ^ mask as u8;
+                for (i, byte) in 0x12345678u32.to_be_bytes().into_iter().enumerate() {
+                    packet[layout.od_ridx + i] = byte ^ mask.to_be_bytes()[i % 4];
+                }
                 for (i, byte) in 0x0123456789abcdefu64.to_be_bytes().into_iter().enumerate() {
                     packet[layout.od_ctr + i] = byte ^ mask.to_be_bytes()[i % 4];
                 }
@@ -443,12 +475,14 @@ mod tests {
                 with_trailing.extend_from_slice(b"trailing");
                 let mut buf = BytesMut::from(with_trailing.as_slice());
                 let Packet::Data {
+                    receiver_idx,
                     counter,
                     ciphertext: data,
                 } = parse(&mut buf, &layout).unwrap().unwrap()
                 else {
                     panic!("expected data");
                 };
+                assert_eq!(receiver_idx, 0x12345678);
                 assert_eq!(counter, 0x0123456789abcdef);
                 assert_eq!(data, payload);
                 assert_eq!(&buf[..], b"trailing");
@@ -461,10 +495,10 @@ mod tests {
         let mut codec = Codec {
             layout: PacketLayout::default(),
         };
-        let mut src = BytesMut::from(&[0u8; 85][..]);
-        let mut reply = vec![0; 65];
+        let mut src = BytesMut::from(&[0u8; 109][..]);
+        let mut reply = vec![0; 41];
         reply[0] = 1;
-        src.extend_from_slice(&reply[..64]);
+        src.extend_from_slice(&reply[..40]);
         assert!(matches!(
             codec.decode(&mut src).unwrap(),
             Some(Packet::Initiating(_))
@@ -472,7 +506,7 @@ mod tests {
         let partial = src.clone();
         assert!(codec.decode(&mut src).unwrap().is_none());
         assert_eq!(src, partial);
-        src.extend_from_slice(&reply[64..]);
+        src.extend_from_slice(&reply[40..]);
         assert!(matches!(
             codec.decode(&mut src).unwrap(),
             Some(Packet::Reply(_))
@@ -497,10 +531,11 @@ mod tests {
                     oi_eph: 5,
                     oi_epk: 40,
                     or_eph: 6,
-                    or_ets: 40,
+                    oi_ets: 100,
                     oi_sidx: 90,
                     or_sidx: 70,
                     or_ridx: 80,
+                    od_ridx: 14,
                     od_ctr: 5,
                     od_dl: 20,
                     od_d: 28,
@@ -513,6 +548,7 @@ mod tests {
                     Packet::Initiating(Initiating {
                         sender_idx: 0x12345678,
                         enc_pub_key: [8; 48],
+                        enc_ts: [10; 24],
                         ephemeral: [7; 32],
                     }),
                     &mut buf,
@@ -523,7 +559,6 @@ mod tests {
                     Packet::Reply(Replying {
                         sender_idx: 0x87654321,
                         receiver_idx: 0x12345678,
-                        enc_ts: [10; 24],
                         eph: [9; 32],
                     }),
                     &mut buf,
@@ -533,6 +568,7 @@ mod tests {
                 codec
                     .encode(
                         Packet::Data {
+                            receiver_idx: 0x12345678,
                             counter: u64::MAX,
                             ciphertext: data,
                         },
@@ -546,22 +582,24 @@ mod tests {
             };
             assert_eq!(packet.sender_idx, 0x12345678);
             assert_eq!(packet.enc_pub_key, [8; 48]);
+            assert_eq!(packet.enc_ts, [10; 24]);
             assert_eq!(packet.ephemeral, [7; 32]);
             let Some(Packet::Reply(packet)) = codec.decode(&mut buf).unwrap() else {
                 panic!("expected reply")
             };
             assert_eq!(packet.sender_idx, 0x87654321);
             assert_eq!(packet.receiver_idx, 0x12345678);
-            assert_eq!(packet.enc_ts, [10; 24]);
             assert_eq!(packet.eph, [9; 32]);
             for expected in [&b"payload"[..], &b""[..]] {
                 let Some(Packet::Data {
+                    receiver_idx,
                     counter,
                     ciphertext: data,
                 }) = codec.decode(&mut buf).unwrap()
                 else {
                     panic!("expected data")
                 };
+                assert_eq!(receiver_idx, 0x12345678);
                 assert_eq!(counter, u64::MAX);
                 assert_eq!(data, expected);
             }

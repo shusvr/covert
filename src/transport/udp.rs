@@ -1,9 +1,10 @@
 use crate::{
-    Result,
+    Key, Result,
     config::{Config, PubKey},
     crypto::{Cipher, Initiating, finish, post_reply, pre_reply},
     wire::{Codec, Packet, PacketLayout},
 };
+use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use kameo::{
     Actor,
@@ -13,7 +14,6 @@ use kameo::{
 };
 use serde::Deserialize;
 use std::{
-    collections::HashMap,
     net::{Ipv4Addr, SocketAddr},
     pin::pin,
     sync::{Arc, atomic::AtomicU64},
@@ -22,6 +22,7 @@ use std::{
 use tokio::{net::UdpSocket, sync::Notify, time::sleep};
 use tokio_util::udp::UdpFramed;
 use tracing::{debug, error, trace, warn};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -48,6 +49,11 @@ pub(super) async fn create_udp_listener(
     config: &Config,
     listener: &UdpListenerConfig,
 ) -> Result<()> {
+    let state = Arc::new(State {
+        established: DashMap::new(),
+        initiated: DashMap::new(),
+        peering: DashMap::new(),
+    });
     let addr = (Ipv4Addr::UNSPECIFIED, listener.port);
     let socket = Arc::new(UdpSocket::bind(addr).await?);
     // TODO: change packet layout
@@ -58,7 +64,8 @@ pub(super) async fn create_udp_listener(
             match result {
                 Ok((packet, addr)) => {
                     trace!(?addr, "Received a packet on udp socket");
-                    if let Err(err) = process_incoming(&socket, &config, packet, addr).await {
+                    if let Err(err) = process_incoming(&state, &socket, &config, packet, addr).await
+                    {
                         error!("Failed to process incoming packet: {err}");
                     }
                 }
@@ -69,40 +76,62 @@ pub(super) async fn create_udp_listener(
 }
 
 pub struct PeerHandle {
+    peer_id: Uuid,
     timestamp: u64,
     sent: AtomicU64,
     received: AtomicU64,
     handle: WeakActorRef<UdpPeer>,
+    notify: Arc<Notify>,
 }
 
 impl PeerHandle {
-    pub fn new(handle: WeakActorRef<UdpPeer>, timestamp: u64) -> Self {
+    pub fn new(peer_id: Uuid, handle: WeakActorRef<UdpPeer>, timestamp: u64) -> Self {
         Self {
             timestamp,
             handle,
+            peer_id,
             sent: 0.into(),
             received: 0.into(),
+            notify: Arc::new(Notify::new()),
         }
     }
 }
 
-#[tracing::instrument(skip(socket, packet, config))]
+pub struct Initiated {
+    peer_id: Uuid,
+    psk: Key,
+    initiating: Initiating,
+}
+
+#[derive(Default)]
+pub struct State {
+    established: DashMap<u32, PeerHandle>,
+    initiated: DashMap<u32, Initiated>,
+    peering: DashMap<Uuid, u32>,
+}
+
+#[tracing::instrument(skip(state, socket, packet, config))]
 async fn process_incoming(
+    state: &Arc<State>,
     socket: &Arc<UdpSocket>,
     config: &Config,
     packet: Packet,
     from: SocketAddr,
 ) -> Result<()> {
-    let mut established = HashMap::<u32, PeerHandle>::new();
-    let mut initiated = HashMap::<u32, _>::new();
-
     match packet {
         Packet::Initiating(initiating) => {
-            let remote_pk = pre_reply(
+            let (remote_pk, timestamp) = pre_reply(
                 &config.interface.private_key.0,
                 initiating.enc_pub_key,
                 initiating.ephemeral,
+                initiating.enc_ts,
             )?;
+
+            if let Some(existing) = state.established.get(&initiating.sender_idx)
+                && existing.timestamp >= timestamp
+            {
+                warn!(?from, "Possible reply attack, received old timestamp");
+            }
 
             let Some(peer) = config
                 .peers
@@ -115,23 +144,26 @@ async fn process_incoming(
             };
 
             let sender_idx = fastrand::u32(..);
-            let timestamp = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
             let (replying, cipher) = post_reply(
                 &remote_pk,
                 peer.pre_shared_key.as_ref().map(|k| &k.0),
-                timestamp,
                 sender_idx,
                 initiating.sender_idx,
             )?;
 
-            let handle = establish(cipher, socket, from, timestamp);
+            let handle = establish(
+                cipher,
+                socket,
+                from,
+                timestamp,
+                initiating.sender_idx,
+                peer.peer_id,
+            );
+            state.established.insert(initiating.sender_idx, handle);
+            state.peering.insert(peer.peer_id, initiating.sender_idx);
         }
         Packet::Reply(replying) => {
-            let Some(initiated): Option<Initiating> = initiated.remove(&replying.receiver_idx)
-            else {
+            let Some((_, initiated)) = state.initiated.remove(&replying.receiver_idx) else {
                 warn!(
                     receiver_idx = replying.receiver_idx,
                     "Received a reply to an unknown index"
@@ -139,19 +171,72 @@ async fn process_incoming(
                 return Ok(());
             };
 
-            let (timestamp, cipher) = finish(
-                &config.interface.private_key.0,
-                None,
-                replying.enc_ts,
-                replying.eph,
-            )?;
+            if initiated.initiating.sender_idx != replying.receiver_idx {
+                warn!(
+                    sender_idx = initiated.initiating.sender_idx,
+                    receiver_idx = replying.receiver_idx,
+                    "Misbehaving peer, i.sender_idx != r.receiver_idx"
+                );
+            }
 
-            let handle = establish(cipher, socket, from, timestamp);
+            let cipher = finish(&config.interface.private_key.0, None, replying.eph)?;
+
+            let timestamp = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_err(std::io::Error::other)?
+                .as_secs();
+
+            let handle = establish(
+                cipher,
+                socket,
+                from,
+                timestamp,
+                replying.sender_idx,
+                initiated.peer_id,
+            );
+            state.established.insert(replying.receiver_idx, handle);
+            state
+                .peering
+                .insert(initiated.peer_id, replying.receiver_idx);
         }
         Packet::Data {
+            receiver_idx,
             counter,
             ciphertext,
-        } => todo!(),
+        } => {
+            if let Some(handle) = state.established.get(&receiver_idx) {
+                if let Some(actor) = handle.handle.upgrade() {
+                    if let Some(plaintext) =
+                        actor.ask(RecvPacket(counter, ciphertext)).await.unwrap()
+                    {
+                        if plaintext.is_empty() {
+                            debug!(receiver_idx, "Plaintext is empty, keepalive");
+                            handle.notify.notify_waiters();
+                        } else {
+                            debug!(
+                                receiver_idx,
+                                plaintext_len = plaintext.len(),
+                                "Actor decrypted ciphertext"
+                            );
+                        }
+                    } else {
+                        debug!(receiver_idx, "Actor failed to decrypt, cleaning ip");
+
+                        state.peering.remove(&handle.value().peer_id);
+                        drop(handle);
+                        state.established.remove(&receiver_idx);
+                    }
+                } else {
+                    debug!(receiver_idx, "Actor has expired, cleaning up");
+
+                    state.peering.remove(&handle.value().peer_id);
+                    drop(handle);
+                    state.established.remove(&receiver_idx);
+                }
+            } else {
+                debug!("Received data to unknown")
+            }
+        }
     }
 
     Ok(())
@@ -160,21 +245,29 @@ async fn process_incoming(
 #[derive(Actor)]
 pub struct UdpPeer {
     framed: UdpFramed<Codec, Arc<UdpSocket>>,
+    receiver_idx: u32,
     dst: SocketAddr,
     cipher: Cipher,
 }
 
 pub struct SendPacket(Vec<u8>);
-pub struct RecvPacket(Vec<u8>);
+pub struct RecvPacket(u64, Vec<u8>);
 
 impl Message<RecvPacket> for UdpPeer {
-    type Reply = ();
+    type Reply = Option<Vec<u8>>;
 
     async fn handle(
         &mut self,
-        RecvPacket(packet): RecvPacket,
+        RecvPacket(nonce, ciphertext): RecvPacket,
         ctx: &mut Context<Self, Self::Reply>,
-    ) {
+    ) -> Self::Reply {
+        if let Ok(plaintext) = self.cipher.decrypt(nonce, ciphertext) {
+            Some(plaintext)
+        } else {
+            debug!("Actor failed to decrypt, stopping");
+            ctx.stop();
+            None
+        }
     }
 }
 
@@ -193,6 +286,7 @@ impl Message<SendPacket> for UdpPeer {
         };
 
         let item = Packet::Data {
+            receiver_idx: self.receiver_idx,
             counter,
             ciphertext,
         };
@@ -235,12 +329,15 @@ fn establish(
     socket: &Arc<UdpSocket>,
     from: SocketAddr,
     timestamp: u64,
+    receiver_idx: u32,
+    peer_id: Uuid,
 ) -> PeerHandle {
     let framed = UdpFramed::new(socket.clone(), Codec::new(PacketLayout::default()));
     let notify = Arc::new(Notify::new());
     let actor = UdpPeer {
         framed,
         dst: from,
+        receiver_idx,
         cipher,
     };
 
@@ -248,5 +345,5 @@ fn establish(
     tokio::spawn(retain(handle.clone(), notify.clone(), 300, 60));
 
     let weak = handle.downgrade();
-    PeerHandle::new(weak, timestamp)
+    PeerHandle::new(peer_id, weak, timestamp)
 }

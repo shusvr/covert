@@ -36,6 +36,7 @@ pub fn sk_to_bytes(sk: &PrivateKey) -> Key {
 
 #[derive(Debug)]
 pub struct Initiating {
+    pub(crate) enc_ts: SealedTimestamp,
     pub(crate) sender_idx: u32,
     pub(crate) enc_pub_key: SealedKey,
     pub(crate) ephemeral: Key,
@@ -44,6 +45,7 @@ pub struct Initiating {
 pub fn initiate(
     local_sk: &Key,
     remote_pk: &Key,
+    timestamp: u64,
     sender_idx: u32,
 ) -> Result<Initiating, Unspecified> {
     let remote_pk = to_pk(remote_pk);
@@ -69,7 +71,19 @@ pub fn initiate(
     )?;
     inout[32..].copy_from_slice(tag.as_ref());
 
+    let mut enc_ts = [0; 24];
+    enc_ts[..8].copy_from_slice(&timestamp.to_be_bytes());
+    let mut nonce = [0; 12];
+    nonce[11] = 1;
+    let tag = aes.seal_in_place_separate_tag(
+        Nonce::assume_unique_for_key(nonce),
+        Aad::from(&inout),
+        &mut enc_ts[..8],
+    )?;
+    enc_ts[8..].copy_from_slice(tag.as_ref());
+
     Ok(Initiating {
+        enc_ts,
         enc_pub_key: inout.try_into().unwrap(),
         ephemeral: pk_to_bytes(&epk),
         sender_idx,
@@ -80,7 +94,8 @@ pub fn pre_reply(
     local_sk: &Key,
     mut enc_pub_key: SealedKey,
     ephemeral: Key,
-) -> Result<Key, Unspecified> {
+    mut enc_ts: SealedTimestamp,
+) -> Result<(Key, u64), Unspecified> {
     let local_sk = to_sk(local_sk);
     let remote_epk = to_pk(&ephemeral);
 
@@ -94,6 +109,15 @@ pub fn pre_reply(
     let okm = prk.expand(&[b"for-hs"], &aead::CHACHA20_POLY1305)?;
     let cipher = LessSafeKey::new(aead::UnboundKey::from(okm));
 
+    let mut nonce = [0; 12];
+    nonce[11] = 1;
+    let timestamp = cipher.open_in_place(
+        Nonce::assume_unique_for_key(nonce),
+        Aad::from(&enc_pub_key),
+        &mut enc_ts,
+    )?;
+    let timestamp = u64::from_be_bytes(timestamp.try_into().map_err(|_| Unspecified)?);
+
     let pub_key = &*cipher.open_within(
         Nonce::assume_unique_for_key([0; _]),
         Aad::empty(),
@@ -105,12 +129,11 @@ pub fn pre_reply(
 
     let mut key = Key::default();
     key.copy_from_slice(parsed.as_ref());
-    Ok(key)
+    Ok((key, timestamp))
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct Replying {
-    pub(crate) enc_ts: SealedTimestamp,
     pub(crate) eph: Key,
     pub(crate) sender_idx: u32,
     pub(crate) receiver_idx: u32,
@@ -119,7 +142,6 @@ pub struct Replying {
 pub fn post_reply(
     remote_pk: &Key,
     pre_shared_key: Option<&Key>,
-    timestamp: u64,
     sender_idx: u32,
     receiver_idx: u32,
 ) -> Result<(Replying, Cipher), Unspecified> {
@@ -135,19 +157,9 @@ pub fn post_reply(
     let okm = prk.expand(&info, &aead::CHACHA20_POLY1305)?;
     let key = LessSafeKey::new(aead::UnboundKey::from(okm));
 
-    let mut in_out = [0; 24];
-    in_out[..8].copy_from_slice(&timestamp.to_be_bytes());
-    let tag = key.seal_in_place_separate_tag(
-        Nonce::assume_unique_for_key([0; _]),
-        Aad::empty(),
-        &mut in_out[..8],
-    )?;
-    in_out[8..].copy_from_slice(tag.as_ref());
-
     Ok((
         Replying {
             eph: pk_to_bytes(&epk),
-            enc_ts: in_out,
             sender_idx,
             receiver_idx,
         },
@@ -158,9 +170,8 @@ pub fn post_reply(
 pub fn finish(
     local_sk: &Key,
     pre_shared_key: Option<&Key>,
-    mut enc_ts: SealedTimestamp,
     eph: Key,
-) -> Result<(u64, Cipher), Unspecified> {
+) -> Result<Cipher, Unspecified> {
     let local_sk = to_sk(local_sk);
     let remote_epk = UnparsedPublicKey::new(&X25519, &eph);
 
@@ -176,14 +187,7 @@ pub fn finish(
     let okm = prk.expand(&info, &aead::CHACHA20_POLY1305)?;
     let key = LessSafeKey::new(aead::UnboundKey::from(okm));
 
-    let timestamp = key.open_in_place(
-        Nonce::assume_unique_for_key([0; _]),
-        Aad::empty(),
-        &mut enc_ts,
-    )?;
-    let timestamp = u64::from_be_bytes(timestamp.try_into().map_err(|_| Unspecified)?);
-
-    Ok((timestamp, Cipher::new(key, true)))
+    Ok(Cipher::new(key, true))
 }
 
 pub struct Cipher {
@@ -223,21 +227,27 @@ impl Cipher {
         Ok((value, data))
     }
 
-    pub fn decrypt<'a>(&self, nonce: u64, data: &'a mut [u8]) -> Result<&'a [u8], Unspecified> {
+    pub fn decrypt<'a>(&self, nonce: u64, mut ciphertext: Vec<u8>) -> Result<Vec<u8>, Unspecified> {
         let next = nonce.checked_add(1).ok_or(Unspecified)?;
         if nonce < self.enc_dec[1].load(Ordering::Relaxed) {
             return Err(Unspecified);
         }
-        let slice =
-            self.key
-                .open_in_place(Self::nonce(nonce, !self.is_initiator), Aad::empty(), data)?;
+        let len = self
+            .key
+            .open_in_place(
+                Self::nonce(nonce, !self.is_initiator),
+                Aad::empty(),
+                &mut ciphertext,
+            )?
+            .len();
+        ciphertext.truncate(len);
         // Update only after authentication; concurrent duplicates cannot both succeed.
         self.enc_dec[1]
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |expected| {
                 (nonce >= expected).then_some(next)
             })
             .map_err(|_| Unspecified)?;
-        Ok(slice)
+        Ok(ciphertext)
     }
 }
 
@@ -253,11 +263,14 @@ mod tests {
         let i = initiate(
             &sk_to_bytes(&sk1),
             &pk_to_bytes(&sk2.compute_public_key().unwrap()),
+            u64::MAX,
             0,
         )
         .unwrap();
 
-        let pk = pre_reply(&sk_to_bytes(&sk2), i.enc_pub_key, i.ephemeral).unwrap();
+        let (pk, timestamp) =
+            pre_reply(&sk_to_bytes(&sk2), i.enc_pub_key, i.ephemeral, i.enc_ts).unwrap();
+        assert_eq!(timestamp, u64::MAX);
         assert_eq!(pk.as_ref(), pk_to_bytes(&sk1.compute_public_key().unwrap()));
     }
 
@@ -270,25 +283,20 @@ mod tests {
             let initiation = initiate(
                 &local_sk,
                 &pk_to_bytes(&responder.compute_public_key().unwrap()),
+                u64::MAX,
                 0,
             )
             .unwrap();
-            let remote_pk = pre_reply(
+            let (remote_pk, timestamp) = pre_reply(
                 &sk_to_bytes(&responder),
                 initiation.enc_pub_key,
                 initiation.ephemeral,
+                initiation.enc_ts,
             )
             .unwrap();
-            let (reply, responder_key) = post_reply(
-                &remote_pk.as_ref().try_into().unwrap(),
-                psk.as_ref(),
-                u64::MAX,
-                0,
-                0,
-            )
-            .unwrap();
-            let (timestamp, initiator_key) =
-                finish(&local_sk, psk.as_ref(), reply.enc_ts, reply.eph).unwrap();
+            let (reply, responder_key) =
+                post_reply(&remote_pk.as_ref().try_into().unwrap(), psk.as_ref(), 0, 0).unwrap();
+            let initiator_key = finish(&local_sk, psk.as_ref(), reply.eph).unwrap();
             assert_eq!(timestamp, u64::MAX);
 
             let (nonce, mut message) = responder_key.encrypt(b"session message".to_vec()).unwrap();
@@ -322,15 +330,46 @@ mod tests {
     }
 
     #[test]
-    fn test_finish_rejects_wrong_psk_and_tampering() {
-        let initiator = PrivateKey::generate(&X25519).unwrap();
-        let local_sk = sk_to_bytes(&initiator);
-        let remote_pk = pk_to_bytes(&initiator.compute_public_key().unwrap());
-        let (reply, _) = post_reply(&remote_pk, Some(&[7; 32]), 123, 0, 0).unwrap();
-        assert!(finish(&local_sk, Some(&[8; 32]), reply.enc_ts, reply.eph).is_err());
+    fn test_initiation_rejects_tampering() {
+        let initiator = random_sk().unwrap();
+        let responder = random_sk().unwrap();
+        for tamper_timestamp in [false, true] {
+            let mut initiation = initiate(
+                &sk_to_bytes(&initiator),
+                &pk_to_bytes(&responder.compute_public_key().unwrap()),
+                123,
+                0,
+            )
+            .unwrap();
+            if tamper_timestamp {
+                initiation.enc_ts[0] ^= 1;
+            } else {
+                initiation.enc_pub_key[0] ^= 1;
+            }
+            assert!(
+                pre_reply(
+                    &sk_to_bytes(&responder),
+                    initiation.enc_pub_key,
+                    initiation.ephemeral,
+                    initiation.enc_ts
+                )
+                .is_err()
+            );
+        }
+    }
 
-        let (mut reply, _) = post_reply(&remote_pk, None, 123, 0, 0).unwrap();
-        reply.enc_ts[0] ^= 1;
-        assert!(finish(&local_sk, None, reply.enc_ts, reply.eph).is_err());
+    #[test]
+    fn test_wrong_psk_rejects_session_data() {
+        let initiator = random_sk().unwrap();
+        let (reply, responder) = post_reply(
+            &pk_to_bytes(&initiator.compute_public_key().unwrap()),
+            Some(&[7; 32]),
+            0,
+            0,
+        )
+        .unwrap();
+        let initiator = finish(&sk_to_bytes(&initiator), Some(&[8; 32]), reply.eph).unwrap();
+        let (counter, mut data) = responder.encrypt(b"message".to_vec()).unwrap();
+        assert!(initiator.decrypt(counter, &mut data).is_err());
     }
 }
