@@ -17,11 +17,15 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::mpsc;
-use tracing::{debug, error, trace};
+use tracing::{Level, debug, error, trace};
 
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
+    /// Increase logging verbosity (-v for debug, -vv for trace).
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -45,8 +49,12 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    _ = dotenvy::dotenv();
-    tracing_subscriber::fmt::init();
+    let log_level = match cli.verbose {
+        0 => Level::INFO,
+        1 => Level::DEBUG,
+        _ => Level::TRACE,
+    };
+    tracing_subscriber::fmt().with_max_level(log_level).init();
 
     match cli.command {
         Command::Run { config, chanlen } => run(config, chanlen).await,

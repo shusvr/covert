@@ -80,20 +80,10 @@ impl Initiated {
     }
 }
 
-pub struct Peering {
-    index: u32,
-}
-
-impl Peering {
-    pub fn new(index: u32) -> Self {
-        Self { index }
-    }
-}
-
 pub struct State {
     established: DashMap<u32, PeerHandle>,
     initiated: DashMap<u32, Initiated>,
-    peering: DashMap<Uuid, Peering>,
+    peering: DashMap<Uuid, u32>,
     queued: DashMap<Uuid, FixedCircularBuffer<Vec<u8>, 16>>,
     tun_in_tx: mpsc::Sender<Vec<u8>>,
 }

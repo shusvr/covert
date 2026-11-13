@@ -89,7 +89,7 @@ async fn expired_session_queues_traffic_and_reinitiates() {
     let mut session = establish(cipher, 0, peer_id, 2);
     session.since = std::time::Instant::now() - Duration::from_secs(61);
     state.established.insert(1, session);
-    state.peering.insert(peer_id, Peering::new(1));
+    state.peering.insert(peer_id, 1);
     let mut listener = UdpListener {
         framed: UdpFramed::new(socket, Codec::new(PacketLayout::default())),
         peer_addresses: Arc::new(
@@ -139,7 +139,7 @@ async fn received_keepalive_refreshes_session_and_invalid_data_removes_it() {
     let mut session = establish(receiver, 0, peer_id, 2);
     session.since = std::time::Instant::now() - Duration::from_secs(30);
     state.established.insert(1, session);
-    state.peering.insert(peer_id, Peering::new(1));
+    state.peering.insert(peer_id, 1);
     let mut framed = UdpFramed::new(socket, Codec::new(PacketLayout::default()));
     let addresses = DashMap::new();
     let (counter, ciphertext) = sender.encrypt(vec![]).unwrap();
@@ -337,8 +337,8 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     .await
     .unwrap();
     assert!(state_a.initiated.is_empty());
-    assert_eq!(state_a.peering.get(&peer_a).unwrap().index, local_a);
-    assert_eq!(state_b.peering.get(&peer_b).unwrap().index, local_b);
+    assert_eq!(*state_a.peering.get(&peer_a).unwrap().value(), local_a);
+    assert_eq!(*state_b.peering.get(&peer_b).unwrap().value(), local_b);
     assert_eq!(
         state_a.established.get(&local_a).unwrap().receiver_idx,
         local_b

@@ -3,7 +3,7 @@ use crate::{
     codec::{Codec, Packet, PacketLayout},
     config::{Config, PubKey},
     crypto::{finish, initiate, post_reply, pre_reply},
-    transport::{Initiated, Peering, State, establish},
+    transport::{Initiated, State, establish},
 };
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
@@ -119,7 +119,7 @@ impl UdpListener {
             return Ok(());
         };
 
-        let local_idx = state.peering.get(&peer_id).map(|entry| entry.index);
+        let local_idx = state.peering.get(&peer_id).map(|entry| *entry.value());
         if let Some(local_idx) = local_idx
             && let Some((cipher, receiver_idx)) = state.session(local_idx)
         {
@@ -186,7 +186,7 @@ pub(super) async fn create_udp_listener(
 }
 
 fn has_live_connection(state: &State, peer_id: Uuid) -> bool {
-    let index = state.peering.get(&peer_id).map(|entry| entry.index);
+    let index = state.peering.get(&peer_id).map(|entry| *entry.value());
     index
         .and_then(|index| state.established.get(&index))
         .is_some_and(|handle| handle.is_live())
@@ -221,7 +221,7 @@ async fn send_keepalives(listener: &mut UdpListener, state: &State, config: &Con
         else {
             continue;
         };
-        let Some(index) = state.peering.get(&peer.peer_id).map(|entry| entry.index) else {
+        let Some(index) = state.peering.get(&peer.peer_id).map(|entry| *entry.value()) else {
             continue;
         };
         let Some((cipher, receiver_idx)) = state.session(index) else {
@@ -370,7 +370,7 @@ async fn process_incoming(
             debug!(peer_id = ?peer.peer_id, remote_addr = %from, remote_idx = initiating.sender_idx, timestamp, "Handshake initiation accepted");
 
             // Established sessions are indexed by our own index, not the sender's.
-            let local_idx = state.peering.get(&peer.peer_id).map(|entry| entry.index);
+            let local_idx = state.peering.get(&peer.peer_id).map(|entry| *entry.value());
             if let Some(existing) = local_idx.and_then(|index| state.established.get(&index))
                 && existing.timestamp >= timestamp
             {
@@ -389,8 +389,7 @@ async fn process_incoming(
             peer_addresses.insert(peer.peer_id, from);
             let handle = establish(cipher, timestamp, peer.peer_id, initiating.sender_idx);
             state.established.insert(sender_idx, handle);
-            let peering = Peering::new(sender_idx);
-            state.peering.insert(peer.peer_id, peering);
+            state.peering.insert(peer.peer_id, sender_idx);
 
             debug!(peer_id = ?peer.peer_id, remote_addr = %from, local_idx = sender_idx,
                 remote_idx = initiating.sender_idx, "Sending handshake reply");
@@ -433,8 +432,9 @@ async fn process_incoming(
             peer_addresses.insert(initiated.peer_id, from);
             let handle = establish(cipher, timestamp, initiated.peer_id, replying.sender_idx);
             state.established.insert(replying.receiver_idx, handle);
-            let peering = Peering::new(replying.receiver_idx);
-            state.peering.insert(initiated.peer_id, peering);
+            state
+                .peering
+                .insert(initiated.peer_id, replying.receiver_idx);
             debug!(peer_id = ?initiated.peer_id, remote_addr = %from,
                 local_idx = replying.receiver_idx, remote_idx = replying.sender_idx,
                 role = "initiator", "Connection established");
