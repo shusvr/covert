@@ -9,6 +9,7 @@ aws-lc-rs = "1.18.2"
 base64 = "0.23.1"
 bytes = "1.12.1"
 clap = { version = "4", features = ["derive"] }
+dashmap = "6.2.1"
 dotenvy = "0.15.7"
 etherparse = "0.21.0"
 fastrand = "2.5.0"

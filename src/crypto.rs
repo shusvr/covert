@@ -158,9 +158,8 @@ pub fn post_reply(
 pub fn finish(
     local_sk: &Key,
     pre_shared_key: Option<&Key>,
-    Replying {
-        mut enc_ts, eph, ..
-    }: Replying,
+    mut enc_ts: SealedTimestamp,
+    eph: Key,
 ) -> Result<(u64, Cipher), Unspecified> {
     let local_sk = to_sk(local_sk);
     let remote_epk = UnparsedPublicKey::new(&X25519, &eph);
@@ -288,7 +287,8 @@ mod tests {
                 0,
             )
             .unwrap();
-            let (timestamp, initiator_key) = finish(&local_sk, psk.as_ref(), reply).unwrap();
+            let (timestamp, initiator_key) =
+                finish(&local_sk, psk.as_ref(), reply.enc_ts, reply.eph).unwrap();
             assert_eq!(timestamp, u64::MAX);
 
             let (nonce, mut message) = responder_key.encrypt(b"session message".to_vec()).unwrap();
@@ -327,10 +327,10 @@ mod tests {
         let local_sk = sk_to_bytes(&initiator);
         let remote_pk = pk_to_bytes(&initiator.compute_public_key().unwrap());
         let (reply, _) = post_reply(&remote_pk, Some(&[7; 32]), 123, 0, 0).unwrap();
-        assert!(finish(&local_sk, Some(&[8; 32]), reply).is_err());
+        assert!(finish(&local_sk, Some(&[8; 32]), reply.enc_ts, reply.eph).is_err());
 
         let (mut reply, _) = post_reply(&remote_pk, None, 123, 0, 0).unwrap();
         reply.enc_ts[0] ^= 1;
-        assert!(finish(&local_sk, None, reply).is_err());
+        assert!(finish(&local_sk, None, reply.enc_ts, reply.eph).is_err());
     }
 }

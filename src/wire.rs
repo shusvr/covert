@@ -1,6 +1,6 @@
 use crate::crypto::{Initiating, Replying};
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::io;
 use thiserror::Error;
@@ -18,7 +18,7 @@ pub struct PacketLayout {
     pub oi_sidx: usize, // (initiating) offset of sender index
     pub or_sidx: usize, // (replying) offset of sender index
     pub or_ridx: usize, // (replying) offset of receiver index
-    pub od_non: usize,  // (data) offset of nonce
+    pub od_ctr: usize,  // (data) offset of counter
     pub od_dl: usize,   // (data) offset of data length
     pub od_d: usize,    // (data) offset of data itself
 }
@@ -35,7 +35,7 @@ impl PacketLayout {
             r(self.or_ets, 24),
             r(self.or_sidx, 4),
             r(self.or_ridx, 4),
-            r(self.od_non, 12),
+            r(self.od_ctr, 8),
             r(self.od_dl, 4),
         ];
 
@@ -109,9 +109,9 @@ impl Default for PacketLayout {
             oi_sidx: 81,
             or_sidx: 57,
             or_ridx: 61,
-            od_non: 1,
-            od_dl: 1 + 12,
-            od_d: 1 + 12 + 4,
+            od_ctr: 1,
+            od_dl: 1 + 8,
+            od_d: 1 + 8 + 4,
         }
     }
 }
@@ -120,7 +120,7 @@ impl Default for PacketLayout {
 pub enum Packet {
     Initiating(Initiating),
     Reply(Replying),
-    Data { nonce: [u8; 12], data: Bytes },
+    Data { counter: u64, ciphertext: Vec<u8> },
 }
 
 #[derive(Debug, Error)]
@@ -175,19 +175,23 @@ pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet,
         }
         // data
         2 => {
-            let nonce = get_masked_at(buf, layout.od_non, layout.mask)?;
+            let counter = u64::from_be_bytes(get_masked_at(buf, layout.od_ctr, layout.mask)?);
             let len = u32::from_be_bytes(get_masked_at(buf, layout.od_dl, layout.mask)?);
             let end = layout.od_d.checked_add(usize::try_from(len).ok()?)?;
             let consumed = end
-                .max(layout.od_non.checked_add(12)?)
+                .max(layout.od_ctr.checked_add(8)?)
                 .max(layout.od_dl.checked_add(4)?)
                 .max(layout.o_ty.checked_add(1)?);
             if buf.len() < consumed {
                 return None;
             }
-            let data = buf.split_to(consumed).freeze().slice(layout.od_d..end);
+            let data = buf[layout.od_d..end].to_vec();
+            buf.advance(consumed);
 
-            return Some(Ok(Packet::Data { nonce, data }));
+            return Some(Ok(Packet::Data {
+                counter,
+                ciphertext: data,
+            }));
         }
         _ => return Some(Err(Error::UnexpectedTy(ty))),
     }
@@ -200,13 +204,15 @@ pub fn append(buf: &mut BytesMut, packet: Packet, layout: &PacketLayout) -> Resu
     let (ty, len) = match &packet {
         Packet::Initiating(_) => (0, layout.ilen().max(ty_end)),
         Packet::Reply(_) => (1, layout.rlen().max(ty_end)),
-        Packet::Data { data, .. } => {
+        Packet::Data {
+            ciphertext: data, ..
+        } => {
             u32::try_from(data.len()).map_err(|_| Error::PacketOverflow)?;
             let len = layout
                 .od_d
                 .checked_add(data.len())
                 .ok_or(Error::PacketOverflow)?
-                .max(layout.od_non.checked_add(12).ok_or(Error::PacketOverflow)?)
+                .max(layout.od_ctr.checked_add(8).ok_or(Error::PacketOverflow)?)
                 .max(layout.od_dl.checked_add(4).ok_or(Error::PacketOverflow)?)
                 .max(ty_end);
             (2, len)
@@ -244,8 +250,11 @@ pub fn append(buf: &mut BytesMut, packet: Packet, layout: &PacketLayout) -> Resu
             put_masked_at(out, layout.or_eph, &eph, layout.mask);
             put_masked_at(out, layout.or_ets, &enc_ts, layout.mask);
         }
-        Packet::Data { nonce, data } => {
-            put_masked_at(out, layout.od_non, &nonce, layout.mask);
+        Packet::Data {
+            counter,
+            ciphertext: data,
+        } => {
+            put_masked_at(out, layout.od_ctr, &counter.to_be_bytes(), layout.mask);
             put_masked_at(
                 out,
                 layout.od_dl,
@@ -352,7 +361,7 @@ mod tests {
     #[test]
     fn test_type_layout_overlap() {
         // Check both ends of every fixed field in all packet variants.
-        for o_ty in [1, 32, 33, 80, 56, 12, 13, 16] {
+        for o_ty in [1, 32, 33, 80, 56, 8, 9, 12] {
             let layout = PacketLayout {
                 o_ty,
                 od_d: 100,
@@ -392,7 +401,7 @@ mod tests {
 
     #[test]
     fn test_data_layout_overlap() {
-        for od_d in [0, 1, 12, 13, 16] {
+        for od_d in [0, 1, 8, 9, 12] {
             let layout = PacketLayout {
                 od_d,
                 ..PacketLayout::default()
@@ -416,14 +425,13 @@ mod tests {
             for payload in [&b"hello"[..], &b""[..]] {
                 let mut packet = vec![0; layout.od_d];
                 packet[layout.o_ty] = 2 ^ mask as u8;
-                for (i, byte) in [7u8; 12].into_iter().enumerate() {
-                    packet[layout.od_non + i] = byte ^ mask.to_be_bytes()[i % 4];
+                for (i, byte) in 0x0123456789abcdefu64.to_be_bytes().into_iter().enumerate() {
+                    packet[layout.od_ctr + i] = byte ^ mask.to_be_bytes()[i % 4];
                 }
                 for (i, byte) in (payload.len() as u32).to_be_bytes().into_iter().enumerate() {
                     packet[layout.od_dl + i] = byte ^ mask.to_be_bytes()[i % 4];
                 }
                 packet.extend_from_slice(payload);
-                let packet = Bytes::from(packet);
                 let expected_len = packet.len();
                 for len in 0..expected_len {
                     let mut partial = BytesMut::from(&packet[..len]);
@@ -434,15 +442,16 @@ mod tests {
                 let mut with_trailing = packet.to_vec();
                 with_trailing.extend_from_slice(b"trailing");
                 let mut buf = BytesMut::from(with_trailing.as_slice());
-                let payload_ptr = buf[layout.od_d..].as_ptr();
-                let Packet::Data { nonce, data } = parse(&mut buf, &layout).unwrap().unwrap()
+                let Packet::Data {
+                    counter,
+                    ciphertext: data,
+                } = parse(&mut buf, &layout).unwrap().unwrap()
                 else {
                     panic!("expected data");
                 };
-                assert_eq!(nonce, [7; 12]);
+                assert_eq!(counter, 0x0123456789abcdef);
                 assert_eq!(data, payload);
                 assert_eq!(&buf[..], b"trailing");
-                assert_eq!(data.as_ptr(), payload_ptr);
             }
         }
     }
@@ -492,7 +501,7 @@ mod tests {
                     oi_sidx: 90,
                     or_sidx: 70,
                     or_ridx: 80,
-                    od_non: 5,
+                    od_ctr: 5,
                     od_dl: 20,
                     od_d: 28,
                 },
@@ -520,12 +529,12 @@ mod tests {
                     &mut buf,
                 )
                 .unwrap();
-            for data in [Bytes::from_static(b"payload"), Bytes::new()] {
+            for data in [b"payload".to_vec(), Vec::new()] {
                 codec
                     .encode(
                         Packet::Data {
-                            nonce: [11; 12],
-                            data,
+                            counter: u64::MAX,
+                            ciphertext: data,
                         },
                         &mut buf,
                     )
@@ -546,10 +555,14 @@ mod tests {
             assert_eq!(packet.enc_ts, [10; 24]);
             assert_eq!(packet.eph, [9; 32]);
             for expected in [&b"payload"[..], &b""[..]] {
-                let Some(Packet::Data { nonce, data }) = codec.decode(&mut buf).unwrap() else {
+                let Some(Packet::Data {
+                    counter,
+                    ciphertext: data,
+                }) = codec.decode(&mut buf).unwrap()
+                else {
                     panic!("expected data")
                 };
-                assert_eq!(nonce, [11; 12]);
+                assert_eq!(counter, u64::MAX);
                 assert_eq!(data, expected);
             }
             assert!(buf.is_empty());
