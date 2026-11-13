@@ -1,2 +1,2 @@
-run:
-    cargo b && sudo ./target/debug/covert run ./examples/ex1.toml
+run config="ex1":
+    cargo b && sudo ./target/debug/covert run ./examples/{{quote(config)}}.toml

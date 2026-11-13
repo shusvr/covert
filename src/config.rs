@@ -74,6 +74,15 @@ pub enum PeerTransport {
     },
 }
 
+impl PeerTransport {
+    pub fn unwrap_udp(&self) -> &UdpTransportPeerConfig {
+        match self {
+            PeerTransport::Udp { udp } => udp,
+            _ => unreachable!(),
+        }
+    }
+}
+
 fn deserialize_addrs<'de, D>(deserializer: D) -> Result<Vec<IpNet>, D::Error>
 where
     D: serde::Deserializer<'de>,

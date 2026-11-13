@@ -7,16 +7,17 @@ pub type Timestamp = i64;
 pub type SealedTimestamp = [u8; 24];
 pub type Nonce = [u8; 12];
 
+pub mod codec;
 pub mod config;
 pub mod crypto;
-pub mod listener;
 pub mod transport;
-pub mod wire;
 
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("Io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Wire: {0}")]
+    Codec(#[from] codec::Error),
     #[error("Unspecified crypto error")]
     Crypto,
 }

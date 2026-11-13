@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use covert::{
     config::{Config, ListenerConfig, PeerTransport},
     crypto::{pk_to_bytes, random_sk, sk_to_bytes},
-    transport::create_listener,
+    transport::{Listener, State, create_listener},
 };
 use etherparse::{NetHeaders, PacketHeaders};
 use std::{
@@ -127,12 +127,10 @@ async fn run(conf_path: PathBuf, chanlen: Option<u16>) -> Result<()> {
         .context("failed to create a tun device")?;
 
     let chanlen = chanlen.unwrap_or(512) as usize;
-    let (tun_out_tx, tun_out_rx) = mpsc::channel::<Vec<u8>>(chanlen);
     let (tun_in_tx, mut tun_in_rx) = mpsc::channel::<Vec<u8>>(chanlen);
 
-    create_listener(&config, tun_in_tx).await?;
-
-    tokio::spawn(reader_task(config.clone(), tun_out_rx));
+    let state = Arc::new(State::new(tun_in_tx));
+    let mut listener = create_listener(&state, &config).await?;
 
     let mut tun_buf = vec![0; config.interface.mtu as usize];
     loop {
@@ -140,7 +138,10 @@ async fn run(conf_path: PathBuf, chanlen: Option<u16>) -> Result<()> {
             result = tun.recv(&mut tun_buf) => match result {
                 Ok(len) => {
                     debug!(len, "Received packet on tun");
-                    tun_out_tx.send(tun_buf[..len].to_owned()).await?;
+
+                    if let Err(err) = process_tun_packet(&state, &config, &mut listener, &tun_buf[..len]).await {
+                        error!("Failed to process tun packet: {err}");
+                    }
                 }
                 Err(err) => error!("Failed to receive on tun: {err}"),
             },
@@ -156,7 +157,12 @@ async fn run(conf_path: PathBuf, chanlen: Option<u16>) -> Result<()> {
     }
 }
 
-async fn process_tun_packet(config: &Config, packet: Vec<u8>) -> Result<()> {
+async fn process_tun_packet(
+    state: &State,
+    config: &Config,
+    listener: &mut Listener,
+    packet: &[u8],
+) -> Result<()> {
     let parsed = PacketHeaders::from_ip_slice(&packet)?;
     let net = parsed.net.unwrap();
     let dst = match net {
@@ -167,23 +173,11 @@ async fn process_tun_packet(config: &Config, packet: Vec<u8>) -> Result<()> {
 
     for p in config.peers.iter() {
         if p.allowed_ips.iter().any(|x| x.contains(&dst)) {
-            // todo send packet to peer
+            if let Err(err) = listener.trasmit(state, config, p.peer_id, packet).await {
+                error!("Failed to transmit: {err}");
+            }
         }
     }
 
     Ok(())
-}
-
-async fn reader_task(config: Arc<Config>, mut tun_out_rx: mpsc::Receiver<Vec<u8>>) {
-    loop {
-        let Some(packet) = tun_out_rx.recv().await else {
-            debug!("tun_out_rx was closed, exiting reader task");
-            break;
-        };
-
-        let len = packet.len();
-        if let Err(err) = process_tun_packet(&config, packet).await {
-            error!(packet_len = len, "process_tun_packet error: {err}");
-        }
-    }
 }
