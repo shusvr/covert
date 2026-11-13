@@ -227,7 +227,7 @@ impl Cipher {
         Ok((value, data))
     }
 
-    pub fn decrypt<'a>(&self, nonce: u64, mut ciphertext: Vec<u8>) -> Result<Vec<u8>, Unspecified> {
+    pub fn decrypt(&self, nonce: u64, mut ciphertext: Vec<u8>) -> Result<Vec<u8>, Unspecified> {
         let next = nonce.checked_add(1).ok_or(Unspecified)?;
         if nonce < self.enc_dec[1].load(Ordering::Relaxed) {
             return Err(Unspecified);
@@ -299,27 +299,26 @@ mod tests {
             let initiator_key = finish(&local_sk, psk.as_ref(), reply.eph).unwrap();
             assert_eq!(timestamp, u64::MAX);
 
-            let (nonce, mut message) = responder_key.encrypt(b"session message".to_vec()).unwrap();
-            let mut replay = message.clone();
+            let (nonce, message) = responder_key.encrypt(b"session message".to_vec()).unwrap();
+            let replay = message.clone();
             assert_eq!(
-                initiator_key.decrypt(nonce, &mut message).unwrap(),
+                initiator_key.decrypt(nonce, message).unwrap(),
                 b"session message"
             );
-            assert!(initiator_key.decrypt(nonce, &mut replay).is_err());
+            assert!(initiator_key.decrypt(nonce, replay).is_err());
 
-            let (nonce, mut message) = initiator_key.encrypt(b"return message".to_vec()).unwrap();
+            let (nonce, message) = initiator_key.encrypt(b"return message".to_vec()).unwrap();
             assert_eq!(
-                responder_key.decrypt(nonce, &mut message).unwrap(),
+                responder_key.decrypt(nonce, message).unwrap(),
                 b"return message"
             );
 
             let (nonce, message) = responder_key.encrypt(b"authenticated".to_vec()).unwrap();
             let mut tampered = message.clone();
             tampered[0] ^= 1;
-            assert!(initiator_key.decrypt(nonce + 100, &mut tampered).is_err());
-            let mut message = message;
+            assert!(initiator_key.decrypt(nonce + 100, tampered).is_err());
             assert_eq!(
-                initiator_key.decrypt(nonce, &mut message).unwrap(),
+                initiator_key.decrypt(nonce, message).unwrap(),
                 b"authenticated"
             );
 
@@ -369,7 +368,7 @@ mod tests {
         )
         .unwrap();
         let initiator = finish(&sk_to_bytes(&initiator), Some(&[8; 32]), reply.eph).unwrap();
-        let (counter, mut data) = responder.encrypt(b"message".to_vec()).unwrap();
-        assert!(initiator.decrypt(counter, &mut data).is_err());
+        let (counter, data) = responder.encrypt(b"message".to_vec()).unwrap();
+        assert!(initiator.decrypt(counter, data).is_err());
     }
 }
