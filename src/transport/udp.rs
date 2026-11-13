@@ -1,14 +1,14 @@
 use crate::{
-    Key, Result,
+    Result,
     config::{Config, PubKey},
-    crypto::{Cipher, Initiating, finish, post_reply, pre_reply},
+    crypto::{Cipher, finish, post_reply, pre_reply},
+    transport::{PeerHandle, State},
     wire::{Codec, Packet, PacketLayout},
 };
-use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use kameo::{
     Actor,
-    actor::{ActorRef, Spawn, WeakActorRef},
+    actor::{ActorRef, Spawn},
     message::Message,
     prelude::Context,
 };
@@ -16,12 +16,16 @@ use serde::Deserialize;
 use std::{
     net::{Ipv4Addr, SocketAddr},
     pin::pin,
-    sync::{Arc, atomic::AtomicU64},
+    sync::Arc,
     time::{Duration, SystemTime},
 };
-use tokio::{net::UdpSocket, sync::Notify, time::sleep};
+use tokio::{
+    net::UdpSocket,
+    sync::{Notify, mpsc},
+    time::sleep,
+};
 use tokio_util::udp::UdpFramed;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -46,24 +50,35 @@ pub struct UdpTransportPeerConfig {
 }
 
 pub(super) async fn create_udp_listener(
-    config: &Config,
+    config: &Arc<Config>,
     listener: &UdpListenerConfig,
-) -> Result<()> {
-    let state = Arc::new(State {
-        established: DashMap::new(),
-        initiated: DashMap::new(),
-        peering: DashMap::new(),
-    });
+    tun_in_tx: mpsc::Sender<Vec<u8>>,
+) -> Result<Arc<State<UdpPeer>>> {
+    let state = Arc::new(State::new(tun_in_tx));
     let addr = (Ipv4Addr::UNSPECIFIED, listener.port);
     let socket = Arc::new(UdpSocket::bind(addr).await?);
     // TODO: change packet layout
-    let mut framed = UdpFramed::new(socket.clone(), Codec::new(PacketLayout::default()));
 
+    tokio::spawn(socket_listener_task(
+        state.clone(),
+        socket.clone(),
+        config.clone(),
+    ));
+
+    Ok(state)
+}
+
+async fn socket_listener_task(
+    state: Arc<State<UdpPeer>>,
+    socket: Arc<UdpSocket>,
+    config: Arc<Config>,
+) {
+    let mut framed = UdpFramed::new(socket.clone(), Codec::new(PacketLayout::default()));
     loop {
         if let Some(result) = framed.next().await {
             match result {
                 Ok((packet, addr)) => {
-                    trace!(?addr, "Received a packet on udp socket");
+                    debug!(?addr, "Received a packet on udp socket");
                     if let Err(err) = process_incoming(&state, &socket, &config, packet, addr).await
                     {
                         error!("Failed to process incoming packet: {err}");
@@ -75,44 +90,9 @@ pub(super) async fn create_udp_listener(
     }
 }
 
-pub struct PeerHandle {
-    peer_id: Uuid,
-    timestamp: u64,
-    sent: AtomicU64,
-    received: AtomicU64,
-    handle: WeakActorRef<UdpPeer>,
-    notify: Arc<Notify>,
-}
-
-impl PeerHandle {
-    pub fn new(peer_id: Uuid, handle: WeakActorRef<UdpPeer>, timestamp: u64) -> Self {
-        Self {
-            timestamp,
-            handle,
-            peer_id,
-            sent: 0.into(),
-            received: 0.into(),
-            notify: Arc::new(Notify::new()),
-        }
-    }
-}
-
-pub struct Initiated {
-    peer_id: Uuid,
-    psk: Key,
-    initiating: Initiating,
-}
-
-#[derive(Default)]
-pub struct State {
-    established: DashMap<u32, PeerHandle>,
-    initiated: DashMap<u32, Initiated>,
-    peering: DashMap<Uuid, u32>,
-}
-
 #[tracing::instrument(skip(state, socket, packet, config))]
 async fn process_incoming(
-    state: &Arc<State>,
+    state: &Arc<State<UdpPeer>>,
     socket: &Arc<UdpSocket>,
     config: &Config,
     packet: Packet,
@@ -291,7 +271,7 @@ impl Message<SendPacket> for UdpPeer {
             ciphertext,
         };
         if let Err(err) = self.framed.send((item, self.dst)).await {
-            error!("Actor failed to send, stopping");
+            error!("Actor failed to send, stopping: {err}");
             ctx.stop();
         }
     }
@@ -331,7 +311,7 @@ fn establish(
     timestamp: u64,
     receiver_idx: u32,
     peer_id: Uuid,
-) -> PeerHandle {
+) -> PeerHandle<UdpPeer> {
     let framed = UdpFramed::new(socket.clone(), Codec::new(PacketLayout::default()));
     let notify = Arc::new(Notify::new());
     let actor = UdpPeer {

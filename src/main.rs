@@ -2,10 +2,9 @@
 
 use anyhow::{Context, Result, bail};
 use base64::prelude::*;
-use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use covert::{
-    config::{ArcConfig, Config, ListenerConfig, PeerTransport},
+    config::{Config, ListenerConfig, PeerTransport},
     crypto::{pk_to_bytes, random_sk, sk_to_bytes},
     transport::create_listener,
 };
@@ -14,6 +13,7 @@ use std::{
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error};
@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
     }
 }
 
-fn read_config(path: &Path) -> anyhow::Result<ArcConfig> {
+fn read_config(path: &Path) -> anyhow::Result<Arc<Config>> {
     let file_name = path
         .file_name()
         .unwrap()
@@ -127,10 +127,10 @@ async fn run(conf_path: PathBuf, chanlen: Option<u16>) -> Result<()> {
         .context("failed to create a tun device")?;
 
     let chanlen = chanlen.unwrap_or(512) as usize;
-    let (tun_out_tx, tun_out_rx) = mpsc::channel::<Bytes>(chanlen);
-    let (tun_in_tx, mut tun_in_rx) = mpsc::channel::<Bytes>(chanlen);
+    let (tun_out_tx, tun_out_rx) = mpsc::channel::<Vec<u8>>(chanlen);
+    let (tun_in_tx, mut tun_in_rx) = mpsc::channel::<Vec<u8>>(chanlen);
 
-    create_listener(&config).await?;
+    create_listener(&config, tun_in_tx).await?;
 
     tokio::spawn(reader_task(config.clone(), tun_out_rx));
 
@@ -140,8 +140,7 @@ async fn run(conf_path: PathBuf, chanlen: Option<u16>) -> Result<()> {
             result = tun.recv(&mut tun_buf) => match result {
                 Ok(len) => {
                     debug!(len, "Received packet on tun");
-                    let packet = Bytes::copy_from_slice(&tun_buf[..len]);
-                    tun_out_tx.send(packet).await?;
+                    tun_out_tx.send(tun_buf[..len].to_owned()).await?;
                 }
                 Err(err) => error!("Failed to receive on tun: {err}"),
             },
@@ -157,7 +156,7 @@ async fn run(conf_path: PathBuf, chanlen: Option<u16>) -> Result<()> {
     }
 }
 
-async fn process_tun_packet(config: &Config, packet: Bytes) -> Result<()> {
+async fn process_tun_packet(config: &Config, packet: Vec<u8>) -> Result<()> {
     let parsed = PacketHeaders::from_ip_slice(&packet)?;
     let net = parsed.net.unwrap();
     let dst = match net {
@@ -175,7 +174,7 @@ async fn process_tun_packet(config: &Config, packet: Bytes) -> Result<()> {
     Ok(())
 }
 
-async fn reader_task(config: ArcConfig, mut tun_out_rx: mpsc::Receiver<Bytes>) {
+async fn reader_task(config: Arc<Config>, mut tun_out_rx: mpsc::Receiver<Vec<u8>>) {
     loop {
         let Some(packet) = tun_out_rx.recv().await else {
             debug!("tun_out_rx was closed, exiting reader task");

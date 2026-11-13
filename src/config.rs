@@ -5,10 +5,8 @@ use crate::transport::{
 use base64::prelude::*;
 use ipnet::IpNet;
 use serde::Deserialize;
-use std::{collections::HashMap, fmt::Debug, net::IpAddr, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, net::IpAddr};
 use uuid::Uuid;
-
-pub type ArcConfig = Arc<Config>;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
