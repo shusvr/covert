@@ -1,74 +1,163 @@
 use crate::crypto::{Initiating, Replying};
 
 use bytes::{Buf, BytesMut};
-use serde::{Deserialize, Serialize};
-use std::io;
+use std::{io, str::FromStr};
 use thiserror::Error;
 use tokio_util::codec::{Decoder, Encoder};
 
-#[derive(Debug, Serialize, Deserialize)]
+const DEFAULT_LAYOUT: PacketLayout = PacketLayout {
+    mask: 0,
+    oty: 0,
+    oieph: 1,
+    oiepk: 1 + 32,
+    oreph: 1,
+    oiets: 85,
+    oisi: 81,
+    orsi: 33,
+    orri: 37,
+    odri: 1,
+    odct: 5,
+    oddl: 1 + 4 + 8,
+    odd: 1 + 4 + 8 + 4,
+};
+
+#[derive(Debug)]
 pub struct PacketLayout {
-    #[serde(rename = "m")]
-    pub mask: u32, // general field mask
-    pub o_ty: usize,    // offset of packet ty
-    pub oi_eph: usize,  // (initiating) offset of ephemeral key
-    pub oi_epk: usize,  // (initiating) offset of encrypted public key
-    pub oi_ets: usize,  // (initiating) offset of encrypted timestamp
-    pub oi_sidx: usize, // (initiating) offset of sender index
-    pub or_eph: usize,  // (replying) offset of ephemeral key
-    pub or_sidx: usize, // (replying) offset of sender index
-    pub or_ridx: usize, // (replying) offset of receiver index
-    pub od_ridx: usize, // (data) offset of receiver index
-    pub od_ctr: usize,  // (data) offset of counter
-    pub od_dl: usize,   // (data) offset of data length
-    pub od_d: usize,    // (data) offset of data itself
+    pub mask: u32,    // general field mask
+    pub oty: usize,   // offset of packet ty
+    pub oieph: usize, // (initiating) offset of ephemeral key
+    pub oiepk: usize, // (initiating) offset of encrypted public key
+    pub oiets: usize, // (initiating) offset of encrypted timestamp
+    pub oisi: usize,  // (initiating) offset of sender index
+    pub oreph: usize, // (replying) offset of ephemeral key
+    pub orsi: usize,  // (replying) offset of sender index
+    pub orri: usize,  // (replying) offset of receiver index
+    pub odri: usize,  // (data) offset of receiver index
+    pub odct: usize,  // (data) offset of counter
+    pub oddl: usize,  // (data) offset of data length
+    pub odd: usize,   // (data) offset of data itself
+}
+
+impl Default for PacketLayout {
+    fn default() -> Self {
+        DEFAULT_LAYOUT
+    }
+}
+
+impl ToString for PacketLayout {
+    fn to_string(&self) -> String {
+        let pairs = [
+            ("m", self.mask as usize),
+            ("oty", self.oty),
+            ("oieph", self.oieph),
+            ("oiepk", self.oiepk),
+            ("oiets", self.oiets),
+            ("oisidx", self.oisi),
+            ("oreph", self.oreph),
+            ("orsidx", self.orsi),
+            ("orridx", self.orri),
+            ("odridx", self.odri),
+            ("odctr", self.odct),
+            ("oddl", self.oddl),
+            ("odd", self.odd),
+        ];
+
+        let pairs = pairs
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>();
+        pairs.join("&")
+    }
+}
+
+impl FromStr for PacketLayout {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut layout = DEFAULT_LAYOUT;
+        for pair in s.split('&') {
+            let (k, v) = pair.split_once("=").ok_or(Error::InvalidLayout("pair"))?;
+            let v = v
+                .parse::<usize>()
+                .map_err(|_| Error::InvalidLayout("non int"))?;
+
+            match k {
+                "oty" => layout.oty = v,
+                "oieph" => layout.oieph = v,
+                "oiepk" => layout.oiepk = v,
+                "oiets" => layout.oiets = v,
+                "oisidx" => layout.oisi = v,
+                "oreph" => layout.oreph = v,
+                "orsidx" => layout.orsi = v,
+                "orridx" => layout.orri = v,
+                "odridx" => layout.odri = v,
+                "odctr" => layout.odct = v,
+                "oddl" => layout.oddl = v,
+                "odd" => layout.odd = v,
+                _ => return Err(Error::UnkownLayoutParam(k.to_owned())),
+            }
+        }
+
+        layout.check()?;
+        Ok(layout)
+    }
 }
 
 impl PacketLayout {
-    pub fn check(&self) -> Result<(), &'static str> {
-        let r = |x: usize, o: usize| x..x + o;
+    pub fn check(&self) -> Result<(), Error> {
+        let r = |s: &'static str, x: usize, o: usize| (s, x..x + o);
         #[rustfmt::skip]
         let ranges = [
-            r(self.oi_eph, 32),
-            r(self.oi_epk, 48),
-            r(self.oi_sidx, 4),
-            r(self.oi_ets, 24),
-            r(self.or_eph, 32),
-            r(self.or_sidx, 4),
-            r(self.or_ridx, 4),
-            r(self.od_ridx, 4),
-            r(self.od_ctr, 8),
-            r(self.od_dl, 4),
+            r("oieph", self.oieph, 32),
+            r("oiepk", self.oiepk, 48),
+            r("oisidx", self.oisi, 4),
+            r("oiets", self.oiets, 24),
+            r("oreph", self.oreph, 32),
+            r("orsidx", self.orsi, 4),
+            r("orridx", self.orri, 4),
+            r("odridx", self.odri, 4),
+            r("odctr", self.odct, 8),
+            r("oddl", self.oddl, 4),
         ];
 
         // Data has a variable length, so reserve everything from od_d onward.
-        if self.o_ty >= self.od_d
-            || ranges[7..10]
-                .iter()
-                .any(|range| range.start < range.end && range.end > self.od_d)
-        {
-            return Err("data overlaps packet fields");
+        if self.oty >= self.odd {
+            return Err(Error::LayoutFieldsOverlap(
+                "odd".to_owned(),
+                "oty".to_owned(),
+            ));
+        } else {
+            if let Some(bad) = ranges[7..10].iter().find_map(|(name, range)| {
+                (range.start < range.end && range.end > self.odd).then_some(name)
+            }) {
+                return Err(Error::LayoutFieldsOverlap(
+                    "odd".to_owned(),
+                    (*bad).to_owned(),
+                ));
+            }
         }
 
-        let ty_range = self.o_ty
-            ..self
-                .o_ty
-                .checked_add(1)
-                .ok_or("packet type offset overflows")?;
+        let ty_range = (
+            "oty",
+            self.oty..self.oty.checked_add(1).expect("packet type overflow"),
+        );
         for group in [0..4, 4..7, 7..10] {
-            for (i, r1) in ranges[group.clone()]
+            for (i, (k1, r1)) in ranges[group.clone()]
                 .iter()
                 .chain(std::iter::once(&ty_range))
                 .enumerate()
             {
-                for (j, r2) in ranges[group.clone()]
+                for (j, (k2, r2)) in ranges[group.clone()]
                     .iter()
                     .chain(std::iter::once(&ty_range))
                     .enumerate()
                 {
                     let overlaps = (r1.start < r2.end) & (r2.start < r1.end);
                     if i != j && overlaps {
-                        return Err("packet ranges overlap");
+                        return Err(Error::LayoutFieldsOverlap(
+                            (*k1).to_owned(),
+                            (*k2).to_owned(),
+                        ));
                     }
                 }
             }
@@ -81,10 +170,10 @@ impl PacketLayout {
 impl PacketLayout {
     fn ilen(&self) -> usize {
         [
-            self.oi_eph + 32,
-            self.oi_epk + 48,
-            self.oi_sidx + 4,
-            self.oi_ets + 24,
+            self.oieph + 32,
+            self.oiepk + 48,
+            self.oisi + 4,
+            self.oiets + 24,
         ]
         .into_iter()
         .max()
@@ -92,30 +181,10 @@ impl PacketLayout {
     }
 
     fn rlen(&self) -> usize {
-        [self.or_eph + 32, self.or_sidx + 4, self.or_ridx + 4]
+        [self.oreph + 32, self.orsi + 4, self.orri + 4]
             .into_iter()
             .max()
             .unwrap()
-    }
-}
-
-impl Default for PacketLayout {
-    fn default() -> Self {
-        Self {
-            mask: 0,
-            o_ty: 0,
-            oi_eph: 1,
-            oi_epk: 1 + 32,
-            or_eph: 1,
-            oi_ets: 85,
-            oi_sidx: 81,
-            or_sidx: 33,
-            or_ridx: 37,
-            od_ridx: 1,
-            od_ctr: 5,
-            od_dl: 1 + 4 + 8,
-            od_d: 1 + 4 + 8 + 4,
-        }
     }
 }
 
@@ -136,65 +205,71 @@ pub enum Error {
     UnexpectedTy(u8),
     #[error("Tried encoding a packet that is too large")]
     PacketOverflow,
+    #[error("Invalid packet layout({0})")]
+    InvalidLayout(&'static str),
+    #[error("Layout param `{0}` doesn't exist")]
+    UnkownLayoutParam(String),
+    #[error("Layout params `{0}` and `{1}` will cause overlap")]
+    LayoutFieldsOverlap(String, String),
     #[error("Io: {0}")]
     Io(#[from] io::Error),
 }
 
 /// Consumes one complete packet, leaving incomplete or invalid input untouched.
 pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet, Error>> {
-    if buf.len() < layout.o_ty + 1 {
+    if buf.len() < layout.oty + 1 {
         return None;
     }
 
-    let ty = buf[layout.o_ty] ^ layout.mask as u8;
+    let ty = buf[layout.oty] ^ layout.mask as u8;
     match ty {
         // initiating
         0 => {
-            let ephemeral = get_masked_at(buf, layout.oi_eph, layout.mask)?;
-            let enc_pub_key = get_masked_at(buf, layout.oi_epk, layout.mask)?;
+            let ephemeral = get_masked_at(buf, layout.oieph, layout.mask)?;
+            let enc_pub_key = get_masked_at(buf, layout.oiepk, layout.mask)?;
 
-            let sender_idx = u32::from_be_bytes(get_masked_at(buf, layout.oi_sidx, layout.mask)?);
-            let enc_ts = get_masked_at(buf, layout.oi_ets, layout.mask)?;
+            let sender_idx = u32::from_be_bytes(get_masked_at(buf, layout.oisi, layout.mask)?);
+            let enc_ts = get_masked_at(buf, layout.oiets, layout.mask)?;
             let packet = Packet::Initiating(Initiating {
                 enc_ts,
                 sender_idx,
                 enc_pub_key,
                 ephemeral,
             });
-            let consumed = layout.ilen().max(layout.o_ty + 1);
+            let consumed = layout.ilen().max(layout.oty + 1);
             buf.advance(consumed);
             return Some(Ok(packet));
         }
         // reply
         1 => {
-            let ephemeral = get_masked_at(buf, layout.or_eph, layout.mask)?;
+            let ephemeral = get_masked_at(buf, layout.oreph, layout.mask)?;
 
-            let sender_idx = u32::from_be_bytes(get_masked_at(buf, layout.or_sidx, layout.mask)?);
-            let receiver_idx = u32::from_be_bytes(get_masked_at(buf, layout.or_ridx, layout.mask)?);
+            let sender_idx = u32::from_be_bytes(get_masked_at(buf, layout.orsi, layout.mask)?);
+            let receiver_idx = u32::from_be_bytes(get_masked_at(buf, layout.orri, layout.mask)?);
             let packet = Packet::Reply(Replying {
                 sender_idx,
                 receiver_idx,
                 eph: ephemeral,
             });
-            let consumed = layout.rlen().max(layout.o_ty + 1);
+            let consumed = layout.rlen().max(layout.oty + 1);
             buf.advance(consumed);
             return Some(Ok(packet));
         }
         // data
         2 => {
-            let receiver_idx = u32::from_be_bytes(get_masked_at(buf, layout.od_ridx, layout.mask)?);
-            let counter = u64::from_be_bytes(get_masked_at(buf, layout.od_ctr, layout.mask)?);
-            let len = u32::from_be_bytes(get_masked_at(buf, layout.od_dl, layout.mask)?);
-            let end = layout.od_d.checked_add(usize::try_from(len).ok()?)?;
+            let receiver_idx = u32::from_be_bytes(get_masked_at(buf, layout.odri, layout.mask)?);
+            let counter = u64::from_be_bytes(get_masked_at(buf, layout.odct, layout.mask)?);
+            let len = u32::from_be_bytes(get_masked_at(buf, layout.oddl, layout.mask)?);
+            let end = layout.odd.checked_add(usize::try_from(len).ok()?)?;
             let consumed = end
-                .max(layout.od_ridx.checked_add(4)?)
-                .max(layout.od_ctr.checked_add(8)?)
-                .max(layout.od_dl.checked_add(4)?)
-                .max(layout.o_ty.checked_add(1)?);
+                .max(layout.odri.checked_add(4)?)
+                .max(layout.odct.checked_add(8)?)
+                .max(layout.oddl.checked_add(4)?)
+                .max(layout.oty.checked_add(1)?);
             if buf.len() < consumed {
                 return None;
             }
-            let data = buf[layout.od_d..end].to_vec();
+            let data = buf[layout.odd..end].to_vec();
             buf.advance(consumed);
 
             return Some(Ok(Packet::Data {
@@ -210,7 +285,7 @@ pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet,
 /// Appends a packet using layout-relative offsets, randomizing unused bytes.
 /// The layout must have passed `PacketLayout::check`.
 pub fn append(buf: &mut BytesMut, packet: Packet, layout: &PacketLayout) -> Result<(), Error> {
-    let ty_end = layout.o_ty.checked_add(1).ok_or(Error::PacketOverflow)?;
+    let ty_end = layout.oty.checked_add(1).ok_or(Error::PacketOverflow)?;
     let (ty, len) = match &packet {
         Packet::Initiating(_) => (0, layout.ilen().max(ty_end)),
         Packet::Reply(_) => (1, layout.rlen().max(ty_end)),
@@ -219,12 +294,12 @@ pub fn append(buf: &mut BytesMut, packet: Packet, layout: &PacketLayout) -> Resu
         } => {
             u32::try_from(data.len()).map_err(|_| Error::PacketOverflow)?;
             let len = layout
-                .od_d
+                .odd
                 .checked_add(data.len())
                 .ok_or(Error::PacketOverflow)?
-                .max(layout.od_ridx.checked_add(4).ok_or(Error::PacketOverflow)?)
-                .max(layout.od_ctr.checked_add(8).ok_or(Error::PacketOverflow)?)
-                .max(layout.od_dl.checked_add(4).ok_or(Error::PacketOverflow)?)
+                .max(layout.odri.checked_add(4).ok_or(Error::PacketOverflow)?)
+                .max(layout.odct.checked_add(8).ok_or(Error::PacketOverflow)?)
+                .max(layout.oddl.checked_add(4).ok_or(Error::PacketOverflow)?)
                 .max(ty_end);
             (2, len)
         }
@@ -234,7 +309,7 @@ pub fn append(buf: &mut BytesMut, packet: Packet, layout: &PacketLayout) -> Resu
     buf.resize(end, 0);
     fastrand::fill(&mut buf[start..end]);
     let out = &mut buf[start..end];
-    out[layout.o_ty] = ty ^ layout.mask as u8;
+    out[layout.oty] = ty ^ layout.mask as u8;
     match packet {
         Packet::Initiating(Initiating {
             enc_pub_key,
@@ -242,44 +317,34 @@ pub fn append(buf: &mut BytesMut, packet: Packet, layout: &PacketLayout) -> Resu
             sender_idx,
             enc_ts,
         }) => {
-            put_masked_at(out, layout.oi_ets, &enc_ts, layout.mask);
-            put_masked_at(out, layout.oi_sidx, &sender_idx.to_be_bytes(), layout.mask);
-            put_masked_at(out, layout.oi_eph, &ephemeral, layout.mask);
-            put_masked_at(out, layout.oi_epk, &enc_pub_key, layout.mask);
+            put_masked_at(out, layout.oiets, &enc_ts, layout.mask);
+            put_masked_at(out, layout.oisi, &sender_idx.to_be_bytes(), layout.mask);
+            put_masked_at(out, layout.oieph, &ephemeral, layout.mask);
+            put_masked_at(out, layout.oiepk, &enc_pub_key, layout.mask);
         }
         Packet::Reply(Replying {
             eph,
             sender_idx,
             receiver_idx,
         }) => {
-            put_masked_at(out, layout.or_sidx, &sender_idx.to_be_bytes(), layout.mask);
-            put_masked_at(
-                out,
-                layout.or_ridx,
-                &receiver_idx.to_be_bytes(),
-                layout.mask,
-            );
-            put_masked_at(out, layout.or_eph, &eph, layout.mask);
+            put_masked_at(out, layout.orsi, &sender_idx.to_be_bytes(), layout.mask);
+            put_masked_at(out, layout.orri, &receiver_idx.to_be_bytes(), layout.mask);
+            put_masked_at(out, layout.oreph, &eph, layout.mask);
         }
         Packet::Data {
             receiver_idx,
             counter,
             ciphertext: data,
         } => {
+            put_masked_at(out, layout.odri, &receiver_idx.to_be_bytes(), layout.mask);
+            put_masked_at(out, layout.odct, &counter.to_be_bytes(), layout.mask);
             put_masked_at(
                 out,
-                layout.od_ridx,
-                &receiver_idx.to_be_bytes(),
-                layout.mask,
-            );
-            put_masked_at(out, layout.od_ctr, &counter.to_be_bytes(), layout.mask);
-            put_masked_at(
-                out,
-                layout.od_dl,
+                layout.oddl,
                 &(data.len() as u32).to_be_bytes(),
                 layout.mask,
             );
-            out[layout.od_d..layout.od_d + data.len()].copy_from_slice(&data);
+            out[layout.odd..layout.odd + data.len()].copy_from_slice(&data);
         }
     }
     Ok(())
@@ -345,9 +410,9 @@ mod tests {
     fn test_parse_handshake_packets() {
         let layout = PacketLayout::default();
         let mut initiation = vec![0; layout.ilen()];
-        initiation[layout.oi_eph..layout.oi_eph + 32].fill(7);
-        initiation[layout.oi_epk..layout.oi_epk + 48].fill(8);
-        initiation[layout.oi_ets..layout.oi_ets + 24].fill(10);
+        initiation[layout.oieph..layout.oieph + 32].fill(7);
+        initiation[layout.oiepk..layout.oiepk + 48].fill(8);
+        initiation[layout.oiets..layout.oiets + 24].fill(10);
         let mut buf = BytesMut::from(initiation.as_slice());
         let Packet::Initiating(packet) = parse(&mut buf, &layout).unwrap().unwrap() else {
             panic!("expected initiation");
@@ -362,8 +427,8 @@ mod tests {
         assert_eq!(partial, original);
 
         let mut reply = vec![0; layout.rlen()];
-        reply[layout.o_ty] = 1;
-        reply[layout.or_eph..layout.or_eph + 32].fill(9);
+        reply[layout.oty] = 1;
+        reply[layout.oreph..layout.oreph + 32].fill(9);
         let mut buf = BytesMut::from(reply.as_slice());
         let Packet::Reply(packet) = parse(&mut buf, &layout).unwrap().unwrap() else {
             panic!("expected reply");
@@ -381,8 +446,8 @@ mod tests {
         // Check both ends of every fixed field in all packet variants.
         for o_ty in [1, 32, 33, 80, 56, 8, 9, 12] {
             let layout = PacketLayout {
-                o_ty,
-                od_d: 100,
+                oty: o_ty,
+                odd: 100,
                 ..PacketLayout::default()
             };
             assert!(layout.check().is_err(), "type offset {o_ty}");
@@ -393,23 +458,23 @@ mod tests {
     fn test_index_layout_overlap() {
         for layout in [
             PacketLayout {
-                oi_sidx: 0,
+                oisi: 0,
                 ..PacketLayout::default()
             },
             PacketLayout {
-                oi_sidx: 78,
+                oisi: 78,
                 ..PacketLayout::default()
             },
             PacketLayout {
-                or_sidx: 31,
+                orsi: 31,
                 ..PacketLayout::default()
             },
             PacketLayout {
-                or_ridx: 31,
+                orri: 31,
                 ..PacketLayout::default()
             },
             PacketLayout {
-                or_ridx: 36,
+                orri: 36,
                 ..PacketLayout::default()
             },
         ] {
@@ -421,7 +486,7 @@ mod tests {
     fn test_data_receiver_index_overlap() {
         for od_ridx in [0, 4, 12, 16, 17] {
             let layout = PacketLayout {
-                od_ridx,
+                odri: od_ridx,
                 ..PacketLayout::default()
             };
             assert!(layout.check().is_err());
@@ -432,13 +497,13 @@ mod tests {
     fn test_data_layout_overlap() {
         for od_d in [0, 1, 8, 9, 12] {
             let layout = PacketLayout {
-                od_d,
+                odd: od_d,
                 ..PacketLayout::default()
             };
             assert!(layout.check().is_err());
         }
         let layout = PacketLayout {
-            o_ty: 17,
+            oty: 17,
             ..PacketLayout::default()
         };
         assert!(layout.check().is_err());
@@ -452,16 +517,16 @@ mod tests {
                 ..PacketLayout::default()
             };
             for payload in [&b"hello"[..], &b""[..]] {
-                let mut packet = vec![0; layout.od_d];
-                packet[layout.o_ty] = 2 ^ mask as u8;
+                let mut packet = vec![0; layout.odd];
+                packet[layout.oty] = 2 ^ mask as u8;
                 for (i, byte) in 0x12345678u32.to_be_bytes().into_iter().enumerate() {
-                    packet[layout.od_ridx + i] = byte ^ mask.to_be_bytes()[i % 4];
+                    packet[layout.odri + i] = byte ^ mask.to_be_bytes()[i % 4];
                 }
                 for (i, byte) in 0x0123456789abcdefu64.to_be_bytes().into_iter().enumerate() {
-                    packet[layout.od_ctr + i] = byte ^ mask.to_be_bytes()[i % 4];
+                    packet[layout.odct + i] = byte ^ mask.to_be_bytes()[i % 4];
                 }
                 for (i, byte) in (payload.len() as u32).to_be_bytes().into_iter().enumerate() {
-                    packet[layout.od_dl + i] = byte ^ mask.to_be_bytes()[i % 4];
+                    packet[layout.oddl + i] = byte ^ mask.to_be_bytes()[i % 4];
                 }
                 packet.extend_from_slice(payload);
                 let expected_len = packet.len();
@@ -527,18 +592,18 @@ mod tests {
             let mut codec = Codec {
                 layout: PacketLayout {
                     mask,
-                    o_ty: 2,
-                    oi_eph: 5,
-                    oi_epk: 40,
-                    or_eph: 6,
-                    oi_ets: 100,
-                    oi_sidx: 90,
-                    or_sidx: 70,
-                    or_ridx: 80,
-                    od_ridx: 14,
-                    od_ctr: 5,
-                    od_dl: 20,
-                    od_d: 28,
+                    oty: 2,
+                    oieph: 5,
+                    oiepk: 40,
+                    oreph: 6,
+                    oiets: 100,
+                    oisi: 90,
+                    orsi: 70,
+                    orri: 80,
+                    odri: 14,
+                    odct: 5,
+                    oddl: 20,
+                    odd: 28,
                 },
             };
             codec.layout.check().unwrap();
