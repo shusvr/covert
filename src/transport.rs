@@ -1,6 +1,6 @@
 use circular_buffer::FixedCircularBuffer;
 use dashmap::DashMap;
-use futures::{Sink, SinkExt, Stream};
+use futures::{Sink, SinkExt};
 use std::{
     sync::{
         Arc,
@@ -318,17 +318,9 @@ async fn process_incoming(
     Ok(Some(out))
 }
 
-pub trait PacketSender<R>:
-    Sink<(Packet, R), Error = codec::Error> + Stream<Item = Result<(Packet, R), codec::Error>> + Unpin
-{
-}
+pub trait PacketSender<R>: Sink<(Packet, R), Error = codec::Error> + Unpin {}
 
-impl<R, T> PacketSender<R> for T where
-    T: Sink<(Packet, R), Error = codec::Error>
-        + Stream<Item = Result<(Packet, R), codec::Error>>
-        + Unpin
-{
-}
+impl<R, T> PacketSender<R> for T where T: Sink<(Packet, R), Error = codec::Error> + Unpin {}
 
 pub async fn initiate<R: Clone>(
     state: &State,
