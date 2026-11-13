@@ -93,7 +93,7 @@ async fn expired_session_queues_traffic_and_reinitiates() {
     state.peering.insert(peer_id, 1);
     let mut listener = UdpListener {
         framed: UdpFramed::new(socket, Codec::new(PacketLayout::default())),
-        peer_addresses: Arc::new(
+        routing: Arc::new(
             [(peer_id, remote.local_addr().unwrap())]
                 .into_iter()
                 .collect(),
@@ -212,7 +212,7 @@ async fn background_task_retries_peers_with_known_endpoints() {
         .unwrap();
     let mut receiver = UdpListener {
         framed: UdpFramed::new(socket, Codec::new(PacketLayout::default())),
-        peer_addresses: Arc::new(DashMap::new()),
+        routing: Arc::new(DashMap::new()),
     };
     let (packet, _) = receive(&mut receiver).await;
     let Packet::Initiating(initiation) = packet else {
@@ -273,7 +273,7 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     let state_b = Arc::new(State::new(tx_b));
     let mut a = UdpListener {
         framed: UdpFramed::new(socket_a, Codec::new(PacketLayout::default())),
-        peer_addresses: Arc::new(
+        routing: Arc::new(
             [(peer_a, socket_b.local_addr().unwrap())]
                 .into_iter()
                 .collect(),
@@ -281,7 +281,7 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     };
     let mut b = UdpListener {
         framed: UdpFramed::new(socket_b, Codec::new(PacketLayout::default())),
-        peer_addresses: Arc::new(DashMap::new()),
+        routing: Arc::new(DashMap::new()),
     };
 
     // Queue traffic on both sides before their sessions exist.
@@ -311,32 +311,18 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     };
     let local_a = initiation.sender_idx;
     assert!(state_a.initiated.contains_key(&local_a));
-    handle_udp_packet(
-        &state_b,
-        &mut b.framed,
-        &config_b,
-        &b.peer_addresses,
-        packet,
-        from,
-    )
-    .await
-    .unwrap();
+    handle_udp_packet(&state_b, &mut b.framed, &config_b, &b.routing, packet, from)
+        .await
+        .unwrap();
     let (packet, from) = receive(&mut a).await;
     let Packet::Reply(ref reply) = packet else {
         panic!("expected reply")
     };
     let local_b = reply.sender_idx;
     assert_eq!(reply.receiver_idx, local_a);
-    handle_udp_packet(
-        &state_a,
-        &mut a.framed,
-        &config_a,
-        &a.peer_addresses,
-        packet,
-        from,
-    )
-    .await
-    .unwrap();
+    handle_udp_packet(&state_a, &mut a.framed, &config_a, &a.routing, packet, from)
+        .await
+        .unwrap();
     assert!(state_a.initiated.is_empty());
     assert_eq!(*state_a.peering.get(&peer_a).unwrap().value(), local_a);
     assert_eq!(*state_b.peering.get(&peer_b).unwrap().value(), local_b);
@@ -354,28 +340,14 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     assert_eq!(state_a.queued.get(&unrelated_peer).unwrap().len(), 1);
     for expected in [b"queued first".as_slice(), b"queued second".as_slice()] {
         let (packet, from) = receive(&mut b).await;
-        handle_udp_packet(
-            &state_b,
-            &mut b.framed,
-            &config_b,
-            &b.peer_addresses,
-            packet,
-            from,
-        )
-        .await
-        .unwrap();
+        handle_udp_packet(&state_b, &mut b.framed, &config_b, &b.routing, packet, from)
+            .await
+            .unwrap();
         assert_eq!(rx_b.try_recv().unwrap(), expected);
         let (packet, from) = receive(&mut a).await;
-        handle_udp_packet(
-            &state_a,
-            &mut a.framed,
-            &config_a,
-            &a.peer_addresses,
-            packet,
-            from,
-        )
-        .await
-        .unwrap();
+        handle_udp_packet(&state_a, &mut a.framed, &config_a, &a.routing, packet, from)
+            .await
+            .unwrap();
         assert_eq!(rx_a.try_recv().unwrap(), expected);
     }
 
@@ -384,16 +356,9 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
         .unwrap();
     let (packet, from) = receive(&mut b).await;
     assert!(matches!(packet, Packet::Data { receiver_idx, .. } if receiver_idx == local_b));
-    handle_udp_packet(
-        &state_b,
-        &mut b.framed,
-        &config_b,
-        &b.peer_addresses,
-        packet,
-        from,
-    )
-    .await
-    .unwrap();
+    handle_udp_packet(&state_b, &mut b.framed, &config_b, &b.routing, packet, from)
+        .await
+        .unwrap();
     assert_eq!(
         timeout(Duration::from_secs(3), rx_b.recv())
             .await
@@ -402,22 +367,15 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
         b"hello"
     );
 
-    assert_eq!(*b.peer_addresses.get(&peer_b).unwrap(), from);
+    assert_eq!(*b.routing.get(&peer_b).unwrap(), from);
     b.transmit(&state_b, &config_b, peer_b, b"reply")
         .await
         .unwrap();
     let (packet, from) = receive(&mut a).await;
     assert!(matches!(packet, Packet::Data { receiver_idx, .. } if receiver_idx == local_a));
-    handle_udp_packet(
-        &state_a,
-        &mut a.framed,
-        &config_a,
-        &a.peer_addresses,
-        packet,
-        from,
-    )
-    .await
-    .unwrap();
+    handle_udp_packet(&state_a, &mut a.framed, &config_a, &a.routing, packet, from)
+        .await
+        .unwrap();
     assert_eq!(
         timeout(Duration::from_secs(3), rx_a.recv())
             .await
@@ -465,7 +423,7 @@ async fn background_task_sends_encrypted_keepalive_with_jitter() {
         .unwrap();
     let mut remote = UdpListener {
         framed: UdpFramed::new(socket, Codec::new(PacketLayout::default())),
-        peer_addresses: Arc::new(DashMap::new()),
+        routing: Arc::new(DashMap::new()),
     };
     let (packet, from) = receive(&mut remote).await;
     let Packet::Initiating(initiation) = packet else {

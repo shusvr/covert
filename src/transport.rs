@@ -1,5 +1,6 @@
 use circular_buffer::FixedCircularBuffer;
 use dashmap::DashMap;
+use futures::{Sink, SinkExt, Stream};
 use std::{
     sync::{
         Arc,
@@ -8,14 +9,14 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::{
     Key, Result,
-    codec::Packet,
+    codec::{self, Packet},
     config::{Config, ListenerConfig, PubKey},
-    crypto::{Cipher, Initiating, Replying, finish, post_reply, pre_reply},
+    crypto::{self, Cipher, Initiating, Replying, finish, post_reply, pre_reply},
     transport::udp::UdpListener,
 };
 
@@ -107,6 +108,13 @@ impl State {
             .is_live()
             .then(|| (handle.cipher.clone(), handle.receiver_idx))
     }
+
+    fn has_live_connection(&self, peer_id: Uuid) -> bool {
+        let index = self.peering.get(&peer_id).map(|entry| *entry.value());
+        index
+            .and_then(|index| self.established.get(&index))
+            .is_some_and(|handle| handle.is_live())
+    }
 }
 
 pub mod icmp;
@@ -129,7 +137,15 @@ impl Listener {
     ) -> Result<()> {
         match self {
             Listener::Udp(udp) => {
-                udp.transmit(state, config, peer_id, packet).await?;
+                transmit(
+                    state,
+                    config,
+                    &udp.peer_addresses,
+                    &mut udp.framed,
+                    peer_id,
+                    packet,
+                )
+                .await?;
             }
         }
 
@@ -300,4 +316,202 @@ async fn process_incoming(
     };
 
     Ok(Some(out))
+}
+
+pub trait PacketSender<R>:
+    Sink<(Packet, R), Error = codec::Error> + Stream<Item = Result<(Packet, R), codec::Error>> + Unpin
+{
+}
+
+impl<R, T> PacketSender<R> for T where
+    T: Sink<(Packet, R), Error = codec::Error>
+        + Stream<Item = Result<(Packet, R), codec::Error>>
+        + Unpin
+{
+}
+
+pub async fn initiate<R: Clone>(
+    state: &State,
+    config: &Config,
+    routing: &DashMap<Uuid, R>,
+    sender: &mut impl PacketSender<R>,
+    peer_id: Uuid,
+) -> Result<()> {
+    debug!(?peer_id, "Handshake initiation requested");
+
+    let Some(addr) = routing.get(&peer_id).map(|e| e.value().clone()) else {
+        debug!(
+            ?peer_id,
+            "Peer has no address associated, skipping initiation"
+        );
+        return Ok(());
+    };
+
+    if state.has_live_connection(peer_id) {
+        debug!(
+            ?peer_id,
+            "Peer already has a live connection, skipping initiation"
+        );
+        return Ok(());
+    }
+
+    if let Some(peer) = config.peers.iter().find(|p| p.peer_id == peer_id) {
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let sender_idx = fastrand::u32(..);
+        let initiating = crypto::initiate(
+            &config.interface.private_key.0,
+            &peer.public_key.0,
+            timestamp,
+            sender_idx,
+        )?;
+
+        // Register before sending: the receive task may process the reply immediately.
+        state.initiated.insert(
+            sender_idx,
+            Initiated::new(
+                peer_id,
+                peer.pre_shared_key.as_ref().map(|key| key.0),
+                initiating.clone(),
+            ),
+        );
+        debug!(
+            ?peer_id,
+            local_idx = sender_idx,
+            "Sending handshake initiation"
+        );
+        let packet = Packet::Initiating(initiating);
+        if let Err(err) = sender.send((packet, addr)).await {
+            state.initiated.remove(&sender_idx);
+            return Err(err.into());
+        }
+        debug!(
+            ?peer_id,
+            local_idx = sender_idx,
+            "Handshake initiation sent"
+        );
+    } else {
+        warn!(?peer_id, "Trying to initiate by unknown peer id");
+    }
+
+    Ok(())
+}
+
+pub async fn transmit<R: Clone>(
+    state: &State,
+    config: &Config,
+    routing: &DashMap<Uuid, R>,
+    sender: &mut impl PacketSender<R>,
+    peer_id: Uuid,
+    packet: &[u8],
+) -> Result<()> {
+    debug!(?peer_id, len = packet.len(), "Transmitting");
+
+    let Some(addr) = routing.get(&peer_id).map(|x| x.value().clone()) else {
+        debug!(?peer_id, "Peer has not been reached yet, skipping transmit");
+        state
+            .queued
+            .entry(peer_id)
+            .or_default()
+            .push_back(packet.to_owned());
+        return Ok(());
+    };
+
+    let local_idx = state.peering.get(&peer_id).map(|entry| *entry.value());
+    if let Some(local_idx) = local_idx
+        && let Some((cipher, receiver_idx)) = state.session(local_idx)
+    {
+        let (counter, ciphertext) = match cipher.encrypt(packet.to_owned()) {
+            Ok(encrypted) => encrypted,
+            Err(err) => {
+                debug!(?peer_id, "Cipher failed to encrypt, cleaning up");
+                state.established.remove(&local_idx);
+                return Err(err.into());
+            }
+        };
+        debug!(?peer_id, "Sending data");
+        let packet = Packet::Data {
+            receiver_idx,
+            counter,
+            ciphertext,
+        };
+        sender.send((packet, addr)).await?;
+        return Ok(());
+    }
+
+    if let Some(local_idx) = local_idx {
+        state.established.remove(&local_idx);
+    }
+    // Queue traffic while a missing or expired session is re-established.
+    state
+        .queued
+        .entry(peer_id)
+        .or_default()
+        .push_back(packet.to_owned());
+    initiate(state, config, routing, sender, peer_id).await?;
+
+    Ok(())
+}
+
+async fn initiate_disconnected_peers<R: Clone>(
+    state: &State,
+    config: &Config,
+    routing: &DashMap<Uuid, R>,
+    sender: &mut impl PacketSender<R>,
+) {
+    state.established.retain(|_, handle| handle.is_live());
+    state
+        .initiated
+        .retain(|_, pending| pending.when.elapsed() < Duration::from_secs(60));
+    for peer in &config.peers {
+        if routing.contains_key(&peer.peer_id) && !state.has_live_connection(peer.peer_id) {
+            if let Err(err) = initiate(state, config, routing, &mut *sender, peer.peer_id).await {
+                error!(peer_id = ?peer.peer_id, "Failed to initiate handshake: {err}");
+            }
+        }
+    }
+}
+
+async fn send_keepalives<R: Clone>(
+    state: &State,
+    config: &Config,
+    routing: &DashMap<Uuid, R>,
+    sender: &mut impl PacketSender<R>,
+) {
+    for peer in &config.peers {
+        let Some(addr) = routing
+            .get(&peer.peer_id)
+            .map(|entry| entry.value().clone())
+        else {
+            continue;
+        };
+        let Some(index) = state.peering.get(&peer.peer_id).map(|entry| *entry.value()) else {
+            continue;
+        };
+        let Some((cipher, receiver_idx)) = state.session(index) else {
+            continue;
+        };
+        match cipher.encrypt(Vec::new()) {
+            Ok((counter, ciphertext)) => {
+                let packet = Packet::Data {
+                    receiver_idx,
+                    counter,
+                    ciphertext,
+                };
+                match sender.send((packet, addr)).await {
+                    Ok(()) => {
+                        debug!(peer_id = ?peer.peer_id, receiver_idx, counter, "Keepalive sent")
+                    }
+                    Err(err) => error!(peer_id = ?peer.peer_id, "Failed to send keepalive: {err}"),
+                }
+            }
+            Err(_) => {
+                debug!(peer_id = ?peer.peer_id, "Cipher failed to encrypt keepalive, cleaning up");
+                state.established.remove(&index);
+            }
+        }
+    }
 }
