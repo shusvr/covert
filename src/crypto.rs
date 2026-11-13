@@ -34,7 +34,7 @@ pub fn sk_to_bytes(sk: &PrivateKey) -> Key {
     seed.as_ref().try_into().unwrap()
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Initiating {
     pub(crate) enc_ts: SealedTimestamp,
     pub(crate) sender_idx: u32,
