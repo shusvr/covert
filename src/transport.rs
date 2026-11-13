@@ -5,20 +5,21 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::mpsc;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
     Key, Result,
-    config::{Config, ListenerConfig},
-    crypto::{Cipher, Initiating},
+    codec::Packet,
+    config::{Config, ListenerConfig, PubKey},
+    crypto::{Cipher, Initiating, Replying, finish, post_reply, pre_reply},
     transport::udp::UdpListener,
 };
 
 pub struct PeerHandle {
-    #[expect(dead_code)]
     peer_id: Uuid,
     receiver_idx: u32,
     timestamp: u64,
@@ -151,4 +152,152 @@ pub async fn create_listener(state: &Arc<State>, config: &Arc<Config>) -> Result
 
 fn establish(cipher: Cipher, timestamp: u64, peer_id: Uuid, receiver_idx: u32) -> PeerHandle {
     PeerHandle::new(peer_id, receiver_idx, Arc::new(cipher), timestamp)
+}
+
+enum ProcessResult {
+    Established {
+        local_idx: u32,
+        replying: Option<Replying>,
+        handle: PeerHandle,
+    },
+    Packet {
+        plaintext: Vec<u8>,
+    },
+}
+
+async fn process_incoming(
+    state: &Arc<State>,
+    config: &Config,
+    packet: Packet,
+) -> Result<Option<ProcessResult>> {
+    let out = match packet {
+        Packet::Initiating(initiating) => {
+            debug!(
+                remote_idx = initiating.sender_idx,
+                "Handshake initiation received"
+            );
+            let (remote_pk, timestamp) = pre_reply(
+                &config.interface.private_key.0,
+                initiating.enc_pub_key,
+                initiating.ephemeral,
+                initiating.enc_ts,
+            )?;
+
+            let Some(peer) = config
+                .peers
+                .iter()
+                .find(|p| p.public_key.0 == remote_pk.as_ref())
+            else {
+                let pubkey: PubKey = remote_pk.into();
+                warn!(?pubkey, "Received initiating from an unknown peer");
+                return Ok(None);
+            };
+
+            debug!(peer_id = ?peer.peer_id, remote_idx = initiating.sender_idx, timestamp, "Handshake initiation accepted");
+
+            // Established sessions are indexed by our own index, not the sender's.
+            let local_idx = state.peering.get(&peer.peer_id).map(|entry| *entry.value());
+            if let Some(existing) = local_idx.and_then(|index| state.established.get(&index))
+                && existing.timestamp >= timestamp
+            {
+                warn!("Possible replay attack, received old timestamp");
+                return Ok(None);
+            }
+
+            let sender_idx = fastrand::u32(..);
+            let (replying, cipher) = post_reply(
+                &remote_pk,
+                peer.pre_shared_key.as_ref().map(|k| &k.0),
+                sender_idx,
+                initiating.sender_idx,
+            )?;
+
+            let handle = establish(cipher, timestamp, peer.peer_id, initiating.sender_idx);
+            ProcessResult::Established {
+                local_idx: sender_idx,
+                replying: Some(replying),
+                handle,
+            }
+        }
+        Packet::Reply(replying) => {
+            debug!(
+                local_idx = replying.receiver_idx,
+                remote_idx = replying.sender_idx,
+                "Handshake reply received"
+            );
+            let Some((_, initiated)) = state.initiated.remove(&replying.receiver_idx) else {
+                warn!(
+                    receiver_idx = replying.receiver_idx,
+                    "Received a reply to an unknown index"
+                );
+                return Ok(None);
+            };
+
+            if initiated.initiating.sender_idx != replying.receiver_idx {
+                warn!(
+                    sender_idx = initiated.initiating.sender_idx,
+                    receiver_idx = replying.receiver_idx,
+                    "Misbehaving peer, i.sender_idx != r.receiver_idx"
+                );
+            }
+
+            let cipher = finish(
+                &config.interface.private_key.0,
+                initiated.psk.as_ref(),
+                replying.eph,
+            )?;
+
+            let timestamp = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs();
+
+            let handle = establish(cipher, timestamp, initiated.peer_id, replying.sender_idx);
+            ProcessResult::Established {
+                local_idx: replying.receiver_idx,
+                replying: None,
+                handle,
+            }
+        }
+        Packet::Data {
+            receiver_idx,
+            counter,
+            ciphertext,
+        } => {
+            let Some(handle) = state.established.get(&receiver_idx) else {
+                debug!(receiver_idx, "Received data for an unknown session");
+                return Ok(None);
+            };
+            if !handle.is_live() {
+                debug!(receiver_idx, "Session has expired, cleaning up");
+                drop(handle);
+                state.established.remove(&receiver_idx);
+                return Ok(None);
+            }
+            let plaintext = match handle.cipher.decrypt(counter, ciphertext) {
+                Ok(plaintext) => plaintext,
+                Err(_) => {
+                    debug!(receiver_idx, "Cipher failed to decrypt, cleaning up");
+                    drop(handle);
+                    state.established.remove(&receiver_idx);
+                    return Ok(None);
+                }
+            };
+            if plaintext.is_empty() {
+                debug!(receiver_idx, "Plaintext is empty, keepalive");
+                handle.keep_alive();
+                return Ok(None);
+            }
+            // Decryption is synchronous; release the map guard before TUN delivery.
+            drop(handle);
+            debug!(
+                receiver_idx,
+                plaintext_len = plaintext.len(),
+                "Decrypted ciphertext"
+            );
+
+            ProcessResult::Packet { plaintext }
+        }
+    };
+
+    Ok(Some(out))
 }

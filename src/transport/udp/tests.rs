@@ -1,7 +1,8 @@
 use super::*;
 use crate::{
     config::{Interface, ListenerConfig, Peer, PeerTransport},
-    crypto::{pk_to_bytes, random_sk, sk_to_bytes},
+    crypto::{finish, pk_to_bytes, post_reply, pre_reply, random_sk, sk_to_bytes},
+    transport::establish,
 };
 use tokio::{sync::mpsc, time::timeout};
 
@@ -143,7 +144,7 @@ async fn received_keepalive_refreshes_session_and_invalid_data_removes_it() {
     let mut framed = UdpFramed::new(socket, Codec::new(PacketLayout::default()));
     let addresses = DashMap::new();
     let (counter, ciphertext) = sender.encrypt(vec![]).unwrap();
-    process_incoming(
+    handle_udp_packet(
         &state,
         &mut framed,
         &config,
@@ -165,7 +166,7 @@ async fn received_keepalive_refreshes_session_and_invalid_data_removes_it() {
     ciphertext[0] ^= 1;
     timeout(
         Duration::from_secs(3),
-        process_incoming(
+        handle_udp_packet(
             &state,
             &mut framed,
             &config,
@@ -310,7 +311,7 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     };
     let local_a = initiation.sender_idx;
     assert!(state_a.initiated.contains_key(&local_a));
-    process_incoming(
+    handle_udp_packet(
         &state_b,
         &mut b.framed,
         &config_b,
@@ -326,7 +327,7 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     };
     let local_b = reply.sender_idx;
     assert_eq!(reply.receiver_idx, local_a);
-    process_incoming(
+    handle_udp_packet(
         &state_a,
         &mut a.framed,
         &config_a,
@@ -353,7 +354,7 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     assert_eq!(state_a.queued.get(&unrelated_peer).unwrap().len(), 1);
     for expected in [b"queued first".as_slice(), b"queued second".as_slice()] {
         let (packet, from) = receive(&mut b).await;
-        process_incoming(
+        handle_udp_packet(
             &state_b,
             &mut b.framed,
             &config_b,
@@ -365,7 +366,7 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
         .unwrap();
         assert_eq!(rx_b.try_recv().unwrap(), expected);
         let (packet, from) = receive(&mut a).await;
-        process_incoming(
+        handle_udp_packet(
             &state_a,
             &mut a.framed,
             &config_a,
@@ -383,7 +384,7 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
         .unwrap();
     let (packet, from) = receive(&mut b).await;
     assert!(matches!(packet, Packet::Data { receiver_idx, .. } if receiver_idx == local_b));
-    process_incoming(
+    handle_udp_packet(
         &state_b,
         &mut b.framed,
         &config_b,
@@ -407,7 +408,7 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
         .unwrap();
     let (packet, from) = receive(&mut a).await;
     assert!(matches!(packet, Packet::Data { receiver_idx, .. } if receiver_idx == local_a));
-    process_incoming(
+    handle_udp_packet(
         &state_a,
         &mut a.framed,
         &config_a,

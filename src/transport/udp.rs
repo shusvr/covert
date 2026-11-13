@@ -1,9 +1,9 @@
 use crate::{
     Result,
     codec::{Codec, Packet, PacketLayout},
-    config::{Config, PubKey},
-    crypto::{finish, initiate, post_reply, pre_reply},
-    transport::{Initiated, State, establish},
+    config::Config,
+    crypto::initiate,
+    transport::{Initiated, ProcessResult, State, process_incoming},
 };
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
@@ -277,10 +277,11 @@ async fn socket_listener_task(
                 match result {
                     Some(Ok((packet, addr))) => {
                         trace!(?addr, "Received a packet on udp socket");
-                        if let Err(err) = process_incoming(
-                            &state, &mut framed, &config, &peer_addresses, packet, addr,
-                        ).await {
-                            error!("Failed to process incoming packet: {err}");
+
+                        match handle_udp_packet(&state, &mut framed, &config, &peer_addresses, packet, addr).await {
+                            Ok(true) => {},
+                            Ok(false) => break,
+                            Err(err) => error!("Failed to process incoming packet: {err}"),
                         }
                     }
                     Some(Err(err)) => error!("Failed to parse the packet on udp socket: {err}"),
@@ -289,6 +290,44 @@ async fn socket_listener_task(
             }
         }
     }
+}
+
+// Return false when TUN delivery is closed and the receive loop should stop.
+async fn handle_udp_packet(
+    state: &Arc<State>,
+    framed: &mut UdpFramed<Codec, Arc<UdpSocket>>,
+    config: &Config,
+    peer_addresses: &DashMap<Uuid, SocketAddr>,
+    packet: Packet,
+    addr: SocketAddr,
+) -> Result<bool> {
+    match process_incoming(state, config, packet).await? {
+        Some(ProcessResult::Established {
+            local_idx,
+            replying,
+            handle,
+        }) => {
+            let peer_id = handle.peer_id;
+            peer_addresses.insert(peer_id, addr);
+            state.established.insert(local_idx, handle);
+            state.peering.insert(peer_id, local_idx);
+
+            // Send the handshake reply before flushing encrypted data.
+            if let Some(replying) = replying {
+                framed.send((Packet::Reply(replying), addr)).await?;
+            }
+            debug!(?peer_id, remote_addr = %addr, local_idx, "Connection established");
+            flush_queued(state, framed, peer_id, local_idx, addr).await?;
+        }
+        Some(ProcessResult::Packet { plaintext }) => {
+            if state.tun_in_tx.send(plaintext).await.is_err() {
+                debug!("tun_in_rx is closed, exiting socket_listener_task");
+                return Ok(false);
+            }
+        }
+        None => {}
+    }
+    Ok(true)
 }
 
 async fn flush_queued(
@@ -335,160 +374,6 @@ async fn flush_queued(
         .queued
         .remove_if(&peer_id, |_, queue| queue.is_empty());
     debug!(?peer_id, remote_addr = %addr, sent, "Flushed queued packets");
-    Ok(())
-}
-
-#[tracing::instrument(skip(state, framed, packet, config, peer_addresses))]
-async fn process_incoming(
-    state: &Arc<State>,
-    framed: &mut UdpFramed<Codec, Arc<UdpSocket>>,
-    config: &Config,
-    peer_addresses: &DashMap<Uuid, SocketAddr>,
-    packet: Packet,
-    from: SocketAddr,
-) -> Result<()> {
-    match packet {
-        Packet::Initiating(initiating) => {
-            debug!(remote_addr = %from, remote_idx = initiating.sender_idx, "Handshake initiation received");
-            let (remote_pk, timestamp) = pre_reply(
-                &config.interface.private_key.0,
-                initiating.enc_pub_key,
-                initiating.ephemeral,
-                initiating.enc_ts,
-            )?;
-
-            let Some(peer) = config
-                .peers
-                .iter()
-                .find(|p| p.public_key.0 == remote_pk.as_ref())
-            else {
-                let pubkey: PubKey = remote_pk.into();
-                warn!(?pubkey, "Received initiating from an unknown peer");
-                return Ok(());
-            };
-
-            debug!(peer_id = ?peer.peer_id, remote_addr = %from, remote_idx = initiating.sender_idx, timestamp, "Handshake initiation accepted");
-
-            // Established sessions are indexed by our own index, not the sender's.
-            let local_idx = state.peering.get(&peer.peer_id).map(|entry| *entry.value());
-            if let Some(existing) = local_idx.and_then(|index| state.established.get(&index))
-                && existing.timestamp >= timestamp
-            {
-                warn!(?from, "Possible replay attack, received old timestamp");
-                return Ok(());
-            }
-
-            let sender_idx = fastrand::u32(..);
-            let (replying, cipher) = post_reply(
-                &remote_pk,
-                peer.pre_shared_key.as_ref().map(|k| &k.0),
-                sender_idx,
-                initiating.sender_idx,
-            )?;
-
-            peer_addresses.insert(peer.peer_id, from);
-            let handle = establish(cipher, timestamp, peer.peer_id, initiating.sender_idx);
-            state.established.insert(sender_idx, handle);
-            state.peering.insert(peer.peer_id, sender_idx);
-
-            debug!(peer_id = ?peer.peer_id, remote_addr = %from, local_idx = sender_idx,
-                remote_idx = initiating.sender_idx, "Sending handshake reply");
-            framed.send((Packet::Reply(replying), from)).await?;
-            debug!(peer_id = ?peer.peer_id, remote_addr = %from, local_idx = sender_idx,
-                remote_idx = initiating.sender_idx, "Handshake reply sent");
-            debug!(peer_id = ?peer.peer_id, remote_addr = %from, local_idx = sender_idx,
-                remote_idx = initiating.sender_idx, role = "responder", "Connection established");
-            flush_queued(state, framed, peer.peer_id, sender_idx, from).await?;
-        }
-        Packet::Reply(replying) => {
-            debug!(remote_addr = %from, local_idx = replying.receiver_idx,
-                remote_idx = replying.sender_idx, "Handshake reply received");
-            let Some((_, initiated)) = state.initiated.remove(&replying.receiver_idx) else {
-                warn!(
-                    receiver_idx = replying.receiver_idx,
-                    "Received a reply to an unknown index"
-                );
-                return Ok(());
-            };
-
-            if initiated.initiating.sender_idx != replying.receiver_idx {
-                warn!(
-                    sender_idx = initiated.initiating.sender_idx,
-                    receiver_idx = replying.receiver_idx,
-                    "Misbehaving peer, i.sender_idx != r.receiver_idx"
-                );
-            }
-
-            let cipher = finish(
-                &config.interface.private_key.0,
-                initiated.psk.as_ref(),
-                replying.eph,
-            )?;
-
-            let timestamp = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)?
-                .as_secs();
-
-            peer_addresses.insert(initiated.peer_id, from);
-            let handle = establish(cipher, timestamp, initiated.peer_id, replying.sender_idx);
-            state.established.insert(replying.receiver_idx, handle);
-            state
-                .peering
-                .insert(initiated.peer_id, replying.receiver_idx);
-            debug!(peer_id = ?initiated.peer_id, remote_addr = %from,
-                local_idx = replying.receiver_idx, remote_idx = replying.sender_idx,
-                role = "initiator", "Connection established");
-            flush_queued(
-                state,
-                framed,
-                initiated.peer_id,
-                replying.receiver_idx,
-                from,
-            )
-            .await?;
-        }
-        Packet::Data {
-            receiver_idx,
-            counter,
-            ciphertext,
-        } => {
-            let Some(handle) = state.established.get(&receiver_idx) else {
-                debug!(receiver_idx, "Received data for an unknown session");
-                return Ok(());
-            };
-            if !handle.is_live() {
-                debug!(receiver_idx, "Session has expired, cleaning up");
-                drop(handle);
-                state.established.remove(&receiver_idx);
-                return Ok(());
-            }
-            let plaintext = match handle.cipher.decrypt(counter, ciphertext) {
-                Ok(plaintext) => plaintext,
-                Err(_) => {
-                    debug!(receiver_idx, "Cipher failed to decrypt, cleaning up");
-                    drop(handle);
-                    state.established.remove(&receiver_idx);
-                    return Ok(());
-                }
-            };
-            if plaintext.is_empty() {
-                debug!(receiver_idx, "Plaintext is empty, keepalive");
-                handle.keep_alive();
-                return Ok(());
-            }
-            // Decryption is synchronous; release the map guard before TUN delivery.
-            drop(handle);
-            debug!(
-                receiver_idx,
-                plaintext_len = plaintext.len(),
-                "Decrypted ciphertext"
-            );
-            if state.tun_in_tx.send(plaintext).await.is_err() {
-                debug!("tun_in_tx is closed");
-            }
-        }
-    }
-
     Ok(())
 }
 
