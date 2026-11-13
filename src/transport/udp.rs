@@ -15,7 +15,7 @@ use std::{
 };
 use tokio::{
     net::UdpSocket,
-    time::{MissedTickBehavior, interval},
+    time::{Instant, MissedTickBehavior, interval, sleep},
 };
 use tokio_util::udp::UdpFramed;
 use tracing::{debug, error, trace, warn};
@@ -122,8 +122,10 @@ impl UdpListener {
         if let Some(index) = state.peering.get(&peer_id) {
             if let Some(handle) = state.established.get(&index.value().index) {
                 if let Some(actor) = handle.handle.upgrade() {
-                    if let Some((counter, ciphertext)) =
-                        actor.ask(EncryptPacket(packet.to_owned())).await.unwrap()
+                    if let Some((counter, ciphertext)) = actor
+                        .ask(EncryptPacket(packet.to_owned()))
+                        .await
+                        .map_err(|err| crate::Error::ActorRequest(err.map_msg(|_| ())))?
                     {
                         debug!(?peer_id, dst=?addr, "Sending data");
                         let packet = Packet::Data {
@@ -131,7 +133,7 @@ impl UdpListener {
                             counter,
                             ciphertext,
                         };
-                        self.framed.send((packet, addr)).await.unwrap();
+                        self.framed.send((packet, addr)).await?;
                     } else {
                         debug!(?peer_id, "Actor can not encrypt, cleaning up");
                         state.established.remove(&index.value().index);
@@ -209,6 +211,50 @@ async fn initiate_disconnected_peers(listener: &mut UdpListener, state: &State, 
     }
 }
 
+fn keepalive_delay() -> Duration {
+    Duration::from_secs_f64(8.0 + 4.0 * fastrand::f64())
+}
+
+async fn send_keepalives(listener: &mut UdpListener, state: &State, config: &Config) {
+    for peer in &config.peers {
+        let Some(addr) = listener
+            .peer_addresses
+            .get(&peer.peer_id)
+            .map(|entry| *entry.value())
+        else {
+            continue;
+        };
+        let Some(index) = state.peering.get(&peer.peer_id).map(|entry| entry.index) else {
+            continue;
+        };
+        // Release map guards before awaiting actor or socket operations.
+        let Some((actor, receiver_idx)) = state.established.get(&index).and_then(|handle| {
+            handle
+                .handle
+                .upgrade()
+                .map(|actor| (actor, handle.receiver_idx))
+        }) else {
+            continue;
+        };
+        match actor.ask(EncryptPacket(Vec::new())).await {
+            Ok(Some((counter, ciphertext))) => {
+                let packet = Packet::Data {
+                    receiver_idx,
+                    counter,
+                    ciphertext,
+                };
+                match listener.framed.send((packet, addr)).await {
+                    Ok(()) => {
+                        debug!(peer_id = ?peer.peer_id, remote_addr = %addr, receiver_idx, counter, "Keepalive sent")
+                    }
+                    Err(err) => error!(peer_id = ?peer.peer_id, "Failed to send keepalive: {err}"),
+                }
+            }
+            _ => debug!(peer_id = ?peer.peer_id, "Connection unavailable, skipping keepalive"),
+        }
+    }
+}
+
 async fn socket_listener_task(
     state: Arc<State>,
     socket: Arc<UdpSocket>,
@@ -222,8 +268,14 @@ async fn socket_listener_task(
     };
     let mut retries = interval(Duration::from_secs(5));
     retries.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let keepalive = sleep(keepalive_delay());
+    tokio::pin!(keepalive);
     loop {
         tokio::select! {
+            _ = &mut keepalive => {
+                send_keepalives(&mut outgoing, &state, &config).await;
+                keepalive.as_mut().reset(Instant::now() + keepalive_delay());
+            }
             _ = retries.tick() => {
                 initiate_disconnected_peers(&mut outgoing, &state, &config).await;
             }
@@ -243,6 +295,58 @@ async fn socket_listener_task(
             }
         }
     }
+}
+
+async fn flush_queued(
+    state: &State,
+    framed: &mut UdpFramed<Codec, Arc<UdpSocket>>,
+    peer_id: Uuid,
+    local_idx: u32,
+    addr: SocketAddr,
+) -> Result<()> {
+    if !state.queued.contains_key(&peer_id) {
+        return Ok(());
+    }
+    let (actor, receiver_idx) = state
+        .established
+        .get(&local_idx)
+        .and_then(|handle| {
+            handle
+                .handle
+                .upgrade()
+                .map(|actor| (actor, handle.receiver_idx))
+        })
+        .ok_or(crate::Error::ConnectionUnavailable { peer_id, local_idx })?;
+    let mut sent = 0;
+    loop {
+        // Release the queue guard before awaiting actor or socket operations.
+        let packet = state
+            .queued
+            .get_mut(&peer_id)
+            .and_then(|mut queue| queue.pop_front());
+        let Some(plaintext) = packet else { break };
+        let (counter, ciphertext) = actor
+            .ask(EncryptPacket(plaintext.clone()))
+            .await
+            .map_err(|err| crate::Error::ActorRequest(err.map_msg(|_| ())))?
+            .ok_or(crate::Error::Crypto)?;
+        framed
+            .send((
+                Packet::Data {
+                    receiver_idx,
+                    counter,
+                    ciphertext,
+                },
+                addr,
+            ))
+            .await?;
+        sent += 1;
+    }
+    state
+        .queued
+        .remove_if(&peer_id, |_, queue| queue.is_empty());
+    debug!(?peer_id, remote_addr = %addr, sent, "Flushed queued packets");
+    Ok(())
 }
 
 #[tracing::instrument(skip(state, framed, packet, config, peer_addresses))]
@@ -306,6 +410,7 @@ async fn process_incoming(
                 remote_idx = initiating.sender_idx, "Handshake reply sent");
             debug!(peer_id = ?peer.peer_id, remote_addr = %from, local_idx = sender_idx,
                 remote_idx = initiating.sender_idx, role = "responder", "Connection established");
+            flush_queued(state, framed, peer.peer_id, sender_idx, from).await?;
         }
         Packet::Reply(replying) => {
             debug!(remote_addr = %from, local_idx = replying.receiver_idx,
@@ -333,8 +438,7 @@ async fn process_incoming(
             )?;
 
             let timestamp = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map_err(std::io::Error::other)?
+                .duration_since(SystemTime::UNIX_EPOCH)?
                 .as_secs();
 
             peer_addresses.insert(initiated.peer_id, from);
@@ -345,6 +449,14 @@ async fn process_incoming(
             debug!(peer_id = ?initiated.peer_id, remote_addr = %from,
                 local_idx = replying.receiver_idx, remote_idx = replying.sender_idx,
                 role = "initiator", "Connection established");
+            flush_queued(
+                state,
+                framed,
+                initiated.peer_id,
+                replying.receiver_idx,
+                from,
+            )
+            .await?;
         }
         Packet::Data {
             receiver_idx,
@@ -353,8 +465,10 @@ async fn process_incoming(
         } => {
             if let Some(handle) = state.established.get(&receiver_idx) {
                 if let Some(actor) = handle.handle.upgrade() {
-                    if let Some(plaintext) =
-                        actor.ask(DecryptPacket(counter, ciphertext)).await.unwrap()
+                    if let Some(plaintext) = actor
+                        .ask(DecryptPacket(counter, ciphertext))
+                        .await
+                        .map_err(|err| crate::Error::ActorRequest(err.map_msg(|_| ())))?
                     {
                         if plaintext.is_empty() {
                             debug!(receiver_idx, "Plaintext is empty, keepalive");

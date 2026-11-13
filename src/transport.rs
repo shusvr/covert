@@ -191,7 +191,7 @@ impl Message<EncryptPacket> for PeerActor {
     }
 }
 
-async fn retain(actor_ref: ActorRef<PeerActor>, notify: Arc<Notify>, ttl: u64, idle: u64) {
+async fn upkeep(actor_ref: ActorRef<PeerActor>, notify: Arc<Notify>, ttl: u64, idle: u64) {
     // this ensures actor lives at most `ttl` seconds
     let mut ttl_fut = pin!(sleep(Duration::from_secs(ttl)));
 

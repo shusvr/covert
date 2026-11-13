@@ -135,7 +135,27 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
         peer_addresses: Arc::new(DashMap::new()),
     };
 
-    a.initiate(&state_a, &config_a, peer_a).await.unwrap();
+    // Queue traffic on both sides before their sessions exist.
+    a.transmit(&state_a, &config_a, peer_a, b"queued first")
+        .await
+        .unwrap();
+    state_a
+        .queued
+        .entry(peer_a)
+        .or_default()
+        .push_back(b"queued second".to_vec());
+    b.transmit(&state_b, &config_b, peer_b, b"queued first")
+        .await
+        .unwrap();
+    b.transmit(&state_b, &config_b, peer_b, b"queued second")
+        .await
+        .unwrap();
+    let unrelated_peer = Uuid::new_v4();
+    state_a
+        .queued
+        .entry(unrelated_peer)
+        .or_default()
+        .push_back(b"unrelated".to_vec());
     let (packet, from) = receive(&mut b).await;
     let Packet::Initiating(ref initiation) = packet else {
         panic!("expected initiation")
@@ -179,6 +199,36 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
         state_b.established.get(&local_b).unwrap().receiver_idx,
         local_a
     );
+
+    assert!(!state_a.queued.contains_key(&peer_a));
+    assert!(!state_b.queued.contains_key(&peer_b));
+    assert_eq!(state_a.queued.get(&unrelated_peer).unwrap().len(), 1);
+    for expected in [b"queued first".as_slice(), b"queued second".as_slice()] {
+        let (packet, from) = receive(&mut b).await;
+        process_incoming(
+            &state_b,
+            &mut b.framed,
+            &config_b,
+            &b.peer_addresses,
+            packet,
+            from,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rx_b.try_recv().unwrap(), expected);
+        let (packet, from) = receive(&mut a).await;
+        process_incoming(
+            &state_a,
+            &mut a.framed,
+            &config_a,
+            &a.peer_addresses,
+            packet,
+            from,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rx_a.try_recv().unwrap(), expected);
+    }
 
     a.transmit(&state_a, &config_a, peer_a, b"hello")
         .await
@@ -246,4 +296,63 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     }
     initiate_disconnected_peers(&mut a, &state_a, &config_a).await;
     assert_eq!(state_a.initiated.len(), 1);
+}
+
+#[tokio::test]
+async fn background_task_sends_encrypted_keepalive_with_jitter() {
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let local_key = random_sk().unwrap();
+    let remote_key = random_sk().unwrap();
+    let config = Arc::new(config(
+        sk_to_bytes(&local_key),
+        pk_to_bytes(&remote_key.compute_public_key().unwrap()),
+        socket.local_addr().unwrap(),
+    ));
+    let (tx, mut rx) = mpsc::channel(4);
+    let state = Arc::new(State::new(tx));
+    let started = Instant::now();
+    let _listener = create_udp_listener(&state, &config, &UdpListenerConfig { port: 0 })
+        .await
+        .unwrap();
+    let mut remote = UdpListener {
+        framed: UdpFramed::new(socket, Codec::new(PacketLayout::default())),
+        peer_addresses: Arc::new(DashMap::new()),
+    };
+    let (packet, from) = receive(&mut remote).await;
+    let Packet::Initiating(initiation) = packet else {
+        panic!("expected initiation")
+    };
+    let (remote_pk, _) = pre_reply(
+        &sk_to_bytes(&remote_key),
+        initiation.enc_pub_key,
+        initiation.ephemeral,
+        initiation.enc_ts,
+    )
+    .unwrap();
+    let (reply, cipher) =
+        post_reply(&remote_pk, Some(&[7; 32]), 123, initiation.sender_idx).unwrap();
+    remote
+        .framed
+        .send((Packet::Reply(reply), from))
+        .await
+        .unwrap();
+    let (packet, _) = timeout(Duration::from_secs(13), remote.framed.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let Packet::Data {
+        receiver_idx,
+        counter,
+        ciphertext,
+    } = packet
+    else {
+        panic!("expected keepalive")
+    };
+    assert!(started.elapsed() >= Duration::from_secs(8));
+    assert_eq!(receiver_idx, 123);
+    assert_eq!(counter, 1);
+    assert_eq!(ciphertext.len(), 16);
+    assert!(cipher.decrypt(counter, ciphertext).unwrap().is_empty());
+    assert!(rx.try_recv().is_err());
 }
