@@ -116,6 +116,7 @@ impl Default for PacketLayout {
     }
 }
 
+#[derive(Debug)]
 pub enum Packet {
     Initiating(Initiating),
     Reply(Replying),

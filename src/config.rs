@@ -131,6 +131,12 @@ pub type PrivKey = Key<true>;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Key<const PRIV: bool>(pub [u8; 32]);
 
+impl<const PRIV: bool> From<[u8; 32]> for Key<PRIV> {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
 impl<'de, const PRIV: bool> Deserialize<'de> for Key<PRIV> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

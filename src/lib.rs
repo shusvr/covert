@@ -1,3 +1,4 @@
+use aws_lc_rs::error::Unspecified;
 use thiserror::Error;
 
 pub type Key = [u8; 32];
@@ -16,6 +17,14 @@ pub mod wire;
 pub enum Error {
     #[error("Io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Unspecified crypto error")]
+    Crypto,
+}
+
+impl From<Unspecified> for Error {
+    fn from(_: Unspecified) -> Self {
+        Self::Crypto
+    }
 }
 
 pub(crate) type Result<T = (), E = Error> = std::result::Result<T, E>;
