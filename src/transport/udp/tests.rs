@@ -38,6 +38,154 @@ async fn receive(listener: &mut UdpListener) -> (Packet, SocketAddr) {
         .unwrap()
 }
 
+fn session_ciphers() -> (crate::crypto::Cipher, crate::crypto::Cipher) {
+    let initiator = random_sk().unwrap();
+    let (reply, responder) = post_reply(
+        &pk_to_bytes(&initiator.compute_public_key().unwrap()),
+        None,
+        0,
+        0,
+    )
+    .unwrap();
+    let initiator = finish(&sk_to_bytes(&initiator), None, reply.eph).unwrap();
+    (initiator, responder)
+}
+
+#[test]
+fn keepalive_refreshes_idle_timeout_but_not_session_lifetime() {
+    let (cipher, _) = session_ciphers();
+    let mut session = establish(cipher, 0, Uuid::new_v4(), 0);
+    assert!(session.is_live());
+
+    session.since = std::time::Instant::now() - Duration::from_secs(30);
+    session.keep_alive();
+    session.since -= Duration::from_secs(31);
+    assert!(session.is_live());
+    session.since -= Duration::from_secs(30);
+    assert!(!session.is_live());
+
+    session.since = std::time::Instant::now() - Duration::from_secs(270);
+    session.keep_alive();
+    assert!(session.is_live());
+    session.since -= Duration::from_secs(31);
+    assert!(!session.is_live());
+}
+
+#[tokio::test]
+async fn expired_session_queues_traffic_and_reinitiates() {
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let remote = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let local_key = random_sk().unwrap();
+    let remote_key = random_sk().unwrap();
+    let config = config(
+        sk_to_bytes(&local_key),
+        pk_to_bytes(&remote_key.compute_public_key().unwrap()),
+        remote.local_addr().unwrap(),
+    );
+    let peer_id = config.peers[0].peer_id;
+    let (tx, _rx) = mpsc::channel(4);
+    let state = State::new(tx);
+    let (cipher, _) = session_ciphers();
+    let mut session = establish(cipher, 0, peer_id, 2);
+    session.since = std::time::Instant::now() - Duration::from_secs(61);
+    state.established.insert(1, session);
+    state.peering.insert(peer_id, Peering::new(1));
+    let mut listener = UdpListener {
+        framed: UdpFramed::new(socket, Codec::new(PacketLayout::default())),
+        peer_addresses: Arc::new(
+            [(peer_id, remote.local_addr().unwrap())]
+                .into_iter()
+                .collect(),
+        ),
+    };
+
+    timeout(
+        Duration::from_secs(3),
+        listener.transmit(&state, &config, peer_id, b"queued after expiry"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!state.established.contains_key(&1));
+    assert!(!has_live_connection(&state, peer_id));
+    assert_eq!(
+        state.queued.get_mut(&peer_id).unwrap().pop_front().unwrap(),
+        b"queued after expiry"
+    );
+    let mut remote = UdpFramed::new(remote, Codec::new(PacketLayout::default()));
+    let (packet, _) = timeout(Duration::from_secs(3), remote.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(packet, Packet::Initiating(_)));
+}
+
+#[tokio::test]
+async fn received_keepalive_refreshes_session_and_invalid_data_removes_it() {
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let local_key = random_sk().unwrap();
+    let remote_key = random_sk().unwrap();
+    let from = socket.local_addr().unwrap();
+    let config = config(
+        sk_to_bytes(&local_key),
+        pk_to_bytes(&remote_key.compute_public_key().unwrap()),
+        from,
+    );
+    let peer_id = config.peers[0].peer_id;
+    let (tx, mut rx) = mpsc::channel(4);
+    let state = Arc::new(State::new(tx));
+    let (sender, receiver) = session_ciphers();
+    let mut session = establish(receiver, 0, peer_id, 2);
+    session.since = std::time::Instant::now() - Duration::from_secs(30);
+    state.established.insert(1, session);
+    state.peering.insert(peer_id, Peering::new(1));
+    let mut framed = UdpFramed::new(socket, Codec::new(PacketLayout::default()));
+    let addresses = DashMap::new();
+    let (counter, ciphertext) = sender.encrypt(vec![]).unwrap();
+    process_incoming(
+        &state,
+        &mut framed,
+        &config,
+        &addresses,
+        Packet::Data {
+            receiver_idx: 1,
+            counter,
+            ciphertext,
+        },
+        from,
+    )
+    .await
+    .unwrap();
+    assert!(rx.try_recv().is_err());
+    state.established.get_mut(&1).unwrap().since -= Duration::from_secs(31);
+    assert!(has_live_connection(&state, peer_id));
+
+    let (counter, mut ciphertext) = sender.encrypt(b"tampered".to_vec()).unwrap();
+    ciphertext[0] ^= 1;
+    timeout(
+        Duration::from_secs(3),
+        process_incoming(
+            &state,
+            &mut framed,
+            &config,
+            &addresses,
+            Packet::Data {
+                receiver_idx: 1,
+                counter,
+                ciphertext,
+            },
+            from,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!state.established.contains_key(&1));
+    assert!(!has_live_connection(&state, peer_id));
+    assert!(rx.try_recv().is_err());
+}
+
 #[tokio::test]
 async fn background_task_retries_peers_with_known_endpoints() {
     let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());

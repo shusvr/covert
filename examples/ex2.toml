@@ -10,4 +10,4 @@ PublicKey = "qN/ExVUeFmYFBzJ743X749kmwkeOAjMK9Bf0sc2qQgA="
 
 
 [[Peer.Transport.Udp]]
-Endpoint = "127.0.0.1:5551"
+Endpoint = "192.168.0.3:5551"

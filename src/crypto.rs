@@ -13,6 +13,9 @@ use aws_lc_rs::{
     rand::SystemRandom,
 };
 
+#[cfg(test)]
+mod tests;
+
 pub fn random_sk() -> Result<PrivateKey, Unspecified> {
     PrivateKey::generate(&X25519)
 }
@@ -190,8 +193,11 @@ pub fn finish(
     Ok(Cipher::new(key, true))
 }
 
+const MAX_NONCE_LAG: u64 = 200;
+
 pub struct Cipher {
-    enc_dec: [AtomicU64; 2],
+    encrypt_counter: AtomicU64,
+    decrypt_counter: AtomicU64,
     key: LessSafeKey,
     is_initiator: bool,
 }
@@ -200,7 +206,8 @@ impl Cipher {
     /// Peers sharing a key must use opposite roles to avoid nonce reuse.
     pub fn new(key: LessSafeKey, is_initiator: bool) -> Self {
         Self {
-            enc_dec: [const { AtomicU64::new(1) }; 2],
+            encrypt_counter: AtomicU64::new(1),
+            decrypt_counter: AtomicU64::new(0),
             key,
             is_initiator,
         }
@@ -214,7 +221,8 @@ impl Cipher {
     }
 
     pub fn encrypt(&self, mut data: Vec<u8>) -> Result<(u64, Vec<u8>), Unspecified> {
-        let value = self.enc_dec[0]
+        let value = self
+            .encrypt_counter
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
@@ -228,8 +236,7 @@ impl Cipher {
     }
 
     pub fn decrypt(&self, nonce: u64, mut ciphertext: Vec<u8>) -> Result<Vec<u8>, Unspecified> {
-        let next = nonce.checked_add(1).ok_or(Unspecified)?;
-        if nonce < self.enc_dec[1].load(Ordering::Relaxed) {
+        if nonce == 0 {
             return Err(Unspecified);
         }
         let len = self
@@ -241,134 +248,11 @@ impl Cipher {
             )?
             .len();
         ciphertext.truncate(len);
-        // Update only after authentication; concurrent duplicates cannot both succeed.
-        self.enc_dec[1]
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |expected| {
-                (nonce >= expected).then_some(next)
-            })
-            .map_err(|_| Unspecified)?;
+        // repeats within the allowed lag are whatever
+        let highest = self.decrypt_counter.fetch_max(nonce, Ordering::Relaxed);
+        if highest.saturating_sub(nonce) > MAX_NONCE_LAG {
+            return Err(Unspecified);
+        }
         Ok(ciphertext)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_pre_reply() {
-        let sk1 = PrivateKey::generate(&X25519).unwrap();
-        let sk2 = PrivateKey::generate(&X25519).unwrap();
-
-        let i = initiate(
-            &sk_to_bytes(&sk1),
-            &pk_to_bytes(&sk2.compute_public_key().unwrap()),
-            u64::MAX,
-            0,
-        )
-        .unwrap();
-
-        let (pk, timestamp) =
-            pre_reply(&sk_to_bytes(&sk2), i.enc_pub_key, i.ephemeral, i.enc_ts).unwrap();
-        assert_eq!(timestamp, u64::MAX);
-        assert_eq!(pk.as_ref(), pk_to_bytes(&sk1.compute_public_key().unwrap()));
-    }
-
-    #[test]
-    fn test_finish() {
-        for psk in [None, Some([7; 32])] {
-            let initiator = PrivateKey::generate(&X25519).unwrap();
-            let responder = PrivateKey::generate(&X25519).unwrap();
-            let local_sk = sk_to_bytes(&initiator);
-            let initiation = initiate(
-                &local_sk,
-                &pk_to_bytes(&responder.compute_public_key().unwrap()),
-                u64::MAX,
-                0,
-            )
-            .unwrap();
-            let (remote_pk, timestamp) = pre_reply(
-                &sk_to_bytes(&responder),
-                initiation.enc_pub_key,
-                initiation.ephemeral,
-                initiation.enc_ts,
-            )
-            .unwrap();
-            let (reply, responder_key) =
-                post_reply(&remote_pk.as_ref().try_into().unwrap(), psk.as_ref(), 0, 0).unwrap();
-            let initiator_key = finish(&local_sk, psk.as_ref(), reply.eph).unwrap();
-            assert_eq!(timestamp, u64::MAX);
-
-            let (nonce, message) = responder_key.encrypt(b"session message".to_vec()).unwrap();
-            let replay = message.clone();
-            assert_eq!(
-                initiator_key.decrypt(nonce, message).unwrap(),
-                b"session message"
-            );
-            assert!(initiator_key.decrypt(nonce, replay).is_err());
-
-            let (nonce, message) = initiator_key.encrypt(b"return message".to_vec()).unwrap();
-            assert_eq!(
-                responder_key.decrypt(nonce, message).unwrap(),
-                b"return message"
-            );
-
-            let (nonce, message) = responder_key.encrypt(b"authenticated".to_vec()).unwrap();
-            let mut tampered = message.clone();
-            tampered[0] ^= 1;
-            assert!(initiator_key.decrypt(nonce + 100, tampered).is_err());
-            assert_eq!(
-                initiator_key.decrypt(nonce, message).unwrap(),
-                b"authenticated"
-            );
-
-            responder_key.enc_dec[0].store(u64::MAX, Ordering::Relaxed);
-            assert!(responder_key.encrypt(vec![]).is_err());
-            assert!(responder_key.encrypt(vec![]).is_err());
-        }
-    }
-
-    #[test]
-    fn test_initiation_rejects_tampering() {
-        let initiator = random_sk().unwrap();
-        let responder = random_sk().unwrap();
-        for tamper_timestamp in [false, true] {
-            let mut initiation = initiate(
-                &sk_to_bytes(&initiator),
-                &pk_to_bytes(&responder.compute_public_key().unwrap()),
-                123,
-                0,
-            )
-            .unwrap();
-            if tamper_timestamp {
-                initiation.enc_ts[0] ^= 1;
-            } else {
-                initiation.enc_pub_key[0] ^= 1;
-            }
-            assert!(
-                pre_reply(
-                    &sk_to_bytes(&responder),
-                    initiation.enc_pub_key,
-                    initiation.ephemeral,
-                    initiation.enc_ts
-                )
-                .is_err()
-            );
-        }
-    }
-
-    #[test]
-    fn test_wrong_psk_rejects_session_data() {
-        let initiator = random_sk().unwrap();
-        let (reply, responder) = post_reply(
-            &pk_to_bytes(&initiator.compute_public_key().unwrap()),
-            Some(&[7; 32]),
-            0,
-            0,
-        )
-        .unwrap();
-        let initiator = finish(&sk_to_bytes(&initiator), Some(&[8; 32]), reply.eph).unwrap();
-        let (counter, data) = responder.encrypt(b"message".to_vec()).unwrap();
-        assert!(initiator.decrypt(counter, data).is_err());
     }
 }

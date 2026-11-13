@@ -22,8 +22,6 @@ pub enum Error {
     Crypto,
     #[error("Connection unavailable for peer {peer_id} at local index {local_idx}")]
     ConnectionUnavailable { peer_id: uuid::Uuid, local_idx: u32 },
-    #[error("Actor request failed: {0}")]
-    ActorRequest(#[from] kameo::error::SendError),
     #[error("System clock is before the Unix epoch: {0}")]
     SystemTime(#[from] std::time::SystemTimeError),
 }

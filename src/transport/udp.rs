@@ -3,7 +3,7 @@ use crate::{
     codec::{Codec, Packet, PacketLayout},
     config::{Config, PubKey},
     crypto::{finish, initiate, post_reply, pre_reply},
-    transport::{DecryptPacket, EncryptPacket, Initiated, Peering, State, establish},
+    transport::{Initiated, Peering, State, establish},
 };
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
@@ -119,42 +119,38 @@ impl UdpListener {
             return Ok(());
         };
 
-        if let Some(index) = state.peering.get(&peer_id) {
-            if let Some(handle) = state.established.get(&index.value().index) {
-                if let Some(actor) = handle.handle.upgrade() {
-                    if let Some((counter, ciphertext)) = actor
-                        .ask(EncryptPacket(packet.to_owned()))
-                        .await
-                        .map_err(|err| crate::Error::ActorRequest(err.map_msg(|_| ())))?
-                    {
-                        debug!(?peer_id, dst=?addr, "Sending data");
-                        let packet = Packet::Data {
-                            receiver_idx: handle.receiver_idx,
-                            counter,
-                            ciphertext,
-                        };
-                        self.framed.send((packet, addr)).await?;
-                    } else {
-                        debug!(?peer_id, "Actor can not encrypt, cleaning up");
-                        state.established.remove(&index.value().index);
-                    }
-                } else {
-                    debug!(?peer_id, "Actor has been dropped, cleaning up");
-                    state.established.remove(&index.value().index);
+        let local_idx = state.peering.get(&peer_id).map(|entry| entry.index);
+        if let Some(local_idx) = local_idx
+            && let Some((cipher, receiver_idx)) = state.session(local_idx)
+        {
+            let (counter, ciphertext) = match cipher.encrypt(packet.to_owned()) {
+                Ok(encrypted) => encrypted,
+                Err(err) => {
+                    debug!(?peer_id, "Cipher failed to encrypt, cleaning up");
+                    state.established.remove(&local_idx);
+                    return Err(err.into());
                 }
-            } else {
-                debug!(?peer_id, "Actor has expired, cleaning up");
-                state.established.remove(&index.value().index);
-            }
-        } else {
-            // no connection to peer, try to initiate if possible
-            state
-                .queued
-                .entry(peer_id)
-                .or_default()
-                .push_back(packet.to_owned());
-            self.initiate(state, config, peer_id).await?;
+            };
+            debug!(?peer_id, dst=?addr, "Sending data");
+            let packet = Packet::Data {
+                receiver_idx,
+                counter,
+                ciphertext,
+            };
+            self.framed.send((packet, addr)).await?;
+            return Ok(());
         }
+
+        if let Some(local_idx) = local_idx {
+            state.established.remove(&local_idx);
+        }
+        // Queue traffic while a missing or expired session is re-established.
+        state
+            .queued
+            .entry(peer_id)
+            .or_default()
+            .push_back(packet.to_owned());
+        self.initiate(state, config, peer_id).await?;
 
         Ok(())
     }
@@ -193,10 +189,11 @@ fn has_live_connection(state: &State, peer_id: Uuid) -> bool {
     let index = state.peering.get(&peer_id).map(|entry| entry.index);
     index
         .and_then(|index| state.established.get(&index))
-        .is_some_and(|handle| handle.handle.upgrade().is_some())
+        .is_some_and(|handle| handle.is_live())
 }
 
 async fn initiate_disconnected_peers(listener: &mut UdpListener, state: &State, config: &Config) {
+    state.established.retain(|_, handle| handle.is_live());
     state
         .initiated
         .retain(|_, pending| pending.when.elapsed() < Duration::from_secs(60));
@@ -227,17 +224,11 @@ async fn send_keepalives(listener: &mut UdpListener, state: &State, config: &Con
         let Some(index) = state.peering.get(&peer.peer_id).map(|entry| entry.index) else {
             continue;
         };
-        // Release map guards before awaiting actor or socket operations.
-        let Some((actor, receiver_idx)) = state.established.get(&index).and_then(|handle| {
-            handle
-                .handle
-                .upgrade()
-                .map(|actor| (actor, handle.receiver_idx))
-        }) else {
+        let Some((cipher, receiver_idx)) = state.session(index) else {
             continue;
         };
-        match actor.ask(EncryptPacket(Vec::new())).await {
-            Ok(Some((counter, ciphertext))) => {
+        match cipher.encrypt(Vec::new()) {
+            Ok((counter, ciphertext)) => {
                 let packet = Packet::Data {
                     receiver_idx,
                     counter,
@@ -250,7 +241,10 @@ async fn send_keepalives(listener: &mut UdpListener, state: &State, config: &Con
                     Err(err) => error!(peer_id = ?peer.peer_id, "Failed to send keepalive: {err}"),
                 }
             }
-            _ => debug!(peer_id = ?peer.peer_id, "Connection unavailable, skipping keepalive"),
+            Err(_) => {
+                debug!(peer_id = ?peer.peer_id, "Cipher failed to encrypt keepalive, cleaning up");
+                state.established.remove(&index);
+            }
         }
     }
 }
@@ -307,29 +301,24 @@ async fn flush_queued(
     if !state.queued.contains_key(&peer_id) {
         return Ok(());
     }
-    let (actor, receiver_idx) = state
-        .established
-        .get(&local_idx)
-        .and_then(|handle| {
-            handle
-                .handle
-                .upgrade()
-                .map(|actor| (actor, handle.receiver_idx))
-        })
-        .ok_or(crate::Error::ConnectionUnavailable { peer_id, local_idx })?;
     let mut sent = 0;
     loop {
-        // Release the queue guard before awaiting actor or socket operations.
+        let (cipher, receiver_idx) = state
+            .session(local_idx)
+            .ok_or(crate::Error::ConnectionUnavailable { peer_id, local_idx })?;
+        // Release the queue guard before awaiting socket operations.
         let packet = state
             .queued
             .get_mut(&peer_id)
             .and_then(|mut queue| queue.pop_front());
         let Some(plaintext) = packet else { break };
-        let (counter, ciphertext) = actor
-            .ask(EncryptPacket(plaintext.clone()))
-            .await
-            .map_err(|err| crate::Error::ActorRequest(err.map_msg(|_| ())))?
-            .ok_or(crate::Error::Crypto)?;
+        let (counter, ciphertext) = match cipher.encrypt(plaintext) {
+            Ok(encrypted) => encrypted,
+            Err(err) => {
+                state.established.remove(&local_idx);
+                return Err(err.into());
+            }
+        };
         framed
             .send((
                 Packet::Data {
@@ -463,41 +452,39 @@ async fn process_incoming(
             counter,
             ciphertext,
         } => {
-            if let Some(handle) = state.established.get(&receiver_idx) {
-                if let Some(actor) = handle.handle.upgrade() {
-                    if let Some(plaintext) = actor
-                        .ask(DecryptPacket(counter, ciphertext))
-                        .await
-                        .map_err(|err| crate::Error::ActorRequest(err.map_msg(|_| ())))?
-                    {
-                        if plaintext.is_empty() {
-                            debug!(receiver_idx, "Plaintext is empty, keepalive");
-                            handle.notify.notify_waiters();
-                        } else {
-                            debug!(
-                                receiver_idx,
-                                plaintext_len = plaintext.len(),
-                                "Actor decrypted ciphertext"
-                            );
-
-                            if state.tun_in_tx.send(plaintext).await.is_err() {
-                                debug!("tun_in_tx is closed");
-                            }
-                        }
-                    } else {
-                        debug!(receiver_idx, "Actor failed to decrypt, cleaning ip");
-
-                        drop(handle);
-                        state.established.remove(&receiver_idx);
-                    }
-                } else {
-                    debug!(receiver_idx, "Actor has expired, cleaning up");
-
+            let Some(handle) = state.established.get(&receiver_idx) else {
+                debug!(receiver_idx, "Received data for an unknown session");
+                return Ok(());
+            };
+            if !handle.is_live() {
+                debug!(receiver_idx, "Session has expired, cleaning up");
+                drop(handle);
+                state.established.remove(&receiver_idx);
+                return Ok(());
+            }
+            let plaintext = match handle.cipher.decrypt(counter, ciphertext) {
+                Ok(plaintext) => plaintext,
+                Err(_) => {
+                    debug!(receiver_idx, "Cipher failed to decrypt, cleaning up");
                     drop(handle);
                     state.established.remove(&receiver_idx);
+                    return Ok(());
                 }
-            } else {
-                debug!("Received data to unknown")
+            };
+            if plaintext.is_empty() {
+                debug!(receiver_idx, "Plaintext is empty, keepalive");
+                handle.keep_alive();
+                return Ok(());
+            }
+            // Decryption is synchronous; release the map guard before TUN delivery.
+            drop(handle);
+            debug!(
+                receiver_idx,
+                plaintext_len = plaintext.len(),
+                "Decrypted ciphertext"
+            );
+            if state.tun_in_tx.send(plaintext).await.is_err() {
+                debug!("tun_in_tx is closed");
             }
         }
     }

@@ -1,16 +1,13 @@
 use circular_buffer::FixedCircularBuffer;
 use dashmap::DashMap;
-use kameo::prelude::*;
 use std::{
-    pin::pin,
-    sync::{Arc, atomic::AtomicU64},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
-use tokio::{
-    sync::{Notify, mpsc},
-    time::sleep,
-};
-use tracing::debug;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
@@ -26,12 +23,12 @@ pub struct PeerHandle {
     receiver_idx: u32,
     timestamp: u64,
     // two different fields because timestamp is used to prevent reply attack and remote clock might be different
-    handle: WeakActorRef<PeerActor>,
-    notify: Arc<Notify>,
+    cipher: Arc<Cipher>,
+    // Monotonic milliseconds since `since`, updated by authenticated keepalives.
+    last_keepalive_ms: AtomicU64,
+    since: Instant,
 
     // for statistical purposes
-    #[expect(dead_code)]
-    since: Instant,
     #[expect(dead_code)]
     sent: AtomicU64,
     #[expect(dead_code)]
@@ -39,22 +36,29 @@ pub struct PeerHandle {
 }
 
 impl PeerHandle {
-    pub fn new(
-        peer_id: Uuid,
-        receiver_idx: u32,
-        handle: WeakActorRef<PeerActor>,
-        timestamp: u64,
-    ) -> Self {
+    pub fn new(peer_id: Uuid, receiver_idx: u32, cipher: Arc<Cipher>, timestamp: u64) -> Self {
         Self {
             peer_id,
             receiver_idx,
             timestamp,
-            handle,
+            cipher,
             sent: 0.into(),
             received: 0.into(),
-            notify: Arc::new(Notify::new()),
+            last_keepalive_ms: AtomicU64::new(0),
             since: Instant::now(),
         }
+    }
+
+    fn is_live(&self) -> bool {
+        let elapsed = self.since.elapsed();
+        let last_keepalive = Duration::from_millis(self.last_keepalive_ms.load(Ordering::Relaxed));
+        elapsed < Duration::from_secs(300)
+            && elapsed.saturating_sub(last_keepalive) < Duration::from_secs(60)
+    }
+
+    fn keep_alive(&self) {
+        self.last_keepalive_ms
+            .store(self.since.elapsed().as_millis() as u64, Ordering::Relaxed);
     }
 }
 
@@ -104,6 +108,14 @@ impl State {
             queued: Default::default(),
         }
     }
+
+    // Clone the cipher so no map guard is held during asynchronous I/O.
+    fn session(&self, local_idx: u32) -> Option<(Arc<Cipher>, u32)> {
+        let handle = self.established.get(&local_idx)?;
+        handle
+            .is_live()
+            .then(|| (handle.cipher.clone(), handle.receiver_idx))
+    }
 }
 
 pub mod icmp;
@@ -147,84 +159,6 @@ pub async fn create_listener(state: &Arc<State>, config: &Arc<Config>) -> Result
     Ok(listener)
 }
 
-#[derive(Actor)]
-pub struct PeerActor {
-    cipher: Cipher,
-}
-
-pub struct EncryptPacket(Vec<u8>);
-pub struct DecryptPacket(u64, Vec<u8>);
-
-impl Message<DecryptPacket> for PeerActor {
-    type Reply = Option<Vec<u8>>;
-
-    async fn handle(
-        &mut self,
-        DecryptPacket(nonce, ciphertext): DecryptPacket,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        if let Ok(plaintext) = self.cipher.decrypt(nonce, ciphertext) {
-            Some(plaintext)
-        } else {
-            debug!("Actor failed to decrypt, stopping");
-            ctx.stop();
-            None
-        }
-    }
-}
-
-impl Message<EncryptPacket> for PeerActor {
-    type Reply = Option<(u64, Vec<u8>)>;
-
-    async fn handle(
-        &mut self,
-        EncryptPacket(packet): EncryptPacket,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        let Ok(result) = self.cipher.encrypt(packet) else {
-            debug!("Actor failed to encrypt, stopping");
-            ctx.stop();
-            return None;
-        };
-
-        Some(result)
-    }
-}
-
-async fn upkeep(actor_ref: ActorRef<PeerActor>, notify: Arc<Notify>, ttl: u64, idle: u64) {
-    // this ensures actor lives at most `ttl` seconds
-    let mut ttl_fut = pin!(sleep(Duration::from_secs(ttl)));
-
-    loop {
-        tokio::select! {
-            biased;
-            // by not putting sleep future in select! we do not reset the timer on each poll
-            _ = &mut ttl_fut => {
-                debug!("Actor has reached end of life");
-                break;
-            }
-            // here we recreate the sleep future each poll to only resolve when actually idle
-            _ = sleep(Duration::from_secs(idle)) => {
-                debug!("Actor has expired");
-                break;
-            }
-            _ = notify.notified() => {
-                debug!("Actor has received keep alive");
-                continue;
-            }
-        }
-    }
-
-    drop(actor_ref)
-}
-
 fn establish(cipher: Cipher, timestamp: u64, peer_id: Uuid, receiver_idx: u32) -> PeerHandle {
-    let notify = Arc::new(Notify::new());
-    let actor = PeerActor { cipher };
-
-    let handle = PeerActor::spawn(actor);
-    tokio::spawn(upkeep(handle.clone(), notify.clone(), 300, 60));
-
-    let weak = handle.downgrade();
-    PeerHandle::new(peer_id, receiver_idx, weak, timestamp)
+    PeerHandle::new(peer_id, receiver_idx, Arc::new(cipher), timestamp)
 }
