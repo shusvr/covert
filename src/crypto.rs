@@ -34,11 +34,16 @@ pub fn sk_to_bytes(sk: &PrivateKey) -> Key {
 
 #[derive(Debug)]
 pub struct Initiating {
+    pub(crate) sender_idx: u32,
     pub(crate) enc_pub_key: SealedKey,
     pub(crate) ephemeral: Key,
 }
 
-pub fn initiate(local_sk: &Key, remote_pk: &Key) -> Result<Initiating, Unspecified> {
+pub fn initiate(
+    local_sk: &Key,
+    remote_pk: &Key,
+    sender_idx: u32,
+) -> Result<Initiating, Unspecified> {
     let remote_pk = to_pk(remote_pk);
     let local_sk = to_sk(local_sk);
     let rng = SystemRandom::new();
@@ -65,6 +70,7 @@ pub fn initiate(local_sk: &Key, remote_pk: &Key) -> Result<Initiating, Unspecifi
     Ok(Initiating {
         enc_pub_key: inout.try_into().unwrap(),
         ephemeral: pk_to_bytes(&epk),
+        sender_idx,
     })
 }
 
@@ -73,6 +79,7 @@ pub fn pre_reply(
     Initiating {
         mut enc_pub_key,
         ephemeral,
+        ..
     }: Initiating,
 ) -> Result<ParsedPublicKey, Unspecified> {
     let local_sk = to_sk(local_sk);
@@ -98,16 +105,20 @@ pub fn pre_reply(
     Ok(UnparsedPublicKey::new(&X25519, pub_key).try_into().unwrap())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Replying {
     pub(crate) enc_ts: SealedTimestamp,
     pub(crate) eph: Key,
+    pub(crate) sender_idx: u32,
+    pub(crate) receiver_idx: u32,
 }
 
 pub fn post_reply(
     remote_pk: &Key,
     pre_shared_key: Option<&Key>,
     timestamp: i64,
+    sender_idx: u32,
+    receiver_idx: u32,
 ) -> Result<(Replying, LessSafeKey), Unspecified> {
     let remote_pk = to_pk(remote_pk);
 
@@ -134,6 +145,8 @@ pub fn post_reply(
         Replying {
             eph: pk_to_bytes(&epk),
             enc_ts: in_out,
+            sender_idx,
+            receiver_idx,
         },
         cipher,
     ))
@@ -142,7 +155,9 @@ pub fn post_reply(
 pub fn finish(
     local_sk: &Key,
     pre_shared_key: Option<&Key>,
-    Replying { mut enc_ts, eph }: Replying,
+    Replying {
+        mut enc_ts, eph, ..
+    }: Replying,
 ) -> Result<(i64, LessSafeKey), Unspecified> {
     let local_sk = to_sk(local_sk);
     let remote_epk = UnparsedPublicKey::new(&X25519, &eph);
@@ -181,6 +196,7 @@ mod tests {
         let i = initiate(
             &sk_to_bytes(&sk1),
             &pk_to_bytes(&sk2.compute_public_key().unwrap()),
+            0,
         )
         .unwrap();
 
@@ -197,11 +213,18 @@ mod tests {
             let initiation = initiate(
                 &local_sk,
                 &pk_to_bytes(&responder.compute_public_key().unwrap()),
+                0,
             )
             .unwrap();
             let remote_pk = pre_reply(&sk_to_bytes(&responder), initiation).unwrap();
-            let (reply, responder_key) =
-                post_reply(&remote_pk.as_ref().try_into().unwrap(), psk.as_ref(), -123).unwrap();
+            let (reply, responder_key) = post_reply(
+                &remote_pk.as_ref().try_into().unwrap(),
+                psk.as_ref(),
+                -123,
+                0,
+                0,
+            )
+            .unwrap();
             let (timestamp, initiator_key) = finish(&local_sk, psk.as_ref(), reply).unwrap();
             assert_eq!(timestamp, -123);
 
@@ -231,10 +254,10 @@ mod tests {
         let initiator = PrivateKey::generate(&X25519).unwrap();
         let local_sk = sk_to_bytes(&initiator);
         let remote_pk = pk_to_bytes(&initiator.compute_public_key().unwrap());
-        let (reply, _) = post_reply(&remote_pk, Some(&[7; 32]), 123).unwrap();
+        let (reply, _) = post_reply(&remote_pk, Some(&[7; 32]), 123, 0, 0).unwrap();
         assert!(finish(&local_sk, Some(&[8; 32]), reply).is_err());
 
-        let (mut reply, _) = post_reply(&remote_pk, None, 123).unwrap();
+        let (mut reply, _) = post_reply(&remote_pk, None, 123, 0, 0).unwrap();
         reply.enc_ts[0] ^= 1;
         assert!(finish(&local_sk, None, reply).is_err());
     }

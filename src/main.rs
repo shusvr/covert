@@ -5,8 +5,9 @@ use base64::prelude::*;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use covert::{
-    config::{ArcConfig, Config, PeerTransport, Transport},
+    config::{ArcConfig, Config, ListenerConfig, PeerTransport},
     crypto::{pk_to_bytes, random_sk, sk_to_bytes},
+    transport::create_listener,
 };
 use etherparse::{NetHeaders, PacketHeaders};
 use std::{
@@ -27,7 +28,13 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the tunnel with a TOML configuration file.
-    Run { config: PathBuf },
+    Run {
+        /// Capacity of the internal message channel.
+        #[arg(short, long)]
+        chanlen: Option<u16>,
+
+        config: PathBuf,
+    },
     /// Generate a base64-encoded X25519 private and public key pair.
     Genkey,
 }
@@ -39,7 +46,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     match cli.command {
-        Command::Run { config } => run(config).await,
+        Command::Run { config, chanlen } => run(config, chanlen).await,
         Command::Genkey => {
             let private_key = random_sk().context("failed to generate private key")?;
             let public_key = private_key
@@ -86,9 +93,9 @@ fn read_config(path: &Path) -> anyhow::Result<ArcConfig> {
     debug!(?path, "Config: {config:#?}");
 
     for p in &config.peers {
-        let matches = match (&config.interface.transport, &p.transport) {
-            (Transport::Udp { .. }, PeerTransport::Udp { .. }) => true,
-            (Transport::Other { id, .. }, PeerTransport::Other { id: peer, .. }) => id == peer,
+        let matches = match (&config.interface.listener, &p.transport) {
+            (ListenerConfig::Udp { .. }, PeerTransport::Udp { .. }) => true,
+            (ListenerConfig::Other { id, .. }, PeerTransport::Other { id: peer, .. }) => id == peer,
             _ => false,
         };
 
@@ -100,7 +107,7 @@ fn read_config(path: &Path) -> anyhow::Result<ArcConfig> {
     Ok(config.into())
 }
 
-async fn run(conf_path: PathBuf) -> Result<()> {
+async fn run(conf_path: PathBuf, chanlen: Option<u16>) -> Result<()> {
     let config = read_config(&conf_path)?;
     let mut builder = tun::DeviceBuilder::new()
         .mtu(config.interface.mtu)
@@ -119,10 +126,11 @@ async fn run(conf_path: PathBuf) -> Result<()> {
         .build_async()
         .context("failed to create a tun device")?;
 
-    const CHAN_LEN: usize = 512;
+    let chanlen = chanlen.unwrap_or(512) as usize;
+    let (tun_out_tx, tun_out_rx) = mpsc::channel::<Bytes>(chanlen);
+    let (tun_in_tx, mut tun_in_rx) = mpsc::channel::<Bytes>(chanlen);
 
-    let (tun_out_tx, tun_out_rx) = mpsc::channel::<Bytes>(CHAN_LEN);
-    let (tun_in_tx, mut tun_in_rx) = mpsc::channel::<Bytes>(CHAN_LEN);
+    create_listener(&config).await?;
 
     tokio::spawn(reader_task(config.clone(), tun_out_rx));
 

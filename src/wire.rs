@@ -6,37 +6,21 @@ use std::io;
 use thiserror::Error;
 use tokio_util::codec::{Decoder, Encoder};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Grease {
-    Fixed {
-        #[serde(rename = "s")]
-        at: usize,
-        #[serde(rename = "l")]
-        len: usize,
-    },
-    Vary {
-        #[serde(rename = "s")]
-        at: usize,
-        #[serde(rename = "m")]
-        min: usize,
-        #[serde(rename = "M")]
-        max: usize,
-    },
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PacketLayout {
     #[serde(rename = "m")]
     pub mask: u32, // general field mask
-    pub o_ty: usize,   // offset of packet ty
-    pub oi_eph: usize, // (initiating) offset of ephemeral key
-    pub oi_epk: usize, // (initiating) offset of encrypted public key
-    pub or_eph: usize, // (replying) offset of ephemeral key
-    pub or_ets: usize, // (replying) offset of encrypted timestamp
-    pub od_non: usize, // (data) offset of nonce
-    pub od_dl: usize,  // (data) offset of data length
-    pub od_d: usize,   // (data) offset of data itself
+    pub o_ty: usize,    // offset of packet ty
+    pub oi_eph: usize,  // (initiating) offset of ephemeral key
+    pub oi_epk: usize,  // (initiating) offset of encrypted public key
+    pub or_eph: usize,  // (replying) offset of ephemeral key
+    pub or_ets: usize,  // (replying) offset of encrypted timestamp
+    pub oi_sidx: usize, // (initiating) offset of sender index
+    pub or_sidx: usize, // (replying) offset of sender index
+    pub or_ridx: usize, // (replying) offset of receiver index
+    pub od_non: usize,  // (data) offset of nonce
+    pub od_dl: usize,   // (data) offset of data length
+    pub od_d: usize,    // (data) offset of data itself
 }
 
 impl PacketLayout {
@@ -46,15 +30,18 @@ impl PacketLayout {
         let ranges = [
             r(self.oi_eph, 32),
             r(self.oi_epk, 48),
+            r(self.oi_sidx, 4),
             r(self.or_eph, 32),
             r(self.or_ets, 24),
+            r(self.or_sidx, 4),
+            r(self.or_ridx, 4),
             r(self.od_non, 12),
             r(self.od_dl, 4),
         ];
 
         // Data has a variable length, so reserve everything from od_d onward.
         if self.o_ty >= self.od_d
-            || ranges[4..6]
+            || ranges[7..9]
                 .iter()
                 .any(|range| range.start < range.end && range.end > self.od_d)
         {
@@ -66,7 +53,7 @@ impl PacketLayout {
                 .o_ty
                 .checked_add(1)
                 .ok_or("packet type offset overflows")?;
-        for group in [0..2, 2..4, 4..6] {
+        for group in [0..3, 3..7, 7..9] {
             for (i, r1) in ranges[group.clone()]
                 .iter()
                 .chain(std::iter::once(&ty_range))
@@ -91,17 +78,22 @@ impl PacketLayout {
 
 impl PacketLayout {
     fn ilen(&self) -> usize {
-        [self.oi_eph + 32, self.oi_epk + 48]
+        [self.oi_eph + 32, self.oi_epk + 48, self.oi_sidx + 4]
             .into_iter()
             .max()
             .unwrap()
     }
 
     fn rlen(&self) -> usize {
-        [self.or_eph + 32, self.or_ets + 24]
-            .into_iter()
-            .max()
-            .unwrap()
+        [
+            self.or_eph + 32,
+            self.or_ets + 24,
+            self.or_sidx + 4,
+            self.or_ridx + 4,
+        ]
+        .into_iter()
+        .max()
+        .unwrap()
     }
 }
 
@@ -114,6 +106,9 @@ impl Default for PacketLayout {
             oi_epk: 1 + 32,
             or_eph: 1,
             or_ets: 1 + 32,
+            oi_sidx: 81,
+            or_sidx: 57,
+            or_ridx: 61,
             od_non: 1,
             od_dl: 1 + 12,
             od_d: 1 + 12 + 4,
@@ -150,7 +145,9 @@ pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet,
             let ephemeral = get_masked_at(buf, layout.oi_eph, layout.mask)?;
             let enc_pub_key = get_masked_at(buf, layout.oi_epk, layout.mask)?;
 
+            let sender_idx = u32::from_be_bytes(get_masked_at(buf, layout.oi_sidx, layout.mask)?);
             let packet = Packet::Initiating(Initiating {
+                sender_idx,
                 enc_pub_key,
                 ephemeral,
             });
@@ -163,7 +160,11 @@ pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet,
             let ephemeral = get_masked_at(buf, layout.or_eph, layout.mask)?;
             let enc_ts = get_masked_at(buf, layout.or_ets, layout.mask)?;
 
+            let sender_idx = u32::from_be_bytes(get_masked_at(buf, layout.or_sidx, layout.mask)?);
+            let receiver_idx = u32::from_be_bytes(get_masked_at(buf, layout.or_ridx, layout.mask)?);
             let packet = Packet::Reply(Replying {
+                sender_idx,
+                receiver_idx,
                 eph: ephemeral,
                 enc_ts,
             });
@@ -220,11 +221,25 @@ pub fn append(buf: &mut BytesMut, packet: Packet, layout: &PacketLayout) -> Resu
         Packet::Initiating(Initiating {
             enc_pub_key,
             ephemeral,
+            sender_idx,
         }) => {
+            put_masked_at(out, layout.oi_sidx, &sender_idx.to_be_bytes(), layout.mask);
             put_masked_at(out, layout.oi_eph, &ephemeral, layout.mask);
             put_masked_at(out, layout.oi_epk, &enc_pub_key, layout.mask);
         }
-        Packet::Reply(Replying { enc_ts, eph }) => {
+        Packet::Reply(Replying {
+            enc_ts,
+            eph,
+            sender_idx,
+            receiver_idx,
+        }) => {
+            put_masked_at(out, layout.or_sidx, &sender_idx.to_be_bytes(), layout.mask);
+            put_masked_at(
+                out,
+                layout.or_ridx,
+                &receiver_idx.to_be_bytes(),
+                layout.mask,
+            );
             put_masked_at(out, layout.or_eph, &eph, layout.mask);
             put_masked_at(out, layout.or_ets, &enc_ts, layout.mask);
         }
@@ -263,6 +278,12 @@ fn get_masked_at<const N: usize>(buf: &[u8], pos: usize, mask: u32) -> Option<[u
 
 pub struct Codec {
     layout: PacketLayout,
+}
+
+impl Codec {
+    pub fn new(layout: PacketLayout) -> Self {
+        Self { layout }
+    }
 }
 
 impl Decoder for Codec {
@@ -305,7 +326,7 @@ mod tests {
         assert_eq!(packet.ephemeral, [7; 32]);
         assert_eq!(packet.enc_pub_key, [8; 48]);
         assert!(buf.is_empty());
-        let mut partial = BytesMut::from(&initiation[..80]);
+        let mut partial = BytesMut::from(&initiation[..84]);
         let original = partial.clone();
         assert!(parse(&mut partial, &layout).is_none());
         assert_eq!(partial, original);
@@ -321,7 +342,7 @@ mod tests {
         assert_eq!(packet.eph, [9; 32]);
         assert_eq!(packet.enc_ts, [10; 24]);
         assert!(buf.is_empty());
-        let mut partial = BytesMut::from(&reply[..56]);
+        let mut partial = BytesMut::from(&reply[..64]);
         let original = partial.clone();
         assert!(parse(&mut partial, &layout).is_none());
         assert_eq!(partial, original);
@@ -337,6 +358,34 @@ mod tests {
                 ..PacketLayout::default()
             };
             assert!(layout.check().is_err(), "type offset {o_ty}");
+        }
+    }
+
+    #[test]
+    fn test_index_layout_overlap() {
+        for layout in [
+            PacketLayout {
+                oi_sidx: 0,
+                ..PacketLayout::default()
+            },
+            PacketLayout {
+                oi_sidx: 78,
+                ..PacketLayout::default()
+            },
+            PacketLayout {
+                or_sidx: 31,
+                ..PacketLayout::default()
+            },
+            PacketLayout {
+                or_ridx: 55,
+                ..PacketLayout::default()
+            },
+            PacketLayout {
+                or_ridx: 60,
+                ..PacketLayout::default()
+            },
+        ] {
+            assert!(layout.check().is_err());
         }
     }
 
@@ -402,10 +451,10 @@ mod tests {
         let mut codec = Codec {
             layout: PacketLayout::default(),
         };
-        let mut src = BytesMut::from(&[0u8; 81][..]);
-        let mut reply = vec![0; 57];
+        let mut src = BytesMut::from(&[0u8; 85][..]);
+        let mut reply = vec![0; 65];
         reply[0] = 1;
-        src.extend_from_slice(&reply[..56]);
+        src.extend_from_slice(&reply[..64]);
         assert!(matches!(
             codec.decode(&mut src).unwrap(),
             Some(Packet::Initiating(_))
@@ -413,7 +462,7 @@ mod tests {
         let partial = src.clone();
         assert!(codec.decode(&mut src).unwrap().is_none());
         assert_eq!(src, partial);
-        src.extend_from_slice(&reply[56..]);
+        src.extend_from_slice(&reply[64..]);
         assert!(matches!(
             codec.decode(&mut src).unwrap(),
             Some(Packet::Reply(_))
@@ -439,6 +488,9 @@ mod tests {
                     oi_epk: 40,
                     or_eph: 6,
                     or_ets: 40,
+                    oi_sidx: 90,
+                    or_sidx: 70,
+                    or_ridx: 80,
                     od_non: 5,
                     od_dl: 20,
                     od_d: 28,
@@ -449,6 +501,7 @@ mod tests {
             codec
                 .encode(
                     Packet::Initiating(Initiating {
+                        sender_idx: 0x12345678,
                         enc_pub_key: [8; 48],
                         ephemeral: [7; 32],
                     }),
@@ -458,6 +511,8 @@ mod tests {
             codec
                 .encode(
                     Packet::Reply(Replying {
+                        sender_idx: 0x87654321,
+                        receiver_idx: 0x12345678,
                         enc_ts: [10; 24],
                         eph: [9; 32],
                     }),
@@ -479,11 +534,14 @@ mod tests {
             let Some(Packet::Initiating(packet)) = codec.decode(&mut buf).unwrap() else {
                 panic!("expected initiation")
             };
+            assert_eq!(packet.sender_idx, 0x12345678);
             assert_eq!(packet.enc_pub_key, [8; 48]);
             assert_eq!(packet.ephemeral, [7; 32]);
             let Some(Packet::Reply(packet)) = codec.decode(&mut buf).unwrap() else {
                 panic!("expected reply")
             };
+            assert_eq!(packet.sender_idx, 0x87654321);
+            assert_eq!(packet.receiver_idx, 0x12345678);
             assert_eq!(packet.enc_ts, [10; 24]);
             assert_eq!(packet.eph, [9; 32]);
             for expected in [&b"payload"[..], &b""[..]] {

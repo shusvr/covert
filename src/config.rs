@@ -1,6 +1,6 @@
 use crate::transport::{
-    icmp::{IcmpTransportConfig, IcmpTransportPeerConfig},
-    udp::{UdpTransportConfig, UdpTransportPeerConfig},
+    icmp::{IcmpListenerConfig, IcmpTransportPeerConfig},
+    udp::{UdpListenerConfig, UdpTransportPeerConfig},
 };
 use base64::prelude::*;
 use ipnet::IpNet;
@@ -29,7 +29,7 @@ pub struct Interface {
     pub mtu: u16,
     pub private_key: PrivKey,
 
-    pub transport: Transport,
+    pub listener: ListenerConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -46,12 +46,12 @@ pub struct Peer {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-pub enum Transport {
+pub enum ListenerConfig {
     Udp {
-        udp: UdpTransportConfig,
+        udp: UdpListenerConfig,
     },
     Icmp {
-        icmp: IcmpTransportConfig,
+        icmp: IcmpListenerConfig,
     },
     Other {
         id: String,

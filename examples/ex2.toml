@@ -1,0 +1,13 @@
+[Interface]
+Address = "10.111.111.2/24"
+PrivateKey = "Z2LubJGUXNxmVPqEHNDRWaeqzYLHjPyMN9i6gvNfXKU="
+
+[[Interface.Listener.Udp]]
+
+[[Peer]]
+AllowedIPs = "10.111.111.1/32"
+PublicKey = "qN/ExVUeFmYFBzJ743X749kmwkeOAjMK9Bf0sc2qQgA="
+
+
+[[Peer.Transport.Udp]]
+Endpoint = "127.0.0.1:5551"

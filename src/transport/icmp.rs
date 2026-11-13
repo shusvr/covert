@@ -3,7 +3,7 @@ use std::net::IpAddr;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-pub struct IcmpTransportConfig {
+pub struct IcmpListenerConfig {
     #[serde(default = "default_icmp_id")]
     id: u16,
 }

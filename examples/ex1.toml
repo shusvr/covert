@@ -1,14 +1,14 @@
 [Interface]
 Address = "10.111.111.1/24"
-PrivateKey = "WBV1IUsYiyR/X8npJKUDrv+StYtO3i6USG2vd6mXCWk="
+PrivateKey = "d7hPKQORyHjM+RlXZqTcN/1U5zf0T2rFwTo97NPrgJc="
 
-[[Interface.Transport.Udp]]
-ListenPort = 5551 # Remove `ListenPort` for default params
+
+[[Interface.Listener.Udp]]
+Port = 5551 # Remove ONLY `Port` for default params, keep the table to infer the Udp mode
+
 
 [[Peer]]
 AllowedIPs = "10.111.111.2/32"
-PublicKey = "r3w0Ro9ShVHe/Tu6XQeTVIajDHHyr5c0evvMnIiHIFM="
-
+PublicKey = "R5Is9GsHJMrSgwCKMRqku214d6Slt6a9u4RyerJ5kQw="
 
 [[Peer.Transport.Udp]]
-Endpoint = "127.0.0.1:5552"

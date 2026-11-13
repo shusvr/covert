@@ -1,3 +1,5 @@
+use thiserror::Error;
+
 pub type Key = [u8; 32];
 pub type SealedKey = [u8; 48];
 pub type Timestamp = i64;
@@ -6,5 +8,14 @@ pub type Nonce = [u8; 12];
 
 pub mod config;
 pub mod crypto;
+pub mod listener;
 pub mod transport;
 pub mod wire;
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("Io: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+pub(crate) type Result<T = (), E = Error> = std::result::Result<T, E>;

@@ -1,2 +1,2 @@
 run:
-    cargo b && sudo ./target/debug/covert ./examples/ex1.toml
+    cargo b && sudo ./target/debug/covert run ./examples/ex1.toml
