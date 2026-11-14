@@ -111,7 +111,7 @@ fn read_config(path: &Path) -> anyhow::Result<Arc<Config>> {
     for p in &config.peers {
         let matches = match (&config.interface.listener, &p.transport) {
             (ListenerConfig::Udp { .. }, PeerTransport::Udp { .. }) => true,
-            (ListenerConfig::Other { id, .. }, PeerTransport::Other { id: peer, .. }) => id == peer,
+            (ListenerConfig::Icmp { .. }, PeerTransport::Icmp { .. }) => true,
             _ => false,
         };
 

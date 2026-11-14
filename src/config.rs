@@ -5,7 +5,7 @@ use crate::transport::{
 use base64::prelude::*;
 use ipnet::IpNet;
 use serde::Deserialize;
-use std::{collections::HashMap, fmt::Debug, net::IpAddr};
+use std::{fmt::Debug, net::IpAddr};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -45,33 +45,15 @@ pub struct Peer {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum ListenerConfig {
-    Udp {
-        udp: UdpListenerConfig,
-    },
-    Icmp {
-        icmp: IcmpListenerConfig,
-    },
-    Other {
-        id: String,
-        #[serde(flatten)]
-        values: HashMap<String, toml::Value>,
-    },
+    Udp { udp: UdpListenerConfig },
+    Icmp { icmp: IcmpListenerConfig },
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum PeerTransport {
-    Udp {
-        udp: UdpTransportPeerConfig,
-    },
-    Icmp {
-        icmp: IcmpTransportPeerConfig,
-    },
-    Other {
-        id: String,
-        #[serde(flatten)]
-        values: HashMap<String, toml::Value>,
-    },
+    Udp { udp: UdpTransportPeerConfig },
+    Icmp { icmp: IcmpTransportPeerConfig },
 }
 
 impl PeerTransport {

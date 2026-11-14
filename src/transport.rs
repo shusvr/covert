@@ -161,7 +161,6 @@ pub async fn create_listener(state: &Arc<State>, config: &Arc<Config>) -> Result
             Listener::Udp(udp)
         }
         ListenerConfig::Icmp { .. } => todo!(),
-        ListenerConfig::Other { .. } => todo!(),
     };
 
     Ok(listener)
@@ -322,7 +321,7 @@ async fn process_incoming(
 
 pub trait PacketSender<R>: Sink<(Packet, R), Error = codec::Error> + Unpin {}
 
-impl<R, T> PacketSender<R> for T where T: Sink<(Packet, R), Error = codec::Error> + Unpin {}
+impl<T, R> PacketSender<R> for T where T: Sink<(Packet, R), Error = codec::Error> + Unpin {}
 
 pub async fn initiate<R: Clone>(
     state: &State,
