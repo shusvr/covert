@@ -2,21 +2,16 @@ use crate::{
     Result,
     codec::{Codec, PacketLayout},
     config::Config,
-    transport::{Endpoint, State, initiate_disconnected_peers, process_packet, send_keepalives},
+    transport::{Endpoint, State, maintain_peers, process_packet},
 };
 use dashmap::DashMap;
 use futures::StreamExt;
 use serde::Deserialize;
 use std::{
-    fmt::Debug,
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
-    time::Duration,
 };
-use tokio::{
-    net::UdpSocket,
-    time::{Instant, MissedTickBehavior, interval, sleep},
-};
+use tokio::{net::UdpSocket, task::JoinSet};
 use tokio_util::udp::UdpFramed;
 use tracing::{error, trace};
 use uuid::Uuid;
@@ -67,10 +62,6 @@ pub async fn create_udp_endpoint(
     Ok(Endpoint { routing, sender })
 }
 
-fn keepalive_delay() -> Duration {
-    Duration::from_secs_f64(8.0 + 4.0 * fastrand::f64())
-}
-
 async fn socket_listener_task(
     state: Arc<State>,
     socket: Arc<UdpSocket>,
@@ -79,19 +70,16 @@ async fn socket_listener_task(
 ) {
     let mut framed = UdpFramed::new(socket.clone(), Codec::new(PacketLayout::default()));
 
-    let mut retries = interval(Duration::from_secs(5));
-    retries.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let keepalive = sleep(keepalive_delay());
-    tokio::pin!(keepalive);
+    // Dropping the receive task also stops its independent maintenance task.
+    let mut maintenance = JoinSet::new();
+    maintenance.spawn(maintain_peers(
+        state.clone(),
+        config.clone(),
+        routing.clone(),
+        UdpFramed::new(socket, Codec::new(PacketLayout::default())),
+    ));
     loop {
         tokio::select! {
-            _ = &mut keepalive => {
-                send_keepalives(&state, &config, &routing, &mut framed).await;
-                keepalive.as_mut().reset(Instant::now() + keepalive_delay());
-            }
-            _ = retries.tick() => {
-                initiate_disconnected_peers(&state, &config, &routing, &mut framed).await;
-            }
             result = framed.next() => {
                 match result {
                     Some(Ok((packet, addr))) => {
@@ -111,6 +99,5 @@ async fn socket_listener_task(
     }
 }
 
-// Return false when TUN delivery is closed and the receive loop should stop.
 #[cfg(test)]
 mod tests;

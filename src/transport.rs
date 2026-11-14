@@ -9,7 +9,10 @@ use std::{
     },
     time::{Duration, Instant, SystemTime},
 };
-use tokio::sync::mpsc;
+use tokio::{
+    sync::mpsc,
+    time::{Instant as TokioInstant, MissedTickBehavior, interval, sleep},
+};
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
@@ -581,4 +584,33 @@ async fn flush_queued<R: Debug + Clone>(
         "Flushed queued packets"
     );
     Ok(())
+}
+
+// Runs independently of receiving packets; only requires a packet sink and routes.
+async fn maintain_peers<R: Clone, S: PacketSender<R>>(
+    state: Arc<State>,
+    config: Arc<Config>,
+    routing: Arc<DashMap<Uuid, R>>,
+    mut sender: S,
+) {
+    let mut retries = interval(Duration::from_secs(5));
+    retries.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let keepalive = sleep(keepalive_delay());
+    tokio::pin!(keepalive);
+    loop {
+        tokio::select! {
+            _ = state.tun_in_tx.closed() => break,
+            _ = &mut keepalive => {
+                send_keepalives(&state, &config, &routing, &mut sender).await;
+                keepalive.as_mut().reset(TokioInstant::now() + keepalive_delay());
+            }
+            _ = retries.tick() => {
+                initiate_disconnected_peers(&state, &config, &routing, &mut sender).await;
+            }
+        }
+    }
+}
+
+fn keepalive_delay() -> Duration {
+    Duration::from_secs_f64(8.0 + 4.0 * fastrand::f64())
 }

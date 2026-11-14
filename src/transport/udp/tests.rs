@@ -1,11 +1,14 @@
 use super::*;
 use crate::codec::Packet;
+use crate::transport::{initiate_disconnected_peers, process_packet};
 use crate::{
     config::{Interface, ListenerConfig, Peer, PeerTransport},
     crypto::{finish, pk_to_bytes, post_reply, pre_reply, random_sk, sk_to_bytes},
     transport::{establish, transmit},
 };
 use futures::SinkExt;
+use std::time::{Duration, Instant};
+type UdpListener = Endpoint<UdpPacketSender, UdpRoute>;
 use tokio::{sync::mpsc, time::timeout};
 
 fn config(local_sk: crate::Key, remote_pk: crate::Key, endpoint: SocketAddr) -> Config {
@@ -34,7 +37,7 @@ fn config(local_sk: crate::Key, remote_pk: crate::Key, endpoint: SocketAddr) -> 
 }
 
 async fn receive(listener: &mut UdpListener) -> (Packet, SocketAddr) {
-    timeout(Duration::from_secs(3), listener.framed.next())
+    timeout(Duration::from_secs(3), listener.sender.next())
         .await
         .unwrap()
         .unwrap()
@@ -148,8 +151,8 @@ async fn expired_session_queues_traffic_and_reinitiates() {
     state.established.insert(1, session);
     state.peering.insert(peer_id, 1);
     let mut listener = UdpListener {
-        framed: UdpFramed::new(socket, Codec::new(PacketLayout::default())),
-        peer_addresses: Arc::new(
+        sender: UdpFramed::new(socket, Codec::new(PacketLayout::default())),
+        routing: Arc::new(
             [(peer_id, remote.local_addr().unwrap())]
                 .into_iter()
                 .collect(),
@@ -161,8 +164,8 @@ async fn expired_session_queues_traffic_and_reinitiates() {
         transmit(
             &state,
             &config,
-            &listener.peer_addresses,
-            &mut listener.framed,
+            &listener.routing,
+            &mut listener.sender,
             peer_id,
             b"queued after expiry",
         ),
@@ -276,8 +279,8 @@ async fn background_task_retries_peers_with_known_endpoints() {
         .await
         .unwrap();
     let mut receiver = UdpListener {
-        framed: UdpFramed::new(socket, Codec::new(PacketLayout::default())),
-        peer_addresses: Arc::new(DashMap::new()),
+        sender: UdpFramed::new(socket, Codec::new(PacketLayout::default())),
+        routing: Arc::new(DashMap::new()),
     };
     let (packet, _) = receive(&mut receiver).await;
     let Packet::Initiating(initiation) = packet else {
@@ -296,7 +299,7 @@ async fn background_task_retries_peers_with_known_endpoints() {
     )
     .unwrap();
     // No response: the background task must retry without any TUN traffic.
-    let (packet, _) = timeout(Duration::from_secs(7), receiver.framed.next())
+    let (packet, _) = timeout(Duration::from_secs(7), receiver.sender.next())
         .await
         .unwrap()
         .unwrap()
@@ -337,24 +340,24 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     let state_a = Arc::new(State::new(tx_a));
     let state_b = Arc::new(State::new(tx_b));
     let mut a = UdpListener {
-        framed: UdpFramed::new(socket_a, Codec::new(PacketLayout::default())),
-        peer_addresses: Arc::new(
+        sender: UdpFramed::new(socket_a, Codec::new(PacketLayout::default())),
+        routing: Arc::new(
             [(peer_a, socket_b.local_addr().unwrap())]
                 .into_iter()
                 .collect(),
         ),
     };
     let mut b = UdpListener {
-        framed: UdpFramed::new(socket_b, Codec::new(PacketLayout::default())),
-        peer_addresses: Arc::new(DashMap::new()),
+        sender: UdpFramed::new(socket_b, Codec::new(PacketLayout::default())),
+        routing: Arc::new(DashMap::new()),
     };
 
     // Queue traffic on both sides before their sessions exist.
     transmit(
         &state_a,
         &config_a,
-        &a.peer_addresses,
-        &mut a.framed,
+        &a.routing,
+        &mut a.sender,
         peer_a,
         b"queued first",
     )
@@ -368,8 +371,8 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     transmit(
         &state_b,
         &config_b,
-        &b.peer_addresses,
-        &mut b.framed,
+        &b.routing,
+        &mut b.sender,
         peer_b,
         b"queued first",
     )
@@ -378,8 +381,8 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     transmit(
         &state_b,
         &config_b,
-        &b.peer_addresses,
-        &mut b.framed,
+        &b.routing,
+        &mut b.sender,
         peer_b,
         b"queued second",
     )
@@ -397,32 +400,18 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     };
     let local_a = initiation.sender_idx;
     assert!(state_a.initiated.contains_key(&local_a));
-    process_packet(
-        &state_b,
-        &config_b,
-        packet,
-        from,
-        &b.peer_addresses,
-        &mut b.framed,
-    )
-    .await
-    .unwrap();
+    process_packet(&state_b, &config_b, packet, from, &b.routing, &mut b.sender)
+        .await
+        .unwrap();
     let (packet, from) = receive(&mut a).await;
     let Packet::Reply(ref reply) = packet else {
         panic!("expected reply")
     };
     let local_b = reply.sender_idx;
     assert_eq!(reply.receiver_idx, local_a);
-    process_packet(
-        &state_a,
-        &config_a,
-        packet,
-        from,
-        &a.peer_addresses,
-        &mut a.framed,
-    )
-    .await
-    .unwrap();
+    process_packet(&state_a, &config_a, packet, from, &a.routing, &mut a.sender)
+        .await
+        .unwrap();
     assert!(state_a.initiated.is_empty());
     assert_eq!(*state_a.peering.get(&peer_a).unwrap().value(), local_a);
     assert_eq!(*state_b.peering.get(&peer_b).unwrap().value(), local_b);
@@ -440,36 +429,22 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     assert_eq!(state_a.queued.get(&unrelated_peer).unwrap().len(), 1);
     for expected in [b"queued first".as_slice(), b"queued second".as_slice()] {
         let (packet, from) = receive(&mut b).await;
-        process_packet(
-            &state_b,
-            &config_b,
-            packet,
-            from,
-            &b.peer_addresses,
-            &mut b.framed,
-        )
-        .await
-        .unwrap();
+        process_packet(&state_b, &config_b, packet, from, &b.routing, &mut b.sender)
+            .await
+            .unwrap();
         assert_eq!(rx_b.try_recv().unwrap(), expected);
         let (packet, from) = receive(&mut a).await;
-        process_packet(
-            &state_a,
-            &config_a,
-            packet,
-            from,
-            &a.peer_addresses,
-            &mut a.framed,
-        )
-        .await
-        .unwrap();
+        process_packet(&state_a, &config_a, packet, from, &a.routing, &mut a.sender)
+            .await
+            .unwrap();
         assert_eq!(rx_a.try_recv().unwrap(), expected);
     }
 
     transmit(
         &state_a,
         &config_a,
-        &a.peer_addresses,
-        &mut a.framed,
+        &a.routing,
+        &mut a.sender,
         peer_a,
         b"hello",
     )
@@ -479,16 +454,9 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     assert!(
         matches!(packet, Packet::Data(crate::codec::Data { receiver_idx, .. }) if receiver_idx == local_b)
     );
-    process_packet(
-        &state_b,
-        &config_b,
-        packet,
-        from,
-        &b.peer_addresses,
-        &mut b.framed,
-    )
-    .await
-    .unwrap();
+    process_packet(&state_b, &config_b, packet, from, &b.routing, &mut b.sender)
+        .await
+        .unwrap();
     assert_eq!(
         timeout(Duration::from_secs(3), rx_b.recv())
             .await
@@ -497,12 +465,12 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
         b"hello"
     );
 
-    assert_eq!(*b.peer_addresses.get(&peer_b).unwrap(), from);
+    assert_eq!(*b.routing.get(&peer_b).unwrap(), from);
     transmit(
         &state_b,
         &config_b,
-        &b.peer_addresses,
-        &mut b.framed,
+        &b.routing,
+        &mut b.sender,
         peer_b,
         b"reply",
     )
@@ -512,16 +480,9 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     assert!(
         matches!(packet, Packet::Data(crate::codec::Data { receiver_idx, .. }) if receiver_idx == local_a)
     );
-    process_packet(
-        &state_a,
-        &config_a,
-        packet,
-        from,
-        &a.peer_addresses,
-        &mut a.framed,
-    )
-    .await
-    .unwrap();
+    process_packet(&state_a, &config_a, packet, from, &a.routing, &mut a.sender)
+        .await
+        .unwrap();
     assert_eq!(
         timeout(Duration::from_secs(3), rx_a.recv())
             .await
@@ -531,14 +492,14 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     );
 
     // The periodic check skips both live connections, including learned endpoints.
-    initiate_disconnected_peers(&state_a, &config_a, &a.peer_addresses, &mut a.framed).await;
-    initiate_disconnected_peers(&state_b, &config_b, &b.peer_addresses, &mut b.framed).await;
+    initiate_disconnected_peers(&state_a, &config_a, &a.routing, &mut a.sender).await;
+    initiate_disconnected_peers(&state_b, &config_b, &b.routing, &mut b.sender).await;
     assert!(state_a.initiated.is_empty());
     assert!(state_b.initiated.is_empty());
 
     // A missing session is retried even when the peering entry still exists.
     state_a.established.remove(&local_a);
-    initiate_disconnected_peers(&state_a, &config_a, &a.peer_addresses, &mut a.framed).await;
+    initiate_disconnected_peers(&state_a, &config_a, &a.routing, &mut a.sender).await;
     let (packet, _) = receive(&mut b).await;
     assert!(matches!(packet, Packet::Initiating(_)));
     assert_eq!(state_a.initiated.len(), 1);
@@ -547,7 +508,7 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     for mut pending in state_a.initiated.iter_mut() {
         pending.when = std::time::Instant::now() - Duration::from_secs(61);
     }
-    initiate_disconnected_peers(&state_a, &config_a, &a.peer_addresses, &mut a.framed).await;
+    initiate_disconnected_peers(&state_a, &config_a, &a.routing, &mut a.sender).await;
     assert_eq!(state_a.initiated.len(), 1);
 }
 
@@ -568,8 +529,8 @@ async fn background_task_sends_encrypted_keepalive_with_jitter() {
         .await
         .unwrap();
     let mut remote = UdpListener {
-        framed: UdpFramed::new(socket, Codec::new(PacketLayout::default())),
-        peer_addresses: Arc::new(DashMap::new()),
+        sender: UdpFramed::new(socket, Codec::new(PacketLayout::default())),
+        routing: Arc::new(DashMap::new()),
     };
     let (packet, from) = receive(&mut remote).await;
     let Packet::Initiating(initiation) = packet else {
@@ -585,11 +546,11 @@ async fn background_task_sends_encrypted_keepalive_with_jitter() {
     let (reply, cipher) =
         post_reply(&remote_pk, Some(&[7; 32]), 123, initiation.sender_idx).unwrap();
     remote
-        .framed
+        .sender
         .send((Packet::Reply(reply), from))
         .await
         .unwrap();
-    let (packet, _) = timeout(Duration::from_secs(13), remote.framed.next())
+    let (packet, _) = timeout(Duration::from_secs(13), remote.sender.next())
         .await
         .unwrap()
         .unwrap()
@@ -609,4 +570,45 @@ async fn background_task_sends_encrypted_keepalive_with_jitter() {
     assert_eq!(ciphertext.len(), 16);
     assert!(cipher.decrypt(counter, ciphertext).unwrap().is_empty());
     assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn maintenance_initiates_without_a_socket_and_stops_when_tun_closes() {
+    let local = random_sk().unwrap();
+    let remote = random_sk().unwrap();
+    let config = Arc::new(config(
+        sk_to_bytes(&local),
+        pk_to_bytes(&remote.compute_public_key().unwrap()),
+        "127.0.0.1:1234".parse().unwrap(),
+    ));
+    let peer_id = config.peers[0].peer_id;
+    let (tun_tx, tun_rx) = mpsc::channel(1);
+    let state = Arc::new(State::new(tun_tx));
+    let routing = Arc::new(
+        [(peer_id, String::from("test-route"))]
+            .into_iter()
+            .collect(),
+    );
+    let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
+    let sender = Box::pin(futures::sink::unfold((), move |(), packet| {
+        let sent_tx = sent_tx.clone();
+        async move {
+            sent_tx.send(packet).unwrap();
+            Ok::<_, crate::codec::Error>(())
+        }
+    }));
+    let task = tokio::spawn(crate::transport::maintain_peers(
+        state, config, routing, sender,
+    ));
+    let (packet, route) = timeout(Duration::from_secs(3), sent_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(packet, Packet::Initiating(_)));
+    assert_eq!(route, "test-route");
+    drop(tun_rx);
+    timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap();
 }
