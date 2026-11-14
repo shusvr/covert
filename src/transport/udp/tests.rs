@@ -323,7 +323,7 @@ async fn received_keepalive_refreshes_session_and_invalid_data_removes_it() {
         .unwrap()
         .unwrap();
     assert!(
-        matches!(packet, Packet::Data(data) if data.flags.contains(crate::codec::DataFlags::KEEPALIVE))
+        matches!(packet, Packet::Data(data) if data.flags.contains(crate::codec::DataFlags::JUNK))
     );
 
     let (counter, mut ciphertext) = sender.encrypt(b"tampered".to_vec()).unwrap();

@@ -22,6 +22,9 @@ const DEFAULT_LAYOUT: PacketLayout = PacketLayout {
     odf: 13,
     oddl: 14,
     odd: 18,
+    oip: 0,
+    orp: 0,
+    odp: 0,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -32,14 +35,17 @@ pub struct PacketLayout {
     pub oiepk: usize, // (initiating) offset of encrypted public key
     pub oiets: usize, // (initiating) offset of encrypted timestamp
     pub oisi: usize,  // (initiating) offset of sender index
+    pub oip: usize,   // (initiating) pad to this len
     pub oreph: usize, // (replying) offset of ephemeral key
     pub orsi: usize,  // (replying) offset of sender index
     pub orri: usize,  // (replying) offset of receiver index
+    pub orp: usize,   // (replying) pad to this len
     pub odri: usize,  // (data) offset of receiver index
     pub odct: usize,  // (data) offset of counter
     pub odf: usize,   // (data) offset of flags
     pub oddl: usize,  // (data) offset of data length
     pub odd: usize,   // (data) offset of data itself
+    pub odp: usize,   // (data) pad to this minimum total length
 }
 
 impl Default for PacketLayout {
@@ -50,21 +56,44 @@ impl Default for PacketLayout {
 
 impl ToString for PacketLayout {
     fn to_string(&self) -> String {
+        let Self {
+            mask,
+            oty,
+            oieph,
+            oiepk,
+            oiets,
+            oisi,
+            oip,
+            oreph,
+            orsi,
+            orri,
+            orp,
+            odri,
+            odct,
+            odf,
+            oddl,
+            odd,
+            odp,
+        } = *self;
+
         let pairs = [
-            ("m", self.mask as usize),
-            ("oty", self.oty),
-            ("oieph", self.oieph),
-            ("oiepk", self.oiepk),
-            ("oiets", self.oiets),
-            ("oisidx", self.oisi),
-            ("oreph", self.oreph),
-            ("orsidx", self.orsi),
-            ("orridx", self.orri),
-            ("odridx", self.odri),
-            ("odctr", self.odct),
-            ("oddl", self.oddl),
-            ("odf", self.odf),
-            ("odd", self.odd),
+            ("m", mask as usize),
+            ("oty", oty),
+            ("oip", oip),
+            ("oieph", oieph),
+            ("oiepk", oiepk),
+            ("oiets", oiets),
+            ("oisidx", oisi),
+            ("orp", orp),
+            ("oreph", oreph),
+            ("orsidx", orsi),
+            ("orridx", orri),
+            ("odridx", odri),
+            ("odctr", odct),
+            ("oddl", oddl),
+            ("odp", odp),
+            ("odf", odf),
+            ("odd", odd),
         ];
 
         let pairs = pairs
@@ -92,16 +121,19 @@ impl FromStr for PacketLayout {
                         u32::try_from(v).map_err(|_| Error::InvalidLayout("mask overflow"))?
                 }
                 "oty" => layout.oty = v,
+                "oip" => layout.oip = v,
                 "oieph" => layout.oieph = v,
                 "oiepk" => layout.oiepk = v,
                 "oiets" => layout.oiets = v,
                 "oisidx" => layout.oisi = v,
                 "oreph" => layout.oreph = v,
                 "orsidx" => layout.orsi = v,
+                "orp" => layout.orp = v,
                 "orridx" => layout.orri = v,
                 "odridx" => layout.odri = v,
                 "odctr" => layout.odct = v,
                 "oddl" => layout.oddl = v,
+                "odp" => layout.odp = v,
                 "odf" => layout.odf = v,
                 "odd" => layout.odd = v,
                 _ => return Err(Error::UnkownLayoutParam(k.to_owned())),
@@ -152,6 +184,9 @@ impl PacketLayout {
             odf,
             oddl,
             odd: data_end + fastrand::usize(0..=MAX_PADDING),
+            oip: 0,
+            orp: 0,
+            odp: 0,
         }
     }
 
@@ -226,6 +261,7 @@ impl PacketLayout {
             self.oiepk + 48,
             self.oisi + 4,
             self.oiets + 24,
+            self.oip,
         ]
         .into_iter()
         .max()
@@ -233,7 +269,7 @@ impl PacketLayout {
     }
 
     fn rlen(&self) -> usize {
-        [self.oreph + 32, self.orsi + 4, self.orri + 4]
+        [self.oreph + 32, self.orsi + 4, self.orri + 4, self.orp]
             .into_iter()
             .max()
             .unwrap()
@@ -243,9 +279,8 @@ impl PacketLayout {
 bitflags! {
     #[derive(Debug)]
     pub struct DataFlags : u8 {
-        const KEEPALIVE = 1;
+        const JUNK = 1;
     }
-
 }
 
 #[derive(Debug)]
@@ -303,6 +338,9 @@ pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet,
                 ephemeral,
             });
             let consumed = layout.ilen().max(layout.oty + 1);
+            if buf.len() < consumed {
+                return None;
+            }
             buf.advance(consumed);
             return Some(Ok(packet));
         }
@@ -318,6 +356,9 @@ pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet,
                 eph: ephemeral,
             });
             let consumed = layout.rlen().max(layout.oty + 1);
+            if buf.len() < consumed {
+                return None;
+            }
             buf.advance(consumed);
             return Some(Ok(packet));
         }
@@ -334,7 +375,8 @@ pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet,
                 .max(layout.odct.checked_add(8)?)
                 .max(layout.odf.checked_add(1)?)
                 .max(layout.oddl.checked_add(4)?)
-                .max(layout.oty.checked_add(1)?);
+                .max(layout.oty.checked_add(1)?)
+                .max(layout.odp);
             if buf.len() < consumed {
                 return None;
             }
@@ -353,6 +395,8 @@ pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet,
 }
 
 /// Appends a packet using layout-relative offsets, randomizing unused bytes.
+/// Pads to the corresponding `oip`, `orp`, or `odp` minimum total length;
+/// packets already at or above that length are never truncated.
 /// The layout must have passed `PacketLayout::check`.
 pub fn append(buf: &mut BytesMut, packet: Packet, layout: &PacketLayout) -> Result<(), Error> {
     let ty_end = layout.oty.checked_add(1).ok_or(Error::PacketOverflow)?;
@@ -371,7 +415,8 @@ pub fn append(buf: &mut BytesMut, packet: Packet, layout: &PacketLayout) -> Resu
                 .max(layout.odct.checked_add(8).ok_or(Error::PacketOverflow)?)
                 .max(layout.odf.checked_add(1).ok_or(Error::PacketOverflow)?)
                 .max(layout.oddl.checked_add(4).ok_or(Error::PacketOverflow)?)
-                .max(ty_end);
+                .max(ty_end)
+                .max(layout.odp);
             (2, len)
         }
     };
@@ -611,7 +656,7 @@ mod tests {
                 for (i, byte) in (payload.len() as u32).to_be_bytes().into_iter().enumerate() {
                     packet[layout.oddl + i] = byte ^ mask.to_be_bytes()[i % 4];
                 }
-                packet[layout.odf] = DataFlags::KEEPALIVE.bits() ^ mask.to_be_bytes()[0];
+                packet[layout.odf] = DataFlags::JUNK.bits() ^ mask.to_be_bytes()[0];
                 packet.extend_from_slice(payload);
                 let expected_len = packet.len();
                 for len in 0..expected_len {
@@ -634,7 +679,7 @@ mod tests {
                 };
                 assert_eq!(receiver_idx, 0x12345678);
                 assert_eq!(counter, 0x0123456789abcdef);
-                assert_eq!(flags.bits(), DataFlags::KEEPALIVE.bits());
+                assert_eq!(flags.bits(), DataFlags::JUNK.bits());
                 assert_eq!(data, payload);
                 assert_eq!(&buf[..], b"trailing");
             }
@@ -673,6 +718,64 @@ mod tests {
     }
 
     #[test]
+    fn test_padding_lengths_and_partial_packets() {
+        for padding in [0, 1, 28, 41, 109, 256] {
+            let layout = PacketLayout {
+                oip: padding,
+                orp: padding,
+                odp: padding,
+                ..PacketLayout::default()
+            };
+            let serialized = layout.to_string();
+            assert_eq!(
+                serialized.parse::<PacketLayout>().unwrap().to_string(),
+                serialized
+            );
+            for (packet, natural_len) in [
+                (
+                    Packet::Initiating(Initiating {
+                        ephemeral: [7; 32],
+                        enc_pub_key: [8; 48],
+                        enc_ts: [9; 24],
+                        sender_idx: 1,
+                    }),
+                    109,
+                ),
+                (
+                    Packet::Reply(Replying {
+                        eph: [7; 32],
+                        sender_idx: 1,
+                        receiver_idx: 2,
+                    }),
+                    41,
+                ),
+                (
+                    Packet::Data(Data {
+                        receiver_idx: 2,
+                        flags: DataFlags::empty(),
+                        counter: 1,
+                        ciphertext: vec![3; 10],
+                    }),
+                    28,
+                ),
+            ] {
+                let mut encoded = BytesMut::new();
+                append(&mut encoded, packet, &layout).unwrap();
+                assert_eq!(encoded.len(), natural_len.max(padding));
+                for len in 0..encoded.len() {
+                    let mut partial = BytesMut::from(&encoded[..len]);
+                    let original = partial.clone();
+                    assert!(parse(&mut partial, &layout).is_none());
+                    assert_eq!(partial, original);
+                }
+                encoded.extend_from_slice(b"trailing");
+                assert!(parse(&mut encoded, &layout).unwrap().is_ok());
+                assert_eq!(&encoded[..], b"trailing");
+            }
+        }
+    }
+
+    #[test]
     fn test_encode_round_trip() {
         let layouts = [0, 0x12345678].map(|mask| PacketLayout {
             mask,
@@ -689,9 +792,16 @@ mod tests {
             odf: 19,
             oddl: 20,
             odd: 28,
+            ..PacketLayout::default()
         });
         for layout in layouts
             .into_iter()
+            .chain(layouts.map(|layout| PacketLayout {
+                oip: 160,
+                orp: 120,
+                odp: 64,
+                ..layout
+            }))
             .chain((0..128).map(|_| PacketLayout::random()))
         {
             let mut codec = Codec::new(layout);

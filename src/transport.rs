@@ -318,7 +318,7 @@ async fn process_incoming(
                 }
             };
             handle.keep_alive();
-            if plaintext.is_empty() || flags.contains(DataFlags::KEEPALIVE) {
+            if plaintext.is_empty() || flags.contains(DataFlags::JUNK) {
                 trace!(receiver_idx, "Plaintext is empty, keepalive");
                 return Ok(None);
             }
@@ -516,7 +516,7 @@ async fn send_keepalives<R: Clone>(
                 let packet = Packet::Data(Data {
                     receiver_idx,
                     counter,
-                    flags: DataFlags::KEEPALIVE,
+                    flags: DataFlags::JUNK,
                     ciphertext,
                 });
                 match sender.send((packet, addr)).await {
