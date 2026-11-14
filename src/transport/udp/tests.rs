@@ -210,11 +210,12 @@ async fn received_keepalive_refreshes_session_and_invalid_data_removes_it() {
         &mut framed,
         &config,
         &addresses,
-        Packet::Data {
+        Packet::Data(crate::codec::Data {
             receiver_idx: 1,
             counter,
             ciphertext,
-        },
+            flags: crate::codec::DataFlags::empty(),
+        }),
         from,
     )
     .await
@@ -232,11 +233,12 @@ async fn received_keepalive_refreshes_session_and_invalid_data_removes_it() {
             &mut framed,
             &config,
             &addresses,
-            Packet::Data {
+            Packet::Data(crate::codec::Data {
                 receiver_idx: 1,
                 counter,
                 ciphertext,
-            },
+                flags: crate::codec::DataFlags::empty(),
+            }),
             from,
         ),
     )
@@ -472,7 +474,9 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     .await
     .unwrap();
     let (packet, from) = receive(&mut b).await;
-    assert!(matches!(packet, Packet::Data { receiver_idx, .. } if receiver_idx == local_b));
+    assert!(
+        matches!(packet, Packet::Data(crate::codec::Data { receiver_idx, .. }) if receiver_idx == local_b)
+    );
     handle_udp_packet(
         &state_b,
         &mut b.framed,
@@ -503,7 +507,9 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     .await
     .unwrap();
     let (packet, from) = receive(&mut a).await;
-    assert!(matches!(packet, Packet::Data { receiver_idx, .. } if receiver_idx == local_a));
+    assert!(
+        matches!(packet, Packet::Data(crate::codec::Data { receiver_idx, .. }) if receiver_idx == local_a)
+    );
     handle_udp_packet(
         &state_a,
         &mut a.framed,
@@ -586,11 +592,12 @@ async fn background_task_sends_encrypted_keepalive_with_jitter() {
         .unwrap()
         .unwrap()
         .unwrap();
-    let Packet::Data {
+    let Packet::Data(crate::codec::Data {
         receiver_idx,
         counter,
         ciphertext,
-    } = packet
+        ..
+    }) = packet
     else {
         panic!("expected keepalive")
     };

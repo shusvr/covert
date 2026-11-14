@@ -1,5 +1,6 @@
 use crate::crypto::{Initiating, Replying};
 
+use bitflags::bitflags;
 use bytes::{Buf, BytesMut};
 use std::{io, str::FromStr};
 use thiserror::Error;
@@ -17,8 +18,9 @@ const DEFAULT_LAYOUT: PacketLayout = PacketLayout {
     orri: 37,
     odri: 1,
     odct: 5,
-    oddl: 1 + 4 + 8,
-    odd: 1 + 4 + 8 + 4,
+    odf: 13,
+    oddl: 14,
+    odd: 18,
 };
 
 #[derive(Debug)]
@@ -34,6 +36,7 @@ pub struct PacketLayout {
     pub orri: usize,  // (replying) offset of receiver index
     pub odri: usize,  // (data) offset of receiver index
     pub odct: usize,  // (data) offset of counter
+    pub odf: usize,   // (data) offset of flags
     pub oddl: usize,  // (data) offset of data length
     pub odd: usize,   // (data) offset of data itself
 }
@@ -59,6 +62,7 @@ impl ToString for PacketLayout {
             ("odridx", self.odri),
             ("odctr", self.odct),
             ("oddl", self.oddl),
+            ("odf", self.odf),
             ("odd", self.odd),
         ];
 
@@ -82,6 +86,10 @@ impl FromStr for PacketLayout {
                 .map_err(|_| Error::InvalidLayout("non int"))?;
 
             match k {
+                "m" => {
+                    layout.mask =
+                        u32::try_from(v).map_err(|_| Error::InvalidLayout("mask overflow"))?
+                }
                 "oty" => layout.oty = v,
                 "oieph" => layout.oieph = v,
                 "oiepk" => layout.oiepk = v,
@@ -93,6 +101,7 @@ impl FromStr for PacketLayout {
                 "odridx" => layout.odri = v,
                 "odctr" => layout.odct = v,
                 "oddl" => layout.oddl = v,
+                "odf" => layout.odf = v,
                 "odd" => layout.odd = v,
                 _ => return Err(Error::UnkownLayoutParam(k.to_owned())),
             }
@@ -126,7 +135,7 @@ impl PacketLayout {
         let oty = fastrand::usize(0..=MAX_PADDING);
         let ([oieph, oiepk, oiets, oisi], _) = offsets(oty, [32, 48, 24, 4]);
         let ([oreph, orsi, orri], _) = offsets(oty, [32, 4, 4]);
-        let ([odri, odct, oddl], data_end) = offsets(oty, [4, 8, 4]);
+        let ([odri, odct, odf, oddl], data_end) = offsets(oty, [4, 8, 1, 4]);
         Self {
             mask: fastrand::u32(..),
             oty,
@@ -139,6 +148,7 @@ impl PacketLayout {
             orri,
             odri,
             odct,
+            odf,
             oddl,
             odd: data_end + fastrand::usize(0..=MAX_PADDING),
         }
@@ -158,6 +168,7 @@ impl PacketLayout {
             r("odridx", self.odri, 4),
             r("odctr", self.odct, 8),
             r("oddl", self.oddl, 4),
+            r("odf", self.odf, 1),
         ];
 
         // Data has a variable length, so reserve everything from od_d onward.
@@ -167,7 +178,7 @@ impl PacketLayout {
                 "oty".to_owned(),
             ));
         } else {
-            if let Some(bad) = ranges[7..10].iter().find_map(|(name, range)| {
+            if let Some(bad) = ranges[7..11].iter().find_map(|(name, range)| {
                 (range.start < range.end && range.end > self.odd).then_some(name)
             }) {
                 return Err(Error::LayoutFieldsOverlap(
@@ -181,7 +192,7 @@ impl PacketLayout {
             "oty",
             self.oty..self.oty.checked_add(1).expect("packet type overflow"),
         );
-        for group in [0..4, 4..7, 7..10] {
+        for group in [0..4, 4..7, 7..11] {
             for (i, (k1, r1)) in ranges[group.clone()]
                 .iter()
                 .chain(std::iter::once(&ty_range))
@@ -228,15 +239,27 @@ impl PacketLayout {
     }
 }
 
+bitflags! {
+    #[derive(Debug)]
+    pub struct DataFlags : u8 {
+        const KEEPALIVE = 1;
+    }
+
+}
+
+#[derive(Debug)]
+pub struct Data {
+    pub(crate) receiver_idx: u32,
+    pub(crate) flags: DataFlags,
+    pub(crate) counter: u64,
+    pub(crate) ciphertext: Vec<u8>,
+}
+
 #[derive(Debug)]
 pub enum Packet {
     Initiating(Initiating),
     Reply(Replying),
-    Data {
-        receiver_idx: u32,
-        counter: u64,
-        ciphertext: Vec<u8>,
-    },
+    Data(Data),
 }
 
 #[derive(Debug, Error)]
@@ -299,11 +322,14 @@ pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet,
         2 => {
             let receiver_idx = u32::from_be_bytes(get_masked_at(buf, layout.odri, layout.mask)?);
             let counter = u64::from_be_bytes(get_masked_at(buf, layout.odct, layout.mask)?);
+            let flags =
+                DataFlags::from_bits_retain(get_masked_at::<1>(buf, layout.odf, layout.mask)?[0]);
             let len = u32::from_be_bytes(get_masked_at(buf, layout.oddl, layout.mask)?);
             let end = layout.odd.checked_add(usize::try_from(len).ok()?)?;
             let consumed = end
                 .max(layout.odri.checked_add(4)?)
                 .max(layout.odct.checked_add(8)?)
+                .max(layout.odf.checked_add(1)?)
                 .max(layout.oddl.checked_add(4)?)
                 .max(layout.oty.checked_add(1)?);
             if buf.len() < consumed {
@@ -312,11 +338,12 @@ pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet,
             let data = buf[layout.odd..end].to_vec();
             buf.advance(consumed);
 
-            return Some(Ok(Packet::Data {
+            return Some(Ok(Packet::Data(Data {
                 receiver_idx,
+                flags,
                 counter,
                 ciphertext: data,
-            }));
+            })));
         }
         _ => return Some(Err(Error::UnexpectedTy(ty))),
     }
@@ -329,9 +356,9 @@ pub fn append(buf: &mut BytesMut, packet: Packet, layout: &PacketLayout) -> Resu
     let (ty, len) = match &packet {
         Packet::Initiating(_) => (0, layout.ilen().max(ty_end)),
         Packet::Reply(_) => (1, layout.rlen().max(ty_end)),
-        Packet::Data {
+        Packet::Data(Data {
             ciphertext: data, ..
-        } => {
+        }) => {
             u32::try_from(data.len()).map_err(|_| Error::PacketOverflow)?;
             let len = layout
                 .odd
@@ -339,6 +366,7 @@ pub fn append(buf: &mut BytesMut, packet: Packet, layout: &PacketLayout) -> Resu
                 .ok_or(Error::PacketOverflow)?
                 .max(layout.odri.checked_add(4).ok_or(Error::PacketOverflow)?)
                 .max(layout.odct.checked_add(8).ok_or(Error::PacketOverflow)?)
+                .max(layout.odf.checked_add(1).ok_or(Error::PacketOverflow)?)
                 .max(layout.oddl.checked_add(4).ok_or(Error::PacketOverflow)?)
                 .max(ty_end);
             (2, len)
@@ -371,13 +399,15 @@ pub fn append(buf: &mut BytesMut, packet: Packet, layout: &PacketLayout) -> Resu
             put_masked_at(out, layout.orri, &receiver_idx.to_be_bytes(), layout.mask);
             put_masked_at(out, layout.oreph, &eph, layout.mask);
         }
-        Packet::Data {
+        Packet::Data(Data {
             receiver_idx,
+            flags,
             counter,
             ciphertext: data,
-        } => {
+        }) => {
             put_masked_at(out, layout.odri, &receiver_idx.to_be_bytes(), layout.mask);
             put_masked_at(out, layout.odct, &counter.to_be_bytes(), layout.mask);
+            put_masked_at(out, layout.odf, &[flags.bits()], layout.mask);
             put_masked_at(
                 out,
                 layout.oddl,
@@ -578,6 +608,7 @@ mod tests {
                 for (i, byte) in (payload.len() as u32).to_be_bytes().into_iter().enumerate() {
                     packet[layout.oddl + i] = byte ^ mask.to_be_bytes()[i % 4];
                 }
+                packet[layout.odf] = DataFlags::KEEPALIVE.bits() ^ mask.to_be_bytes()[0];
                 packet.extend_from_slice(payload);
                 let expected_len = packet.len();
                 for len in 0..expected_len {
@@ -589,16 +620,18 @@ mod tests {
                 let mut with_trailing = packet.to_vec();
                 with_trailing.extend_from_slice(b"trailing");
                 let mut buf = BytesMut::from(with_trailing.as_slice());
-                let Packet::Data {
+                let Packet::Data(Data {
                     receiver_idx,
+                    flags,
                     counter,
                     ciphertext: data,
-                } = parse(&mut buf, &layout).unwrap().unwrap()
+                }) = parse(&mut buf, &layout).unwrap().unwrap()
                 else {
                     panic!("expected data");
                 };
                 assert_eq!(receiver_idx, 0x12345678);
                 assert_eq!(counter, 0x0123456789abcdef);
+                assert_eq!(flags.bits(), DataFlags::KEEPALIVE.bits());
                 assert_eq!(data, payload);
                 assert_eq!(&buf[..], b"trailing");
             }
@@ -650,6 +683,7 @@ mod tests {
             orri: 80,
             odri: 14,
             odct: 5,
+            odf: 19,
             oddl: 20,
             odd: 28,
         });
@@ -684,11 +718,12 @@ mod tests {
             for data in [b"payload".to_vec(), Vec::new()] {
                 codec
                     .encode(
-                        Packet::Data {
+                        Packet::Data(Data {
+                            flags: DataFlags::from_bits_retain(0x81),
                             receiver_idx: 0x12345678,
                             counter: u64::MAX,
                             ciphertext: data,
-                        },
+                        }),
                         &mut buf,
                     )
                     .unwrap();
@@ -708,16 +743,18 @@ mod tests {
             assert_eq!(packet.receiver_idx, 0x12345678);
             assert_eq!(packet.eph, [9; 32]);
             for expected in [&b"payload"[..], &b""[..]] {
-                let Some(Packet::Data {
+                let Some(Packet::Data(Data {
                     receiver_idx,
+                    flags,
                     counter,
                     ciphertext: data,
-                }) = codec.decode(&mut buf).unwrap()
+                })) = codec.decode(&mut buf).unwrap()
                 else {
                     panic!("expected data")
                 };
                 assert_eq!(receiver_idx, 0x12345678);
                 assert_eq!(counter, u64::MAX);
+                assert_eq!(flags.bits(), 0x81);
                 assert_eq!(data, expected);
             }
             assert!(buf.is_empty());

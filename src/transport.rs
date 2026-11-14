@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     Key, Result,
-    codec::{self, Packet},
+    codec::{self, Data, DataFlags, Packet},
     config::{Config, ListenerConfig, PubKey},
     crypto::{self, Cipher, Initiating, Replying, finish, post_reply, pre_reply},
     transport::udp::UdpListener,
@@ -274,11 +274,12 @@ async fn process_incoming(
                 handle,
             }
         }
-        Packet::Data {
+        Packet::Data(Data {
             receiver_idx,
             counter,
             ciphertext,
-        } => {
+            flags,
+        }) => {
             let Some(handle) = state.established.get(&receiver_idx) else {
                 debug!(receiver_idx, "Received data for an unknown session");
                 return Ok(None);
@@ -298,7 +299,7 @@ async fn process_incoming(
                     return Ok(None);
                 }
             };
-            if plaintext.is_empty() {
+            if plaintext.is_empty() || flags.contains(DataFlags::KEEPALIVE) {
                 debug!(receiver_idx, "Plaintext is empty, keepalive");
                 handle.keep_alive();
                 return Ok(None);
@@ -425,11 +426,12 @@ pub async fn transmit<R: Clone>(
             }
         };
         debug!(?peer_id, "Sending data");
-        let packet = Packet::Data {
+        let packet = Packet::Data(Data {
             receiver_idx,
+            flags: DataFlags::empty(),
             counter,
             ciphertext,
-        };
+        });
         sender.send((packet, addr)).await?;
         return Ok(());
     }
@@ -488,11 +490,12 @@ async fn send_keepalives<R: Clone>(
         };
         match cipher.encrypt(Vec::new()) {
             Ok((counter, ciphertext)) => {
-                let packet = Packet::Data {
+                let packet = Packet::Data(Data {
                     receiver_idx,
                     counter,
+                    flags: DataFlags::KEEPALIVE,
                     ciphertext,
-                };
+                });
                 match sender.send((packet, addr)).await {
                     Ok(()) => {
                         debug!(peer_id = ?peer.peer_id, receiver_idx, counter, "Keepalive sent")

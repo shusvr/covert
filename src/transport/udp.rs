@@ -1,6 +1,6 @@
 use crate::{
     Result,
-    codec::{Codec, Packet, PacketLayout},
+    codec::{Codec, Data, DataFlags, Packet, PacketLayout},
     config::Config,
     transport::{
         ProcessResult, State, initiate_disconnected_peers, process_incoming, send_keepalives,
@@ -185,11 +185,12 @@ async fn flush_queued(
         };
         framed
             .send((
-                Packet::Data {
+                Packet::Data(Data {
                     receiver_idx,
                     counter,
                     ciphertext,
-                },
+                    flags: DataFlags::empty(),
+                }),
                 addr,
             ))
             .await?;

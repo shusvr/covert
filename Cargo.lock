@@ -291,6 +291,7 @@ dependencies = [
  "anyhow",
  "aws-lc-rs",
  "base64",
+ "bitflags",
  "bytes",
  "circular-buffer",
  "clap",
