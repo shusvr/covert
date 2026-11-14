@@ -24,7 +24,7 @@ const DEFAULT_LAYOUT: PacketLayout = PacketLayout {
     odd: 18,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct PacketLayout {
     pub mask: u32,    // general field mask
     pub oty: usize,   // offset of packet ty

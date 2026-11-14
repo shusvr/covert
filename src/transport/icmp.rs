@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use bytes::BytesMut;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt, channel::mpsc};
@@ -11,7 +9,10 @@ use std::{
     mem::MaybeUninit,
     net::{Ipv4Addr, SocketAddrV4},
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 use tokio::{io::unix::AsyncFd, task::JoinSet};
 use tokio_util::codec::Encoder;
@@ -19,7 +20,7 @@ use tracing::error;
 
 use crate::{
     Result,
-    codec::{self, Codec, Packet, PacketLayout},
+    codec::{self, Codec, Packet},
     config::Config,
     transport::{Endpoint, PacketSender, State, maintain_peers, process_packet},
 };
@@ -38,10 +39,46 @@ fn default_icmp_id() -> u16 {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct IcmpTransportPeerConfig {
-    endpoint: Option<IcmpRoute>,
+    endpoint: Option<Ipv4Addr>,
 }
 
-type IcmpRoute = Ipv4Addr;
+#[derive(Debug, Clone)]
+pub struct IcmpRoute {
+    address: Ipv4Addr,
+    // Shared by queued packets and the route map so responder data uses the latest query.
+    reply: Option<Arc<AtomicU32>>,
+}
+
+impl IcmpRoute {
+    fn request(address: Ipv4Addr) -> Self {
+        Self {
+            address,
+            reply: None,
+        }
+    }
+    fn response(address: Ipv4Addr, id: u16, seq: u16) -> Self {
+        Self {
+            address,
+            reply: Some(Arc::new(AtomicU32::new(
+                (u32::from(id) << 16) | u32::from(seq),
+            ))),
+        }
+    }
+    fn echo_type(&self, initiating: bool, id: u16, sequence: &mut u16) -> etherparse::Icmpv4Type {
+        if !initiating {
+            if let Some(reply) = &self.reply {
+                let value = reply.load(Ordering::Relaxed);
+                return etherparse::Icmpv4Type::EchoReply(etherparse::IcmpEchoHeader {
+                    id: (value >> 16) as u16,
+                    seq: value as u16,
+                });
+            }
+        }
+        let echo = etherparse::IcmpEchoHeader { id, seq: *sequence };
+        *sequence = sequence.wrapping_add(1);
+        etherparse::Icmpv4Type::EchoRequest(echo)
+    }
+}
 const SOCKET_MARK: u32 = 0x434f5654;
 
 pub async fn create_icmp_endpoint(
@@ -53,7 +90,12 @@ pub async fn create_icmp_endpoint(
         config
             .peers
             .iter()
-            .filter_map(|p| p.transport.unwrap_icmp().endpoint.map(|e| (p.peer_id, e)))
+            .filter_map(|p| {
+                p.transport
+                    .unwrap_icmp()
+                    .endpoint
+                    .map(|e| (p.peer_id, IcmpRoute::request(e)))
+            })
             .collect::<DashMap<_, _>>(),
     );
 
@@ -77,7 +119,7 @@ pub async fn create_icmp_endpoint(
     tokio::spawn(async move {
         let _firewall = firewall;
         let mut tasks = JoinSet::new();
-        tasks.spawn(sender_task(recv, sock.clone(), id));
+        tasks.spawn(sender_task(config.clone(), recv, sock.clone(), id));
         tasks.spawn(maintain_peers(
             state.clone(),
             config.clone(),
@@ -97,15 +139,17 @@ pub async fn create_icmp_endpoint(
 }
 
 async fn sender_task(
+    config: Arc<Config>,
     mut recv: mpsc::Receiver<(Packet, IcmpRoute)>,
     sock: Arc<AsyncFd<Socket>>,
     id: u16,
 ) {
-    let mut codec = Codec::new(PacketLayout::default());
+    let mut codec = Codec::new(config.layout);
     let mut sequence = 0_u16;
     let mut buf = BytesMut::new();
     while let Some((packet, dst)) = recv.next().await {
-        let addr = SocketAddrV4::new(dst, 0);
+        let addr = SocketAddrV4::new(dst.address, 0);
+        let echo_type = dst.echo_type(matches!(&packet, Packet::Initiating(_)), id, &mut sequence);
 
         buf.clear();
         buf.resize(8, 0);
@@ -113,12 +157,8 @@ async fn sender_task(
             error!("Failed to encode a packet: {err}");
             continue;
         }
-        let header = etherparse::Icmpv4Header::with_checksum(
-            etherparse::Icmpv4Type::EchoRequest(etherparse::IcmpEchoHeader { id, seq: sequence }),
-            &buf[8..],
-        );
+        let header = etherparse::Icmpv4Header::with_checksum(echo_type, &buf[8..]);
         buf[..8].copy_from_slice(&header.to_bytes());
-        sequence = sequence.wrapping_add(1);
         let addr = addr.into();
         let result = sock
             .async_io(tokio::io::Interest::WRITABLE, |socket| {
@@ -127,8 +167,10 @@ async fn sender_task(
             .await;
         match result {
             Ok(sent) if sent == buf.len() => {}
-            Ok(sent) => error!(%dst, sent, expected = buf.len(), "Incomplete ICMP datagram send"),
-            Err(err) => error!(%dst, "Failed to send ICMP datagram: {err}"),
+            Ok(sent) => {
+                error!(dst = %dst.address, sent, expected = buf.len(), "Incomplete ICMP datagram send")
+            }
+            Err(err) => error!(dst = %dst.address, "Failed to send ICMP datagram: {err}"),
         }
     }
 }
@@ -224,18 +266,59 @@ async fn receiver_task<S: PacketSender<IcmpRoute>>(
             continue;
         };
         let mut payload = BytesMut::from(payload);
-        let Some(Ok(packet)) = codec::parse(&mut payload, &PacketLayout::default()) else {
+        let Some(Ok(packet)) = codec::parse(&mut payload, &config.layout) else {
             continue;
         };
         if !payload.is_empty() {
             continue;
         }
+        let offset = (received[0] as usize & 15) * 4;
+        let is_request = received[offset] == 8;
+        let echo_id = u16::from_be_bytes([received[offset + 4], received[offset + 5]]);
+        let seq = u16::from_be_bytes([received[offset + 6], received[offset + 7]]);
+        let data_index = match &packet {
+            Packet::Initiating(_) if !is_request => continue,
+            Packet::Reply(_) if is_request => continue,
+            Packet::Data(data) => {
+                let Some(handle) = state.established.get(&data.receiver_idx) else {
+                    continue;
+                };
+                let Some(existing) = routing.get(&handle.peer_id) else {
+                    continue;
+                };
+                if existing.address != route || existing.reply.is_some() != is_request {
+                    continue;
+                }
+                Some(data.receiver_idx)
+            }
+            _ => None,
+        };
+        let route = if is_request {
+            IcmpRoute::response(route, echo_id, seq)
+        } else {
+            IcmpRoute::request(route)
+        };
         match process_packet(&state, &config, packet, route, &routing, &mut sender).await {
-            Ok(true) => {}
+            Ok(true) => {
+                // Only authenticated data/keepalives may update the reply metadata.
+                if let Some(index) = data_index {
+                    if let Some(handle) = state.established.get(&index) {
+                        if let Some(route) = routing.get(&handle.peer_id) {
+                            if let Some(reply) = &route.reply {
+                                reply.store(
+                                    (u32::from(echo_id) << 16) | u32::from(seq),
+                                    Ordering::Relaxed,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             Ok(false) => break,
             Err(err) => error!("Failed to process ICMP packet: {err}"),
         }
     }
 }
 
+#[cfg(test)]
 mod tests;

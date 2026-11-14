@@ -1,11 +1,14 @@
-use crate::transport::{
-    icmp::{IcmpListenerConfig, IcmpTransportPeerConfig},
-    udp::{UdpListenerConfig, UdpTransportPeerConfig},
+use crate::{
+    codec::PacketLayout,
+    transport::{
+        icmp::{IcmpListenerConfig, IcmpTransportPeerConfig},
+        udp::{UdpListenerConfig, UdpTransportPeerConfig},
+    },
 };
 use base64::prelude::*;
 use ipnet::IpNet;
-use serde::Deserialize;
-use std::{fmt::Debug, net::IpAddr};
+use serde::{Deserialize, Deserializer};
+use std::{fmt::Debug, net::IpAddr, str::FromStr};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -13,9 +16,16 @@ use uuid::Uuid;
 pub struct Config {
     #[serde(skip, default)]
     pub dev_name: String,
+    #[serde(deserialize_with = "de_packet_layout", default)]
+    pub layout: PacketLayout,
     pub interface: Interface,
     #[serde(rename = "Peer", default)]
     pub peers: Vec<Peer>,
+}
+
+fn de_packet_layout<'de, D: Deserializer<'de>>(de: D) -> Result<PacketLayout, D::Error> {
+    let s = String::deserialize(de)?;
+    PacketLayout::from_str(&s).map_err(|err| serde::de::Error::custom(err))
 }
 
 #[derive(Debug, Clone, Deserialize)]

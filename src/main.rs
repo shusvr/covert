@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use anyhow::{Context, Result, bail};
 use base64::prelude::*;
 use clap::{Parser, Subcommand};

@@ -1,5 +1,5 @@
 use super::*;
-use crate::codec::Packet;
+use crate::codec::{Packet, PacketLayout};
 use crate::transport::{initiate_disconnected_peers, process_packet};
 use crate::{
     config::{Interface, ListenerConfig, Peer, PeerTransport},
@@ -14,6 +14,7 @@ use tokio::{sync::mpsc, time::timeout};
 fn config(local_sk: crate::Key, remote_pk: crate::Key, endpoint: SocketAddr) -> Config {
     Config {
         dev_name: String::new(),
+        layout: PacketLayout::default(),
         interface: Interface {
             addresses: vec![],
             mtu: 1460,

@@ -1,6 +1,6 @@
 use crate::{
     Result,
-    codec::{Codec, PacketLayout},
+    codec::Codec,
     config::Config,
     transport::{Endpoint, State, maintain_peers, process_packet},
 };
@@ -58,7 +58,7 @@ pub async fn create_udp_endpoint(
         routing.clone(),
     ));
 
-    let sender = UdpFramed::new(socket, Codec::new(PacketLayout::default()));
+    let sender = UdpFramed::new(socket, Codec::new(config.layout));
     Ok(Endpoint { routing, sender })
 }
 
@@ -68,7 +68,7 @@ async fn socket_listener_task(
     config: Arc<Config>,
     routing: Arc<DashMap<Uuid, SocketAddr>>,
 ) {
-    let mut framed = UdpFramed::new(socket.clone(), Codec::new(PacketLayout::default()));
+    let mut framed = UdpFramed::new(socket.clone(), Codec::new(config.layout));
 
     // Dropping the receive task also stops its independent maintenance task.
     let mut maintenance = JoinSet::new();
@@ -76,7 +76,7 @@ async fn socket_listener_task(
         state.clone(),
         config.clone(),
         routing.clone(),
-        UdpFramed::new(socket, Codec::new(PacketLayout::default())),
+        UdpFramed::new(socket, Codec::new(config.layout)),
     ));
     loop {
         tokio::select! {
