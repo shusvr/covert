@@ -91,7 +91,12 @@ async fn socket_listener_task(
                             Err(err) => error!("Failed to process incoming packet: {err}"),
                         }
                     }
-                    Some(Err(err)) => error!("Failed to parse the packet on udp socket: {err}"),
+                    Some(Err(err)) => {
+                        // UdpFramed retains a datagram when decode_eof returns an error.
+                        // Discard it so the next poll can receive a new datagram.
+                        framed.read_buffer_mut().clear();
+                        error!("Failed to parse the packet on udp socket: {err}");
+                    }
                     None => break,
                 }
             }

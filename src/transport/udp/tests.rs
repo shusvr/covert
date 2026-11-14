@@ -514,7 +514,7 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
 }
 
 #[tokio::test]
-async fn background_task_sends_encrypted_keepalive_with_jitter() {
+async fn background_task_recovers_from_invalid_datagrams_and_sends_keepalive() {
     let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let local_key = random_sk().unwrap();
     let remote_key = random_sk().unwrap();
@@ -546,6 +546,16 @@ async fn background_task_sends_encrypted_keepalive_with_jitter() {
     .unwrap();
     let (reply, cipher) =
         post_reply(&remote_pk, Some(&[7; 32]), 123, initiation.sender_idx).unwrap();
+    // Both an unknown type and a truncated handshake must be discarded, allowing
+    // the subsequent valid reply to establish a session and timers to keep running.
+    for malformed in [&[253_u8][..], &[0_u8, 1][..]] {
+        remote
+            .sender
+            .get_ref()
+            .send_to(malformed, from)
+            .await
+            .unwrap();
+    }
     remote
         .sender
         .send((Packet::Reply(reply), from))
