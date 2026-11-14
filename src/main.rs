@@ -6,12 +6,13 @@ use clap::{Parser, Subcommand};
 use covert::{
     codec::PacketLayout,
     config::{Config, ListenerConfig, PeerTransport},
-    crypto::{pk_to_bytes, random_sk, sk_to_bytes},
+    crypto::{pk_to_bytes, random_sk, sk_to_bytes, to_sk},
     transport::{Endpoint, PacketSender, State},
 };
 use etherparse::{NetHeaders, PacketHeaders};
 use std::{
     fs,
+    io::{self, Read},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     sync::Arc,
@@ -42,6 +43,11 @@ enum Command {
     },
     /// Generate a base64-encoded X25519 private and public key pair.
     Genkey,
+    /// Derive a base64-encoded public key from a private key or stdin.
+    Pubkey {
+        /// Base64-encoded private key; read stdin when omitted.
+        private_key: Option<String>,
+    },
     /// Generate a random packet layout
     Genlayout,
 }
@@ -76,6 +82,29 @@ async fn main() -> Result<()> {
         Command::Genlayout => {
             let layout = PacketLayout::random().to_string();
             println!("{layout}");
+            Ok(())
+        }
+        Command::Pubkey { private_key } => {
+            let private_key = match private_key {
+                Some(key) => key,
+                None => {
+                    let mut key = String::new();
+                    io::stdin()
+                        .read_to_string(&mut key)
+                        .context("failed to read private key from stdin")?;
+                    key
+                }
+            };
+            let decoded = BASE64_STANDARD
+                .decode(private_key.trim())
+                .context("private key must be valid base64")?;
+            let key: covert::Key = decoded
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("private key must be 32 bytes"))?;
+            let public_key = to_sk(&key)
+                .compute_public_key()
+                .context("failed to derive public key")?;
+            println!("{}", BASE64_STANDARD.encode(pk_to_bytes(&public_key)));
             Ok(())
         }
     }
