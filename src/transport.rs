@@ -2,6 +2,7 @@ use circular_buffer::FixedCircularBuffer;
 use dashmap::DashMap;
 use futures::{Sink, SinkExt};
 use std::{
+    fmt::Debug,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -509,4 +510,94 @@ async fn send_keepalives<R: Clone>(
             }
         }
     }
+}
+
+async fn process_packet<R: Debug + Clone>(
+    state: &Arc<State>,
+    config: &Config,
+    packet: Packet,
+    route: R,
+    routing: &DashMap<Uuid, R>,
+    sender: &mut impl PacketSender<R>,
+) -> Result<bool> {
+    match process_incoming(state, config, packet).await? {
+        Some(ProcessResult::Established {
+            local_idx,
+            replying,
+            handle,
+        }) => {
+            let peer_id = handle.peer_id;
+            routing.insert(peer_id, route.clone());
+            state.established.insert(local_idx, handle);
+            state.peering.insert(peer_id, local_idx);
+
+            // Send the handshake reply before flushing encrypted data.
+            if let Some(replying) = replying {
+                sender
+                    .send((Packet::Reply(replying), route.clone()))
+                    .await?;
+            }
+            debug!(?peer_id, remote_addr = ?route, local_idx, "Connection established");
+            flush_queued(state, peer_id, local_idx, route, sender).await?;
+        }
+        Some(ProcessResult::Packet { plaintext }) => {
+            if state.tun_in_tx.send(plaintext).await.is_err() {
+                debug!("tun_in_rx is closed, exiting socket_listener_task");
+                return Ok(false);
+            }
+        }
+        None => {}
+    }
+    Ok(true)
+}
+
+async fn flush_queued<R: Debug + Clone>(
+    state: &State,
+    peer_id: Uuid,
+    local_idx: u32,
+    route: R,
+    sender: &mut impl PacketSender<R>,
+) -> Result<()> {
+    if !state.queued.contains_key(&peer_id) {
+        return Ok(());
+    }
+    let mut sent = 0;
+    loop {
+        let (cipher, receiver_idx) = state
+            .session(local_idx)
+            .ok_or(crate::Error::ConnectionUnavailable { peer_id, local_idx })?;
+        // Release the queue guard before awaiting socket operations.
+        let packet = state
+            .queued
+            .get_mut(&peer_id)
+            .and_then(|mut queue| queue.pop_front());
+        let Some(plaintext) = packet else { break };
+        let (counter, ciphertext) = match cipher.encrypt(plaintext) {
+            Ok(encrypted) => encrypted,
+            Err(err) => {
+                state.established.remove(&local_idx);
+                return Err(err.into());
+            }
+        };
+
+        let packet = Packet::Data(Data {
+            receiver_idx,
+            counter,
+            ciphertext,
+            flags: DataFlags::empty(),
+        });
+
+        sender.send((packet, route.clone())).await?;
+        sent += 1;
+    }
+    state
+        .queued
+        .remove_if(&peer_id, |_, queue| queue.is_empty());
+    debug!(
+        ?peer_id,
+        remote_addr =? route,
+        sent,
+        "Flushed queued packets"
+    );
+    Ok(())
 }

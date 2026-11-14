@@ -1,15 +1,14 @@
 use crate::{
     Result,
-    codec::{Codec, Data, DataFlags, Packet, PacketLayout},
+    codec::{Codec, PacketLayout},
     config::Config,
-    transport::{
-        ProcessResult, State, initiate_disconnected_peers, process_incoming, send_keepalives,
-    },
+    transport::{State, initiate_disconnected_peers, process_packet, send_keepalives},
 };
 use dashmap::DashMap;
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use serde::Deserialize;
 use std::{
+    fmt::Debug,
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -19,7 +18,7 @@ use tokio::{
     time::{Instant, MissedTickBehavior, interval, sleep},
 };
 use tokio_util::udp::UdpFramed;
-use tracing::{debug, error, trace};
+use tracing::{error, trace};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -103,7 +102,7 @@ async fn socket_listener_task(
                     Some(Ok((packet, addr))) => {
                         trace!(?addr, "Received a packet on udp socket");
 
-                        match handle_udp_packet(&state, &mut framed, &config, &routing, packet, addr).await {
+                        match process_packet(&state, &config, packet, addr, &routing, &mut framed).await {
                             Ok(true) => {},
                             Ok(false) => break,
                             Err(err) => error!("Failed to process incoming packet: {err}"),
@@ -118,90 +117,5 @@ async fn socket_listener_task(
 }
 
 // Return false when TUN delivery is closed and the receive loop should stop.
-async fn handle_udp_packet(
-    state: &Arc<State>,
-    framed: &mut UdpFramed<Codec, Arc<UdpSocket>>,
-    config: &Config,
-    peer_addresses: &DashMap<Uuid, SocketAddr>,
-    packet: Packet,
-    addr: SocketAddr,
-) -> Result<bool> {
-    match process_incoming(state, config, packet).await? {
-        Some(ProcessResult::Established {
-            local_idx,
-            replying,
-            handle,
-        }) => {
-            let peer_id = handle.peer_id;
-            peer_addresses.insert(peer_id, addr);
-            state.established.insert(local_idx, handle);
-            state.peering.insert(peer_id, local_idx);
-
-            // Send the handshake reply before flushing encrypted data.
-            if let Some(replying) = replying {
-                framed.send((Packet::Reply(replying), addr)).await?;
-            }
-            debug!(?peer_id, remote_addr = %addr, local_idx, "Connection established");
-            flush_queued(state, framed, peer_id, local_idx, addr).await?;
-        }
-        Some(ProcessResult::Packet { plaintext }) => {
-            if state.tun_in_tx.send(plaintext).await.is_err() {
-                debug!("tun_in_rx is closed, exiting socket_listener_task");
-                return Ok(false);
-            }
-        }
-        None => {}
-    }
-    Ok(true)
-}
-
-async fn flush_queued(
-    state: &State,
-    framed: &mut UdpFramed<Codec, Arc<UdpSocket>>,
-    peer_id: Uuid,
-    local_idx: u32,
-    addr: SocketAddr,
-) -> Result<()> {
-    if !state.queued.contains_key(&peer_id) {
-        return Ok(());
-    }
-    let mut sent = 0;
-    loop {
-        let (cipher, receiver_idx) = state
-            .session(local_idx)
-            .ok_or(crate::Error::ConnectionUnavailable { peer_id, local_idx })?;
-        // Release the queue guard before awaiting socket operations.
-        let packet = state
-            .queued
-            .get_mut(&peer_id)
-            .and_then(|mut queue| queue.pop_front());
-        let Some(plaintext) = packet else { break };
-        let (counter, ciphertext) = match cipher.encrypt(plaintext) {
-            Ok(encrypted) => encrypted,
-            Err(err) => {
-                state.established.remove(&local_idx);
-                return Err(err.into());
-            }
-        };
-        framed
-            .send((
-                Packet::Data(Data {
-                    receiver_idx,
-                    counter,
-                    ciphertext,
-                    flags: DataFlags::empty(),
-                }),
-                addr,
-            ))
-            .await?;
-        sent += 1;
-    }
-    state
-        .queued
-        .remove_if(&peer_id, |_, queue| queue.is_empty());
-    debug!(?peer_id, remote_addr = %addr, sent, "Flushed queued packets");
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests;
