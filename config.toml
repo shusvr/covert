@@ -84,6 +84,10 @@ Port = 40676
 # Id is optional and defaults to 1339. Use the same ID on both ends.
 # [Interface.Listener.Icmp.icmp]
 # Id = 1339
+# Mode = "EchoReply"  # Default: initiator requests, responder replies.
+# Alternatives: "OnlyEcho" sends requests both ways; "OnlyUnreachable" sends
+# type 3/code 1 both ways with a tunnel-specific ID/sequence payload prefix.
+# Both ends must select the same mode.
 
 # Optional peer list; omit all [[Peer]] sections for an empty list.
 # Repeat this section for additional peers. Every peer's transport must match

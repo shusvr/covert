@@ -25,11 +25,21 @@ use crate::{
     transport::{Endpoint, PacketSender, State, maintain_peers, process_packet},
 };
 
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+pub enum IcmpMode {
+    #[default]
+    EchoReply,
+    OnlyEcho,
+    OnlyUnreachable,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct IcmpListenerConfig {
     #[serde(default = "default_icmp_id")]
     id: u16,
+    #[serde(default)]
+    mode: IcmpMode,
 }
 
 fn default_icmp_id() -> u16 {
@@ -116,10 +126,11 @@ pub async fn create_icmp_endpoint(
     let config = config.clone();
     let task_routing = routing.clone();
     let id = listener.id;
+    let mode = listener.mode;
     tokio::spawn(async move {
         let _firewall = firewall;
         let mut tasks = JoinSet::new();
-        tasks.spawn(sender_task(config.clone(), recv, sock.clone(), id));
+        tasks.spawn(sender_task(config.clone(), recv, sock.clone(), id, mode));
         tasks.spawn(maintain_peers(
             state.clone(),
             config.clone(),
@@ -127,7 +138,7 @@ pub async fn create_icmp_endpoint(
             maintenance_sender,
         ));
         tokio::select! {
-            _ = receiver_task(state, config, task_routing, outgoing, sock, id) => {},
+            _ = receiver_task(state, config, task_routing, outgoing, sock, id, mode) => {},
             _ = tasks.join_next() => {},
         }
     });
@@ -143,16 +154,33 @@ async fn sender_task(
     mut recv: mpsc::Receiver<(Packet, IcmpRoute)>,
     sock: Arc<AsyncFd<Socket>>,
     id: u16,
+    mode: IcmpMode,
 ) {
     let mut codec = Codec::new(config.layout);
     let mut sequence = 0_u16;
     let mut buf = BytesMut::new();
     while let Some((packet, dst)) = recv.next().await {
         let addr = SocketAddrV4::new(dst.address, 0);
-        let echo_type = dst.echo_type(matches!(&packet, Packet::Initiating(_)), id, &mut sequence);
+        let echo_type = match mode {
+            IcmpMode::EchoReply => {
+                dst.echo_type(matches!(&packet, Packet::Initiating(_)), id, &mut sequence)
+            }
+            IcmpMode::OnlyEcho => dst.echo_type(true, id, &mut sequence),
+            IcmpMode::OnlyUnreachable => etherparse::Icmpv4Type::Unknown {
+                type_u8: 3,
+                code_u8: 1,
+                bytes5to8: [0; 4],
+            },
+        };
 
         buf.clear();
         buf.resize(8, 0);
+        if mode == IcmpMode::OnlyUnreachable {
+            // Tunnel framing inside the ICMP payload, not the reserved header word.
+            buf.extend_from_slice(&id.to_be_bytes());
+            buf.extend_from_slice(&sequence.to_be_bytes());
+            sequence = sequence.wrapping_add(1);
+        }
         if let Err(err) = codec.encode(packet, &mut buf) {
             error!("Failed to encode a packet: {err}");
             continue;
@@ -212,7 +240,7 @@ impl Drop for ReplyFilter {
 }
 
 // Raw IPv4 sockets include the IP header, including any IPv4 options.
-fn echo_payload(bytes: &[u8], id: u16) -> Option<(Ipv4Addr, &[u8])> {
+fn echo_payload(bytes: &[u8], id: u16, mode: IcmpMode) -> Option<(Ipv4Addr, &[u8])> {
     if bytes.len() < 20 || bytes[0] >> 4 != 4 || bytes[9] != 1 {
         return None;
     }
@@ -226,13 +254,31 @@ fn echo_payload(bytes: &[u8], id: u16) -> Option<(Ipv4Addr, &[u8])> {
         return None;
     }
     let icmp = &bytes[header_len..total_len];
-    if !matches!(icmp[0], 0 | 8) || icmp[1] != 0 || u16::from_be_bytes([icmp[4], icmp[5]]) != id {
-        return None;
-    }
     let (header, payload) = etherparse::Icmpv4Header::from_slice(icmp).ok()?;
     if header.checksum != header.icmp_type.calc_checksum(payload) {
         return None;
     }
+    let payload = match mode {
+        IcmpMode::EchoReply if matches!(icmp[0], 0 | 8) && icmp[1] == 0 => {
+            if u16::from_be_bytes([icmp[4], icmp[5]]) != id {
+                return None;
+            }
+            payload
+        }
+        IcmpMode::OnlyEcho if icmp[0] == 8 && icmp[1] == 0 => {
+            if u16::from_be_bytes([icmp[4], icmp[5]]) != id {
+                return None;
+            }
+            payload
+        }
+        IcmpMode::OnlyUnreachable if icmp[0] == 3 && icmp[1] == 1 => {
+            if payload.len() < 4 || u16::from_be_bytes([payload[0], payload[1]]) != id {
+                return None;
+            }
+            &payload[4..]
+        }
+        _ => return None,
+    };
     Some((
         Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15]),
         payload,
@@ -246,6 +292,7 @@ async fn receiver_task<S: PacketSender<IcmpRoute>>(
     mut sender: S,
     sock: Arc<AsyncFd<Socket>>,
     id: u16,
+    mode: IcmpMode,
 ) {
     let mut bytes = vec![MaybeUninit::<u8>::uninit(); 65535];
     loop {
@@ -262,7 +309,7 @@ async fn receiver_task<S: PacketSender<IcmpRoute>>(
         };
         // recv initialized exactly the returned number of bytes.
         let received = unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<u8>(), len) };
-        let Some((route, payload)) = echo_payload(received, id) else {
+        let Some((route, payload)) = echo_payload(received, id, mode) else {
             continue;
         };
         let mut payload = BytesMut::from(payload);
@@ -274,11 +321,17 @@ async fn receiver_task<S: PacketSender<IcmpRoute>>(
         }
         let offset = (received[0] as usize & 15) * 4;
         let is_request = received[offset] == 8;
-        let echo_id = u16::from_be_bytes([received[offset + 4], received[offset + 5]]);
-        let seq = u16::from_be_bytes([received[offset + 6], received[offset + 7]]);
+        let metadata = offset
+            + if mode == IcmpMode::OnlyUnreachable {
+                8
+            } else {
+                4
+            };
+        let echo_id = u16::from_be_bytes([received[metadata], received[metadata + 1]]);
+        let seq = u16::from_be_bytes([received[metadata + 2], received[metadata + 3]]);
         let data_index = match &packet {
-            Packet::Initiating(_) if !is_request => continue,
-            Packet::Reply(_) if is_request => continue,
+            Packet::Initiating(_) if mode == IcmpMode::EchoReply && !is_request => continue,
+            Packet::Reply(_) if mode == IcmpMode::EchoReply && is_request => continue,
             Packet::Data(data) => {
                 let Some(handle) = state.established.get(&data.receiver_idx) else {
                     continue;
@@ -286,14 +339,16 @@ async fn receiver_task<S: PacketSender<IcmpRoute>>(
                 let Some(existing) = routing.get(&handle.peer_id) else {
                     continue;
                 };
-                if existing.address != route || existing.reply.is_some() != is_request {
+                if existing.address != route
+                    || (mode == IcmpMode::EchoReply && existing.reply.is_some() != is_request)
+                {
                     continue;
                 }
                 Some(data.receiver_idx)
             }
             _ => None,
         };
-        let route = if is_request {
+        let route = if mode == IcmpMode::EchoReply && is_request {
             IcmpRoute::response(route, echo_id, seq)
         } else {
             IcmpRoute::request(route)
