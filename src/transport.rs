@@ -11,7 +11,7 @@ use std::{
 };
 use tokio::{
     sync::mpsc,
-    time::{Instant as TokioInstant, MissedTickBehavior, interval, sleep},
+    time::{MissedTickBehavior, interval},
 };
 use tracing::{debug, error, warn};
 use uuid::Uuid;
@@ -29,8 +29,9 @@ pub struct PeerHandle {
     timestamp: u64,
     // two different fields because timestamp is used to prevent reply attack and remote clock might be different
     cipher: Arc<Cipher>,
-    // Monotonic milliseconds since `since`, updated by authenticated keepalives.
+    // Monotonic milliseconds since `since`, updated by authenticated traffic.
     last_keepalive_ms: AtomicU64,
+    next_keepalive_ms: AtomicU64,
     since: Instant,
 
     // for statistical purposes
@@ -50,6 +51,7 @@ impl PeerHandle {
             sent: 0.into(),
             received: 0.into(),
             last_keepalive_ms: AtomicU64::new(0),
+            next_keepalive_ms: AtomicU64::new(keepalive_delay().as_millis() as u64),
             since: Instant::now(),
         }
     }
@@ -62,8 +64,12 @@ impl PeerHandle {
     }
 
     fn keep_alive(&self) {
-        self.last_keepalive_ms
-            .store(self.since.elapsed().as_millis() as u64, Ordering::Relaxed);
+        let now = self.since.elapsed().as_millis() as u64;
+        self.last_keepalive_ms.store(now, Ordering::Relaxed);
+        self.next_keepalive_ms.store(
+            now + keepalive_delay().as_millis() as u64,
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -284,9 +290,9 @@ async fn process_incoming(
                     return Ok(None);
                 }
             };
+            handle.keep_alive();
             if plaintext.is_empty() || flags.contains(DataFlags::KEEPALIVE) {
                 debug!(receiver_idx, "Plaintext is empty, keepalive");
-                handle.keep_alive();
                 return Ok(None);
             }
             // Decryption is synchronous; release the map guard before TUN delivery.
@@ -470,7 +476,12 @@ async fn send_keepalives<R: Clone>(
         let Some(index) = state.peering.get(&peer.peer_id).map(|entry| *entry.value()) else {
             continue;
         };
-        let Some((cipher, receiver_idx)) = state.session(index) else {
+        let Some((cipher, receiver_idx)) = state.established.get(&index).and_then(|handle| {
+            (handle.is_live()
+                && handle.since.elapsed().as_millis() as u64
+                    >= handle.next_keepalive_ms.load(Ordering::Relaxed))
+            .then(|| (handle.cipher.clone(), handle.receiver_idx))
+        }) else {
             continue;
         };
         match cipher.encrypt(Vec::new()) {
@@ -483,6 +494,13 @@ async fn send_keepalives<R: Clone>(
                 });
                 match sender.send((packet, addr)).await {
                     Ok(()) => {
+                        if let Some(handle) = state.established.get(&index) {
+                            handle.next_keepalive_ms.fetch_max(
+                                handle.since.elapsed().as_millis() as u64
+                                    + keepalive_delay().as_millis() as u64,
+                                Ordering::Relaxed,
+                            );
+                        }
                         debug!(peer_id = ?peer.peer_id, receiver_idx, counter, "Keepalive sent")
                     }
                     Err(err) => error!(peer_id = ?peer.peer_id, "Failed to send keepalive: {err}"),
@@ -595,14 +613,14 @@ async fn maintain_peers<R: Clone, S: PacketSender<R>>(
 ) {
     let mut retries = interval(Duration::from_secs(5));
     retries.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let keepalive = sleep(keepalive_delay());
-    tokio::pin!(keepalive);
+    // Per-peer deadlines are refreshed on receive; this only checks which are due.
+    let mut keepalive = interval(Duration::from_millis(100));
+    keepalive.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = state.tun_in_tx.closed() => break,
-            _ = &mut keepalive => {
+            _ = keepalive.tick() => {
                 send_keepalives(&state, &config, &routing, &mut sender).await;
-                keepalive.as_mut().reset(TokioInstant::now() + keepalive_delay());
             }
             _ = retries.tick() => {
                 initiate_disconnected_peers(&state, &config, &routing, &mut sender).await;

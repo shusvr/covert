@@ -230,6 +230,54 @@ async fn received_keepalive_refreshes_session_and_invalid_data_removes_it() {
     state.established.get_mut(&1).unwrap().since -= Duration::from_secs(31);
     assert!(state.has_live_connection(peer_id));
 
+    // Authenticated application data also refreshes liveness and suppresses keepalives.
+    let (counter, ciphertext) = sender.encrypt(b"active peer".to_vec()).unwrap();
+    state
+        .established
+        .get(&1)
+        .unwrap()
+        .next_keepalive_ms
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    process_packet(
+        &state,
+        &config,
+        Packet::Data(crate::codec::Data {
+            receiver_idx: 1,
+            counter,
+            ciphertext,
+            flags: crate::codec::DataFlags::empty(),
+        }),
+        from,
+        &addresses,
+        &mut framed,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rx.try_recv().unwrap(), b"active peer");
+    addresses.insert(peer_id, from);
+    crate::transport::send_keepalives(&state, &config, &addresses, &mut framed).await;
+    assert!(
+        timeout(Duration::from_millis(50), framed.next())
+            .await
+            .is_err()
+    );
+    // Once that peer's deadline expires, its keepalives resume.
+    state
+        .established
+        .get(&1)
+        .unwrap()
+        .next_keepalive_ms
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    crate::transport::send_keepalives(&state, &config, &addresses, &mut framed).await;
+    let (packet, _) = timeout(Duration::from_secs(3), framed.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(packet, Packet::Data(data) if data.flags.contains(crate::codec::DataFlags::KEEPALIVE))
+    );
+
     let (counter, mut ciphertext) = sender.encrypt(b"tampered".to_vec()).unwrap();
     ciphertext[0] ^= 1;
     timeout(
