@@ -48,7 +48,7 @@ pub async fn create_udp_endpoint(
         config
             .peers
             .iter()
-            .filter_map(|p| p.transport.unwrap_udp().endpoint.map(|e| (p.peer_id, e)))
+            .filter_map(|p| p.transport.udp()?.endpoint.map(|e| (p.peer_id, e)))
             .collect::<DashMap<_, _>>(),
     );
     tokio::spawn(socket_listener_task(

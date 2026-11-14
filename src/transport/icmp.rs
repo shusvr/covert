@@ -92,7 +92,7 @@ pub async fn create_icmp_endpoint(
             .iter()
             .filter_map(|p| {
                 p.transport
-                    .unwrap_icmp()
+                    .icmp()?
                     .endpoint
                     .map(|e| (p.peer_id, IcmpRoute::request(e)))
             })

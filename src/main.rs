@@ -16,7 +16,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::mpsc;
-use tracing::{Level, debug, error, trace};
+use tracing::{Level, debug, error, info, trace, warn};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -135,16 +135,20 @@ fn read_config(path: &Path) -> anyhow::Result<Arc<Config>> {
     config.dev_name = file_name.strip_suffix(".toml").unwrap().to_owned();
     debug!(?path, "Config: {config:#?}");
 
-    for p in &config.peers {
-        let matches = match (&config.interface.listener, &p.transport) {
-            (ListenerConfig::Udp { .. }, PeerTransport::Udp { .. }) => true,
-            (ListenerConfig::Icmp { .. }, PeerTransport::Icmp { .. }) => true,
-            _ => false,
-        };
+    let listener_tag = config.interface.listener.tag();
 
-        if !matches {
-            bail!("One of the peers' transport doesn't match the interface transport");
+    let mut mismatch = false;
+    for p in &config.peers {
+        let peer_tag = p.transport.tag();
+
+        info!(?p.peer_id, transport=peer_tag, %p.public_key, psk=?&p.pre_shared_key.is_some(), "Peer");
+        if listener_tag != peer_tag {
+            mismatch = true;
         }
+    }
+
+    if mismatch {
+        warn!("One of the peers' transport doesn't match the interface transport");
     }
 
     Ok(config.into())

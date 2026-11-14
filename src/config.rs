@@ -8,7 +8,11 @@ use crate::{
 use base64::prelude::*;
 use ipnet::IpNet;
 use serde::{Deserialize, Deserializer};
-use std::{fmt::Debug, net::IpAddr, str::FromStr};
+use std::{
+    fmt::{Debug, Display},
+    net::IpAddr,
+    str::FromStr,
+};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -52,35 +56,51 @@ pub struct Peer {
     pub transport: PeerTransport,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub enum ListenerConfig {
-    Udp { udp: UdpListenerConfig },
-    Icmp { icmp: IcmpListenerConfig },
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub enum PeerTransport {
-    Udp { udp: UdpTransportPeerConfig },
-    Icmp { icmp: IcmpTransportPeerConfig },
-}
-
-impl PeerTransport {
-    pub fn unwrap_udp(&self) -> &UdpTransportPeerConfig {
-        match self {
-            PeerTransport::Udp { udp } => udp,
-            _ => unreachable!(),
+macro_rules! make_listen_peer_cfgs {
+    ($($var:ident, $lower:ident, $listen:ident, $peer:ident);* $(;)?) => {
+        #[derive(Debug, Clone, Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        pub enum ListenerConfig {
+            $($var { $lower: $listen }),*
         }
-    }
 
-    pub fn unwrap_icmp(&self) -> &IcmpTransportPeerConfig {
-        match self {
-            PeerTransport::Icmp { icmp } => icmp,
-            _ => unreachable!(),
+        impl ListenerConfig {
+            pub fn tag(&self) -> &'static str {
+                match self {$(
+                    Self::$var { .. } => stringify!($lower)
+                ),*}
+            }
         }
-    }
+
+        #[derive(Debug, Clone, Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        pub enum PeerTransport {
+            $($var { $lower: $peer }),*
+        }
+
+        impl PeerTransport {
+            pub fn tag(&self) -> &'static str {
+                match self {$(
+                    Self::$var { .. } => stringify!($lower)
+                ),*}
+            }
+
+            $(
+                pub fn $lower(&self) -> Option<&$peer> {
+                    match self {
+                        Self::$var { $lower } => Some($lower),
+                        _ => None,
+                    }
+                }
+            )*
+        }
+    };
 }
+
+make_listen_peer_cfgs!(
+    Udp, udp, UdpListenerConfig, UdpTransportPeerConfig;
+    Icmp, icmp, IcmpListenerConfig, IcmpTransportPeerConfig;
+);
 
 fn deserialize_addrs<'de, D>(deserializer: D) -> Result<Vec<IpNet>, D::Error>
 where
@@ -158,26 +178,27 @@ impl<'de, const PRIV: bool> Deserialize<'de> for Key<PRIV> {
     }
 }
 
-#[cfg(debug_assertions)]
+impl<const PRIV: bool> Display for Key<PRIV> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if PRIV && cfg!(not(debug_assertions)) {
+            write!(f, "<REDACTED>")
+        } else {
+            let b64 = BASE64_STANDARD.encode(&self.0);
+            write!(f, "{b64}")
+        }
+    }
+}
+
 impl<const PRIV: bool> Debug for Key<PRIV> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let b64 = BASE64_STANDARD.encode(&self.0);
-        f.debug_tuple("Key").field(&b64).finish()
-    }
-}
+        let mut d = f.debug_tuple("Key");
 
-#[cfg(not(debug_assertions))]
-impl Debug for Key<false> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let b64 = BASE64_STANDARD.encode(&self.0);
-        f.debug_tuple("Key").field(&b64).finish()
-    }
-}
-
-#[cfg(not(debug_assertions))]
-impl Debug for Key<true> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Key").field(&"<REDACTED>").finish()
+        if PRIV && cfg!(not(debug_assertions)) {
+            d.field(&"<REDACTED>").finish()
+        } else {
+            let b64 = BASE64_STANDARD.encode(&self.0);
+            d.field(&b64).finish()
+        }
     }
 }
 
