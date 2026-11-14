@@ -48,7 +48,7 @@ pub async fn create_icmp_endpoint(
     state: &Arc<State>,
     config: &Arc<Config>,
     listener: &IcmpListenerConfig,
-) -> Result<Endpoint<impl PacketSender<IcmpRoute>, IcmpRoute>> {
+) -> Result<Endpoint<impl PacketSender<IcmpRoute> + use<>, IcmpRoute>> {
     let routing = Arc::new(
         config
             .peers

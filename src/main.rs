@@ -143,16 +143,30 @@ async fn run(conf_path: PathBuf, chanlen: Option<u16>) -> Result<()> {
         .context("failed to create a tun device")?;
 
     let chanlen = chanlen.unwrap_or(512) as usize;
-    let (tun_in_tx, mut tun_in_rx) = mpsc::channel::<Vec<u8>>(chanlen);
+    let (tun_in_tx, tun_in_rx) = mpsc::channel::<Vec<u8>>(chanlen);
 
     let state = Arc::new(State::new(tun_in_tx));
-    let mut listener = match &config.interface.listener {
+    match &config.interface.listener {
         ListenerConfig::Udp { udp } => {
-            covert::transport::udp::create_udp_endpoint(&state, &config, udp).await?
+            let endpoint =
+                covert::transport::udp::create_udp_endpoint(&state, &config, udp).await?;
+            run_endpoint(tun, state, config, endpoint, tun_in_rx).await
         }
-        ListenerConfig::Icmp { .. } => todo!(),
-    };
+        ListenerConfig::Icmp { icmp } => {
+            let endpoint =
+                covert::transport::icmp::create_icmp_endpoint(&state, &config, icmp).await?;
+            run_endpoint(tun, state, config, endpoint, tun_in_rx).await
+        }
+    }
+}
 
+async fn run_endpoint<S: PacketSender<R>, R: Clone>(
+    tun: tun::AsyncDevice,
+    state: Arc<State>,
+    config: Arc<Config>,
+    mut listener: Endpoint<S, R>,
+    mut tun_in_rx: mpsc::Receiver<Vec<u8>>,
+) -> Result<()> {
     let mut tun_buf = vec![0; config.interface.mtu as usize];
     loop {
         tokio::select! {
