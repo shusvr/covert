@@ -1,0 +1,124 @@
+# Covert configuration reference. Active settings select UDP; ICMP alternatives
+# are commented below. Replace the example keys and addresses before use.
+# Required values have no default. Omitted optional values use the defaults shown.
+# The TUN device name comes from the filename: config.toml creates "config".
+# Peer IDs are generated internally; neither device name nor peer ID is configurable.
+
+# Optional packet layout, shared by every peer using this interface.
+# Omit Layout to use this exact default. Offsets are zero-based byte positions;
+# m is the XOR mask. Fields within each packet type must not overlap.
+# Generate another layout with `covert genlayout`, then use it on both ends.
+# Layout is an ampersand-separated list of key=decimal-integer pairs.
+# Unspecified keys retain their defaults. Every offset is measured from the
+# start of the Covert packet, excluding outer IP, UDP, and ICMP headers.
+#
+# Common fields (present in every packet type):
+#   m       Default 0. Unsigned 32-bit XOR mask, not an offset. Fixed fields
+#           use its four big-endian bytes repeatedly, restarting at each field.
+#           The packet type uses only the mask's lowest byte. Ciphertext payload
+#           bytes are not masked. This changes encoding, not cryptographic keys.
+#   oty     Default 0. Offset of the 1-byte packet type:
+#           0 = handshake initiation, 1 = handshake reply, 2 = encrypted data.
+#
+# Handshake initiation fields:
+#   oieph   Default 1. Offset of the 32-byte ephemeral public key.
+#   oiepk   Default 33. Offset of the 48-byte encrypted static public key,
+#           including its authentication tag.
+#   oiets   Default 85. Offset of the 24-byte encrypted timestamp,
+#           including its authentication tag; used for handshake replay checks.
+#   oisidx  Default 81. Offset of the 4-byte sender's local session index.
+#
+# Handshake reply fields:
+#   oreph   Default 1. Offset of the 32-byte ephemeral public key.
+#   orsidx  Default 33. Offset of the 4-byte responder's local session index.
+#   orridx  Default 37. Offset of the 4-byte initiator's local session index,
+#           copied from the initiation's sender index to identify the attempt.
+#
+# Encrypted data fields (also used for keepalives):
+#   odridx  Default 1. Offset of the 4-byte receiver's local session index.
+#   odctr   Default 5. Offset of the 8-byte encryption counter/nonce value.
+#   odf     Default 13. Offset of the 1-byte flags bitset. Bit 0 (value 1)
+#           marks a keepalive; ordinary data uses zero flags.
+#   oddl    Default 14. Offset of the 4-byte ciphertext length in bytes,
+#           including the authentication tag, excluding headers and padding.
+#   odd     Default 18. Start of the variable-length encrypted payload,
+#           including its authentication tag. Everything from this offset
+#           onward is reserved for payload, so fixed data fields must precede it.
+#
+# Multi-byte integer fields use big-endian byte order before XOR masking.
+# Offsets may overlap between different packet types, but fields in the same
+# packet type must not overlap each other or oty. Unused padding is randomized.
+# Layout = "m=0&oty=0&oieph=1&oiepk=33&oiets=85&oisidx=81&oreph=1&orsidx=33&orridx=37&odridx=1&odctr=5&odf=13&oddl=14&odd=18"
+
+[Interface]
+# Required: one IP/CIDR or an array. Bare IPv4/IPv6 addresses become /32 or /128.
+# Address is an alias for Addresses. Example alternative:
+# Addresses = ["10.111.111.1/24", "fd00:111::1/64"]
+Address = "10.111.111.1/24"
+
+# Optional TUN MTU; default 1450. Use 1400 to leave encapsulation headroom
+# on a typical 1500-byte IPv4 path.
+Mtu = 1450
+
+# Required: base64-encoded 32-byte X25519 private key. This is a placeholder.
+# Generate a key pair with `covert genkey`; derive a public key with `covert pubkey`.
+PrivateKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+# Liveness values are in seconds. These interface defaults apply to every peer
+# unless that peer overrides the corresponding value independently.
+Timeout = 28          # Idle lifetime since the last authenticated received packet.
+MaxAge = 300          # Absolute session lifetime, even while traffic is active.
+Keepalive = 10        # Base keepalive interval; received traffic resets its deadline.
+KeepaliveJitter = 3   # Uniform +/- jitter: defaults give 7..13 seconds.
+# The effective keepalive interval is clamped to at least one second.
+# Timeout = 0 disables idle expiry; MaxAge = 0 disables age-based expiry.
+# These limits are independent, and disabling either does not disable keepalives.
+
+# Required listener choice: select exactly one transport for the whole interface.
+# UDP binds IPv4 0.0.0.0. Port is optional and defaults to 40676.
+[Interface.Listener.Udp.udp]
+Port = 40676
+
+# ICMP alternative: replace the UDP listener table above with these two lines.
+# Requires raw-socket/firewall privileges and nft; listens for IPv4 ICMP.
+# Id is optional and defaults to 1339. Use the same ID on both ends.
+# [Interface.Listener.Icmp.icmp]
+# Id = 1339
+
+# Optional peer list; omit all [[Peer]] sections for an empty list.
+# Repeat this section for additional peers. Every peer's transport must match
+# the interface listener, and its tunnel address must be distinct from ours.
+[[Peer]]
+# Required: the remote peer's base64-encoded 32-byte public key, not ours.
+# Placeholder only; replace it with the other peer's public key.
+PublicKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+# Optional additional 32-byte base64 shared secret; omitted means no PSK.
+# Set the same secret at both ends. The commented value is a placeholder.
+# PreSharedKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+# Required: destination prefixes routed to this peer; accepts one entry or an array.
+# Bare IPs use host prefixes. An empty array routes no TUN traffic to the peer.
+# IPv4/IPv6 default routes cannot be mixed with more-specific routes of the same
+# family in this list (the same restriction applies to Interface addresses).
+AllowedIPs = ["10.111.111.2/32"]
+
+# Optional per-peer overrides. Omitted values inherit Interface settings,
+# then built-in defaults: Timeout=28, MaxAge=300, Keepalive=10, jitter=3.
+# Timeout = 28
+# MaxAge = 300
+# Keepalive = 10
+# KeepaliveJitter = 3
+
+# Required peer transport table. Endpoint is optional, with no default address.
+# Omit Endpoint to learn the route when an authenticated peer initiates.
+# Known endpoints are retried automatically when disconnected.
+# UDP Endpoint is a numeric IP:port (not a hostname).
+[Peer.Transport.Udp.udp]
+Endpoint = "192.0.2.2:40676"
+
+# ICMP alternative: replace the UDP peer table above with these lines when
+# selecting the ICMP listener. Endpoint accepts a numeric IPv4 address only.
+# The initiator sends Echo Requests; the responder sends Echo Replies.
+# [Peer.Transport.Icmp.icmp]
+# Endpoint = "192.0.2.2"

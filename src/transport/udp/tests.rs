@@ -4,7 +4,7 @@ use crate::transport::{initiate_disconnected_peers, process_packet};
 use crate::{
     config::{Interface, ListenerConfig, Peer, PeerTransport},
     crypto::{finish, pk_to_bytes, post_reply, pre_reply, random_sk, sk_to_bytes},
-    transport::{establish, transmit},
+    transport::{PeerHandle, transmit},
 };
 use futures::SinkExt;
 use std::time::{Duration, Instant};
@@ -16,6 +16,7 @@ fn config(local_sk: crate::Key, remote_pk: crate::Key, endpoint: SocketAddr) -> 
         dev_name: String::new(),
         layout: PacketLayout::default(),
         interface: Interface {
+            liveness: Default::default(),
             addresses: vec![],
             mtu: 1460,
             private_key: local_sk.into(),
@@ -24,6 +25,7 @@ fn config(local_sk: crate::Key, remote_pk: crate::Key, endpoint: SocketAddr) -> 
             },
         },
         peers: vec![Peer {
+            liveness: Default::default(),
             peer_id: Uuid::new_v4(),
             public_key: remote_pk.into(),
             pre_shared_key: Some([7; 32].into()),
@@ -43,6 +45,10 @@ async fn receive(listener: &mut UdpListener) -> (Packet, SocketAddr) {
         .unwrap()
         .unwrap()
         .unwrap()
+}
+
+fn default_liveness() -> crate::config::Liveness {
+    crate::config::LivenessOptions::default().unpack_with_fallback(&Default::default())
 }
 
 fn session_ciphers() -> (crate::crypto::Cipher, crate::crypto::Cipher) {
@@ -115,21 +121,62 @@ async fn generic_send_only_sink_registers_handshake_and_rolls_back_on_failure() 
 #[test]
 fn keepalive_refreshes_idle_timeout_but_not_session_lifetime() {
     let (cipher, _) = session_ciphers();
-    let mut session = establish(cipher, 0, Uuid::new_v4(), 0);
+    let liveness = default_liveness();
+    let mut session = PeerHandle::new(Uuid::new_v4(), 0, cipher, 0, liveness);
     assert!(session.is_live());
 
-    session.since = std::time::Instant::now() - Duration::from_secs(30);
+    session.since = std::time::Instant::now() - Duration::from_secs(liveness.timeout / 2);
     session.keep_alive();
-    session.since -= Duration::from_secs(31);
+    // Beyond the original idle deadline, but still within the refreshed deadline.
+    session.since -= Duration::from_secs(liveness.timeout / 2 + 1);
     assert!(session.is_live());
-    session.since -= Duration::from_secs(30);
+    session.since -= Duration::from_secs(liveness.timeout / 2);
     assert!(!session.is_live());
 
-    session.since = std::time::Instant::now() - Duration::from_secs(270);
+    session.since = std::time::Instant::now() - Duration::from_secs(liveness.max_age - 1);
     session.keep_alive();
     assert!(session.is_live());
-    session.since -= Duration::from_secs(31);
+    session.since -= Duration::from_secs(2);
+    // Only two seconds idle: expiration must come from max_age, not timeout.
     assert!(!session.is_live());
+}
+
+#[test]
+fn zero_expiry_limits_are_independent_and_keepalives_remain_enabled() {
+    for (timeout, max_age, age, expected) in [
+        (0, 0, 3600, true),
+        (0, 300, 100, true),
+        (0, 300, 301, false),
+        (28, 0, 15, true),
+        (28, 0, 29, false),
+    ] {
+        let (cipher, _) = session_ciphers();
+        let liveness = crate::config::Liveness {
+            timeout,
+            max_age,
+            ..default_liveness()
+        };
+        let mut session = PeerHandle::new(Uuid::new_v4(), 0, cipher, 0, liveness);
+        session.since = std::time::Instant::now() - Duration::from_secs(age);
+        assert_eq!(
+            session.is_live(),
+            expected,
+            "timeout={timeout}, max_age={max_age}, age={age}"
+        );
+        assert!(
+            session
+                .next_keepalive_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+        );
+        if timeout > 0 && max_age == 0 {
+            // Refreshing activity still revives idle state without an age limit.
+            session.keep_alive();
+            session.since -= Duration::from_secs(3600);
+            session.keep_alive();
+            assert!(session.is_live());
+        }
+    }
 }
 
 #[tokio::test]
@@ -147,8 +194,8 @@ async fn expired_session_queues_traffic_and_reinitiates() {
     let (tx, _rx) = mpsc::channel(4);
     let state = State::new(tx);
     let (cipher, _) = session_ciphers();
-    let mut session = establish(cipher, 0, peer_id, 2);
-    session.since = std::time::Instant::now() - Duration::from_secs(61);
+    let mut session = PeerHandle::new(peer_id, 2, cipher, 0, default_liveness());
+    session.since = std::time::Instant::now() - Duration::from_secs(default_liveness().timeout + 1);
     state.established.insert(1, session);
     state.peering.insert(peer_id, 1);
     let mut listener = UdpListener {
@@ -204,8 +251,8 @@ async fn received_keepalive_refreshes_session_and_invalid_data_removes_it() {
     let (tx, mut rx) = mpsc::channel(4);
     let state = Arc::new(State::new(tx));
     let (sender, receiver) = session_ciphers();
-    let mut session = establish(receiver, 0, peer_id, 2);
-    session.since = std::time::Instant::now() - Duration::from_secs(30);
+    let mut session = PeerHandle::new(peer_id, 2, receiver, 0, default_liveness());
+    session.since = std::time::Instant::now() - Duration::from_secs(default_liveness().timeout / 2);
     state.established.insert(1, session);
     state.peering.insert(peer_id, 1);
     let mut framed = UdpFramed::new(socket, Codec::new(PacketLayout::default()));
@@ -227,7 +274,8 @@ async fn received_keepalive_refreshes_session_and_invalid_data_removes_it() {
     .await
     .unwrap();
     assert!(rx.try_recv().is_err());
-    state.established.get_mut(&1).unwrap().since -= Duration::from_secs(31);
+    state.established.get_mut(&1).unwrap().since -=
+        Duration::from_secs(default_liveness().timeout / 2 + 1);
     assert!(state.has_live_connection(peer_id));
 
     // Authenticated application data also refreshes liveness and suppresses keepalives.
@@ -609,7 +657,7 @@ async fn background_task_recovers_from_invalid_datagrams_and_sends_keepalive() {
         .send((Packet::Reply(reply), from))
         .await
         .unwrap();
-    let (packet, _) = timeout(Duration::from_secs(13), remote.sender.next())
+    let (packet, _) = timeout(Duration::from_secs(14), remote.sender.next())
         .await
         .unwrap()
         .unwrap()
@@ -623,7 +671,8 @@ async fn background_task_recovers_from_invalid_datagrams_and_sends_keepalive() {
     else {
         panic!("expected keepalive")
     };
-    assert!(started.elapsed() >= Duration::from_secs(8));
+    // Default Keepalive=10 and KeepaliveJitter=3 permit 7..13 seconds.
+    assert!(started.elapsed() >= Duration::from_secs(7));
     assert_eq!(receiver_idx, 123);
     assert_eq!(counter, 1);
     assert_eq!(ciphertext.len(), 16);

@@ -32,6 +32,53 @@ fn de_packet_layout<'de, D: Deserializer<'de>>(de: D) -> Result<PacketLayout, D:
     PacketLayout::from_str(&s).map_err(|err| serde::de::Error::custom(err))
 }
 
+const DEFAULT_TIMEOUT: u32 = 28;
+const DEFAULT_MAX_AGE: u32 = 300;
+const DEFAULT_KEEPALIVE_DELAY: u32 = 10;
+const DEFAULT_KEEPALIVE_JITTER: u32 = 3;
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct LivenessOptions {
+    #[serde(default)]
+    pub timeout: Option<u32>,
+    pub keepalive: Option<u32>,
+    pub keepalive_jitter: Option<u32>,
+    pub max_age: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Liveness {
+    pub timeout: u64,
+    pub max_age: u64,
+    pub ka_delay: u32,
+    pub ka_jitter: u32,
+}
+
+impl Liveness {
+    pub fn next_ka(&self) -> u64 {
+        ((self.ka_delay as f64 + (self.ka_jitter as f64 * (fastrand::f64() * 2.0 - 1.0))) * 1000.0)
+            .max(1000.0) as u64
+    }
+}
+
+impl LivenessOptions {
+    pub fn unpack_with_fallback(&self, fallback: &LivenessOptions) -> Liveness {
+        Liveness {
+            timeout: self.timeout.or(fallback.timeout).unwrap_or(DEFAULT_TIMEOUT) as u64,
+            max_age: self.max_age.or(fallback.max_age).unwrap_or(DEFAULT_MAX_AGE) as u64,
+            ka_delay: self
+                .keepalive
+                .or(fallback.keepalive)
+                .unwrap_or(DEFAULT_KEEPALIVE_DELAY),
+            ka_jitter: self
+                .keepalive_jitter
+                .or(fallback.keepalive_jitter)
+                .unwrap_or(DEFAULT_KEEPALIVE_JITTER),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Interface {
@@ -41,6 +88,8 @@ pub struct Interface {
     pub mtu: u16,
     pub private_key: PrivKey,
 
+    #[serde(flatten)]
+    pub liveness: LivenessOptions,
     pub listener: ListenerConfig,
 }
 
@@ -54,6 +103,8 @@ pub struct Peer {
     #[serde(rename = "AllowedIPs", deserialize_with = "deserialize_addrs")]
     pub allowed_ips: Vec<IpNet>,
     pub transport: PeerTransport,
+    #[serde(flatten)]
+    pub liveness: LivenessOptions,
 }
 
 macro_rules! make_listen_peer_cfgs {

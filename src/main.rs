@@ -3,7 +3,7 @@ use base64::prelude::*;
 use clap::{Parser, Subcommand};
 use covert::{
     codec::PacketLayout,
-    config::{Config, ListenerConfig, PeerTransport},
+    config::{Config, ListenerConfig},
     crypto::{pk_to_bytes, random_sk, sk_to_bytes, to_sk},
     transport::{Endpoint, PacketSender, State},
 };
@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 use tracing::{Level, debug, error, info, trace, warn};
 
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version = env!("COVERT_VERSION"), about)]
 struct Cli {
     /// Increase logging verbosity (-v for debug, -vv for trace).
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]

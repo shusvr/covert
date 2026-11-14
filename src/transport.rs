@@ -13,13 +13,13 @@ use tokio::{
     sync::mpsc,
     time::{MissedTickBehavior, interval},
 };
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 use uuid::Uuid;
 
 use crate::{
     Key, Result,
     codec::{self, Data, DataFlags, Packet},
-    config::{Config, PubKey},
+    config::{Config, Liveness, PubKey},
     crypto::{self, Cipher, Initiating, Replying, finish, post_reply, pre_reply},
 };
 
@@ -32,6 +32,7 @@ pub struct PeerHandle {
     // Monotonic milliseconds since `since`, updated by authenticated traffic.
     last_keepalive_ms: AtomicU64,
     next_keepalive_ms: AtomicU64,
+    liveness: Liveness,
     since: Instant,
 
     // for statistical purposes
@@ -42,34 +43,41 @@ pub struct PeerHandle {
 }
 
 impl PeerHandle {
-    pub fn new(peer_id: Uuid, receiver_idx: u32, cipher: Arc<Cipher>, timestamp: u64) -> Self {
+    pub fn new(
+        peer_id: Uuid,
+        receiver_idx: u32,
+        cipher: Cipher,
+        timestamp: u64,
+        liveness: Liveness,
+    ) -> Self {
         Self {
             peer_id,
             receiver_idx,
             timestamp,
-            cipher,
+            cipher: cipher.into(),
+            last_keepalive_ms: AtomicU64::new(0),
+            next_keepalive_ms: AtomicU64::new(liveness.next_ka()),
+            liveness,
+            since: Instant::now(),
             sent: 0.into(),
             received: 0.into(),
-            last_keepalive_ms: AtomicU64::new(0),
-            next_keepalive_ms: AtomicU64::new(keepalive_delay().as_millis() as u64),
-            since: Instant::now(),
         }
     }
 
     fn is_live(&self) -> bool {
         let elapsed = self.since.elapsed();
         let last_keepalive = Duration::from_millis(self.last_keepalive_ms.load(Ordering::Relaxed));
-        elapsed < Duration::from_secs(300)
-            && elapsed.saturating_sub(last_keepalive) < Duration::from_secs(60)
+        (self.liveness.max_age == 0 || elapsed < Duration::from_secs(self.liveness.max_age))
+            && (self.liveness.timeout == 0
+                || elapsed.saturating_sub(last_keepalive)
+                    < Duration::from_secs(self.liveness.timeout))
     }
 
     fn keep_alive(&self) {
         let now = self.since.elapsed().as_millis() as u64;
         self.last_keepalive_ms.store(now, Ordering::Relaxed);
-        self.next_keepalive_ms.store(
-            now + keepalive_delay().as_millis() as u64,
-            Ordering::Relaxed,
-        );
+        self.next_keepalive_ms
+            .store(now + self.liveness.next_ka(), Ordering::Relaxed);
     }
 }
 
@@ -135,7 +143,7 @@ pub struct Endpoint<S, R> {
 }
 
 impl<S: PacketSender<R>, R: Clone> Endpoint<S, R> {
-    #[tracing::instrument(skip(self, state, config, packet))]
+    #[tracing::instrument(level = "trace", skip(self, state, config, packet))]
     pub async fn trasmit(
         &mut self,
         state: &State,
@@ -155,10 +163,6 @@ impl<S: PacketSender<R>, R: Clone> Endpoint<S, R> {
 
         Ok(())
     }
-}
-
-fn establish(cipher: Cipher, timestamp: u64, peer_id: Uuid, receiver_idx: u32) -> PeerHandle {
-    PeerHandle::new(peer_id, receiver_idx, Arc::new(cipher), timestamp)
 }
 
 enum ProcessResult {
@@ -219,7 +223,16 @@ async fn process_incoming(
                 initiating.sender_idx,
             )?;
 
-            let handle = establish(cipher, timestamp, peer.peer_id, initiating.sender_idx);
+            let liveness = peer
+                .liveness
+                .unpack_with_fallback(&config.interface.liveness);
+            let handle = PeerHandle::new(
+                peer.peer_id,
+                initiating.sender_idx,
+                cipher,
+                timestamp,
+                liveness,
+            );
             ProcessResult::Established {
                 local_idx: sender_idx,
                 replying: Some(replying),
@@ -258,7 +271,21 @@ async fn process_incoming(
                 .duration_since(SystemTime::UNIX_EPOCH)?
                 .as_secs();
 
-            let handle = establish(cipher, timestamp, initiated.peer_id, replying.sender_idx);
+            let peer = config
+                .peers
+                .iter()
+                .find(|p| p.peer_id == initiated.peer_id)
+                .unwrap();
+            let liveness = peer
+                .liveness
+                .unpack_with_fallback(&config.interface.liveness);
+            let handle = PeerHandle::new(
+                initiated.peer_id,
+                replying.sender_idx,
+                cipher,
+                timestamp,
+                liveness,
+            );
             ProcessResult::Established {
                 local_idx: replying.receiver_idx,
                 replying: None,
@@ -272,7 +299,7 @@ async fn process_incoming(
             flags,
         }) => {
             let Some(handle) = state.established.get(&receiver_idx) else {
-                debug!(receiver_idx, "Received data for an unknown session");
+                trace!(receiver_idx, "Received data for an unknown session");
                 return Ok(None);
             };
             if !handle.is_live() {
@@ -292,12 +319,12 @@ async fn process_incoming(
             };
             handle.keep_alive();
             if plaintext.is_empty() || flags.contains(DataFlags::KEEPALIVE) {
-                debug!(receiver_idx, "Plaintext is empty, keepalive");
+                trace!(receiver_idx, "Plaintext is empty, keepalive");
                 return Ok(None);
             }
             // Decryption is synchronous; release the map guard before TUN delivery.
             drop(handle);
-            debug!(
+            trace!(
                 receiver_idx,
                 plaintext_len = plaintext.len(),
                 "Decrypted ciphertext"
@@ -321,10 +348,10 @@ pub async fn initiate<R: Clone>(
     sender: &mut impl PacketSender<R>,
     peer_id: Uuid,
 ) -> Result<()> {
-    debug!(?peer_id, "Handshake initiation requested");
+    trace!(?peer_id, "Handshake initiation requested");
 
     let Some(addr) = routing.get(&peer_id).map(|e| e.value().clone()) else {
-        debug!(
+        trace!(
             ?peer_id,
             "Peer has no address associated, skipping initiation"
         );
@@ -332,7 +359,7 @@ pub async fn initiate<R: Clone>(
     };
 
     if state.has_live_connection(peer_id) {
-        debug!(
+        trace!(
             ?peer_id,
             "Peer already has a live connection, skipping initiation"
         );
@@ -392,10 +419,10 @@ pub async fn transmit<R: Clone>(
     peer_id: Uuid,
     packet: &[u8],
 ) -> Result<()> {
-    debug!(?peer_id, len = packet.len(), "Transmitting");
+    trace!(?peer_id, len = packet.len(), "Transmitting");
 
     let Some(addr) = routing.get(&peer_id).map(|x| x.value().clone()) else {
-        debug!(?peer_id, "Peer has not been reached yet, skipping transmit");
+        trace!(?peer_id, "Peer has not been reached yet, skipping transmit");
         state
             .queued
             .entry(peer_id)
@@ -416,7 +443,7 @@ pub async fn transmit<R: Clone>(
                 return Err(err.into());
             }
         };
-        debug!(?peer_id, "Sending data");
+        trace!(?peer_id, "Sending data");
         let packet = Packet::Data(Data {
             receiver_idx,
             flags: DataFlags::empty(),
@@ -497,11 +524,11 @@ async fn send_keepalives<R: Clone>(
                         if let Some(handle) = state.established.get(&index) {
                             handle.next_keepalive_ms.fetch_max(
                                 handle.since.elapsed().as_millis() as u64
-                                    + keepalive_delay().as_millis() as u64,
+                                    + handle.liveness.next_ka(),
                                 Ordering::Relaxed,
                             );
                         }
-                        debug!(peer_id = ?peer.peer_id, receiver_idx, counter, "Keepalive sent")
+                        trace!(peer_id = ?peer.peer_id, receiver_idx, counter, "Keepalive sent")
                     }
                     Err(err) => error!(peer_id = ?peer.peer_id, "Failed to send keepalive: {err}"),
                 }
@@ -627,8 +654,4 @@ async fn maintain_peers<R: Clone, S: PacketSender<R>>(
             }
         }
     }
-}
-
-fn keepalive_delay() -> Duration {
-    Duration::from_secs_f64(8.0 + 4.0 * fastrand::f64())
 }

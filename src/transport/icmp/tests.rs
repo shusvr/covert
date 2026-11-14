@@ -15,6 +15,7 @@ async fn raw_receive_processes_data_suppresses_kernel_reply_and_cleans_up() {
         dev_name: String::new(),
         layout: PacketLayout::default(),
         interface: Interface {
+            liveness: Default::default(),
             addresses: vec![],
             mtu: 1400,
             private_key: [7; 32].into(),
@@ -38,7 +39,16 @@ async fn raw_receive_processes_data_suppresses_kernel_reply_and_cleans_up() {
     let remote = key(true);
     state.established.insert(
         42,
-        crate::transport::establish(key(false), 0, uuid::Uuid::new_v4(), 7),
+        crate::transport::PeerHandle::new(
+            uuid::Uuid::new_v4(),
+            7,
+            key(false),
+            0,
+            config
+                .interface
+                .liveness
+                .unpack_with_fallback(&Default::default()),
+        ),
     );
     let endpoint = create_icmp_endpoint(&state, &config, &listener)
         .await
@@ -202,6 +212,7 @@ async fn request_reply_handshake_and_bidirectional_data() {
             dev_name: String::new(),
             layout: PacketLayout::default(),
             interface: Interface {
+                liveness: Default::default(),
                 addresses: vec![],
                 mtu: 1400,
                 private_key: sk,
@@ -210,6 +221,7 @@ async fn request_reply_handshake_and_bidirectional_data() {
                 },
             },
             peers: vec![Peer {
+                liveness: Default::default(),
                 peer_id: uuid::Uuid::new_v4(),
                 public_key: pk,
                 pre_shared_key: None,
