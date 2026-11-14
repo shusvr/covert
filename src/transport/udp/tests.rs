@@ -1,9 +1,11 @@
 use super::*;
+use crate::codec::Packet;
 use crate::{
     config::{Interface, ListenerConfig, Peer, PeerTransport},
     crypto::{finish, pk_to_bytes, post_reply, pre_reply, random_sk, sk_to_bytes},
     transport::{establish, transmit},
 };
+use futures::SinkExt;
 use tokio::{sync::mpsc, time::timeout};
 
 fn config(local_sk: crate::Key, remote_pk: crate::Key, endpoint: SocketAddr) -> Config {
@@ -207,9 +209,7 @@ async fn received_keepalive_refreshes_session_and_invalid_data_removes_it() {
     let (counter, ciphertext) = sender.encrypt(vec![]).unwrap();
     process_packet(
         &state,
-        &mut framed,
         &config,
-        &addresses,
         Packet::Data(crate::codec::Data {
             receiver_idx: 1,
             counter,
@@ -217,6 +217,8 @@ async fn received_keepalive_refreshes_session_and_invalid_data_removes_it() {
             flags: crate::codec::DataFlags::empty(),
         }),
         from,
+        &addresses,
+        &mut framed,
     )
     .await
     .unwrap();
@@ -230,9 +232,7 @@ async fn received_keepalive_refreshes_session_and_invalid_data_removes_it() {
         Duration::from_secs(3),
         process_packet(
             &state,
-            &mut framed,
             &config,
-            &addresses,
             Packet::Data(crate::codec::Data {
                 receiver_idx: 1,
                 counter,
@@ -240,6 +240,8 @@ async fn received_keepalive_refreshes_session_and_invalid_data_removes_it() {
                 flags: crate::codec::DataFlags::empty(),
             }),
             from,
+            &addresses,
+            &mut framed,
         ),
     )
     .await
@@ -397,11 +399,11 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     assert!(state_a.initiated.contains_key(&local_a));
     process_packet(
         &state_b,
-        &mut b.framed,
         &config_b,
-        &b.peer_addresses,
         packet,
         from,
+        &b.peer_addresses,
+        &mut b.framed,
     )
     .await
     .unwrap();
@@ -413,11 +415,11 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     assert_eq!(reply.receiver_idx, local_a);
     process_packet(
         &state_a,
-        &mut a.framed,
         &config_a,
-        &a.peer_addresses,
         packet,
         from,
+        &a.peer_addresses,
+        &mut a.framed,
     )
     .await
     .unwrap();
@@ -440,11 +442,11 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
         let (packet, from) = receive(&mut b).await;
         process_packet(
             &state_b,
-            &mut b.framed,
             &config_b,
-            &b.peer_addresses,
             packet,
             from,
+            &b.peer_addresses,
+            &mut b.framed,
         )
         .await
         .unwrap();
@@ -452,11 +454,11 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
         let (packet, from) = receive(&mut a).await;
         process_packet(
             &state_a,
-            &mut a.framed,
             &config_a,
-            &a.peer_addresses,
             packet,
             from,
+            &a.peer_addresses,
+            &mut a.framed,
         )
         .await
         .unwrap();
@@ -479,11 +481,11 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     );
     process_packet(
         &state_b,
-        &mut b.framed,
         &config_b,
-        &b.peer_addresses,
         packet,
         from,
+        &b.peer_addresses,
+        &mut b.framed,
     )
     .await
     .unwrap();
@@ -512,11 +514,11 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
     );
     process_packet(
         &state_a,
-        &mut a.framed,
         &config_a,
-        &a.peer_addresses,
         packet,
         from,
+        &a.peer_addresses,
+        &mut a.framed,
     )
     .await
     .unwrap();
