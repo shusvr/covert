@@ -2,6 +2,7 @@ use crate::crypto::{Initiating, Replying};
 
 use bitflags::bitflags;
 use bytes::{Buf, BytesMut};
+use futures::channel::mpsc;
 use std::{io, str::FromStr};
 use thiserror::Error;
 use tokio_util::codec::{Decoder, Encoder};
@@ -274,6 +275,8 @@ pub enum Error {
     UnkownLayoutParam(String),
     #[error("Layout params `{0}` and `{1}` will cause overlap")]
     LayoutFieldsOverlap(String, String),
+    #[error("Channel was closed or full")]
+    ChannelError(#[from] mpsc::SendError),
     #[error("Io: {0}")]
     Io(#[from] io::Error),
 }

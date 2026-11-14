@@ -63,6 +63,13 @@ impl PeerTransport {
             _ => unreachable!(),
         }
     }
+
+    pub fn unwrap_icmp(&self) -> &IcmpTransportPeerConfig {
+        match self {
+            PeerTransport::Icmp { icmp } => icmp,
+            _ => unreachable!(),
+        }
+    }
 }
 
 fn deserialize_addrs<'de, D>(deserializer: D) -> Result<Vec<IpNet>, D::Error>
