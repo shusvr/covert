@@ -16,9 +16,8 @@ use uuid::Uuid;
 use crate::{
     Key, Result,
     codec::{self, Data, DataFlags, Packet},
-    config::{Config, ListenerConfig, PubKey},
+    config::{Config, PubKey},
     crypto::{self, Cipher, Initiating, Replying, finish, post_reply, pre_reply},
-    transport::udp::UdpListener,
 };
 
 pub struct PeerHandle {
@@ -121,13 +120,12 @@ impl State {
 pub mod icmp;
 pub mod udp;
 
-pub enum Listener {
-    Udp(UdpListener),
+pub struct Endpoint<S, R> {
+    pub sender: S,
+    pub routing: Arc<DashMap<Uuid, R>>,
 }
 
-impl Listener {
-    // pub fn initiate(&self, state: &State, config: &Arc<Config>, peer_id: Uuid) {}
-
+impl<S: PacketSender<R>, R: Clone> Endpoint<S, R> {
     #[tracing::instrument(skip(self, state, config, packet))]
     pub async fn trasmit(
         &mut self,
@@ -136,34 +134,18 @@ impl Listener {
         peer_id: Uuid,
         packet: &[u8],
     ) -> Result<()> {
-        match self {
-            Listener::Udp(udp) => {
-                transmit(
-                    state,
-                    config,
-                    &udp.peer_addresses,
-                    &mut udp.framed,
-                    peer_id,
-                    packet,
-                )
-                .await?;
-            }
-        }
+        transmit(
+            state,
+            config,
+            &self.routing,
+            &mut self.sender,
+            peer_id,
+            packet,
+        )
+        .await?;
 
         Ok(())
     }
-}
-
-pub async fn create_listener(state: &Arc<State>, config: &Arc<Config>) -> Result<Listener> {
-    let listener = match &config.interface.listener {
-        ListenerConfig::Udp { udp } => {
-            let udp = udp::create_udp_listener(state, config, udp).await?;
-            Listener::Udp(udp)
-        }
-        ListenerConfig::Icmp { .. } => todo!(),
-    };
-
-    Ok(listener)
 }
 
 fn establish(cipher: Cipher, timestamp: u64, peer_id: Uuid, receiver_idx: u32) -> PeerHandle {

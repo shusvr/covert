@@ -272,7 +272,7 @@ async fn background_task_retries_peers_with_known_endpoints() {
     let (tx, _rx) = mpsc::channel(4);
     let state = Arc::new(State::new(tx));
     let config = Arc::new(config);
-    let _listener = create_udp_listener(&state, &config, &UdpListenerConfig { port: 0 })
+    let _listener = create_udp_endpoint(&state, &config, &UdpListenerConfig { port: 0 })
         .await
         .unwrap();
     let mut receiver = UdpListener {
@@ -564,7 +564,7 @@ async fn background_task_sends_encrypted_keepalive_with_jitter() {
     let (tx, mut rx) = mpsc::channel(4);
     let state = Arc::new(State::new(tx));
     let started = Instant::now();
-    let _listener = create_udp_listener(&state, &config, &UdpListenerConfig { port: 0 })
+    let _listener = create_udp_endpoint(&state, &config, &UdpListenerConfig { port: 0 })
         .await
         .unwrap();
     let mut remote = UdpListener {

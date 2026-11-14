@@ -2,7 +2,7 @@ use crate::{
     Result,
     codec::{Codec, PacketLayout},
     config::Config,
-    transport::{State, initiate_disconnected_peers, process_packet, send_keepalives},
+    transport::{Endpoint, State, initiate_disconnected_peers, process_packet, send_keepalives},
 };
 use dashmap::DashMap;
 use futures::StreamExt;
@@ -38,20 +38,18 @@ pub struct UdpTransportPeerConfig {
     endpoint: Option<SocketAddr>,
 }
 
-pub struct UdpListener {
-    pub(super) framed: UdpFramed<Codec, Arc<UdpSocket>>,
-    pub(super) peer_addresses: Arc<DashMap<Uuid, SocketAddr>>,
-}
+type UdpPacketSender = UdpFramed<Codec, Arc<UdpSocket>>;
+type UdpRoute = SocketAddr;
 
-pub(super) async fn create_udp_listener(
+pub async fn create_udp_endpoint(
     state: &Arc<State>,
     config: &Arc<Config>,
     listener: &UdpListenerConfig,
-) -> Result<UdpListener> {
+) -> Result<Endpoint<UdpPacketSender, UdpRoute>> {
     let addr = (Ipv4Addr::UNSPECIFIED, listener.port);
     let socket = Arc::new(UdpSocket::bind(addr).await?);
 
-    let peer_addresses = Arc::new(
+    let routing = Arc::new(
         config
             .peers
             .iter()
@@ -62,14 +60,11 @@ pub(super) async fn create_udp_listener(
         state.clone(),
         socket.clone(),
         config.clone(),
-        peer_addresses.clone(),
+        routing.clone(),
     ));
 
-    let framed = UdpFramed::new(socket, Codec::new(PacketLayout::default()));
-    Ok(UdpListener {
-        peer_addresses,
-        framed,
-    })
+    let sender = UdpFramed::new(socket, Codec::new(PacketLayout::default()));
+    Ok(Endpoint { routing, sender })
 }
 
 fn keepalive_delay() -> Duration {

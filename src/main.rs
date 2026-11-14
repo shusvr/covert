@@ -7,7 +7,7 @@ use covert::{
     codec::PacketLayout,
     config::{Config, ListenerConfig, PeerTransport},
     crypto::{pk_to_bytes, random_sk, sk_to_bytes},
-    transport::{Listener, State, create_listener},
+    transport::{Endpoint, PacketSender, State},
 };
 use etherparse::{NetHeaders, PacketHeaders};
 use std::{
@@ -146,7 +146,12 @@ async fn run(conf_path: PathBuf, chanlen: Option<u16>) -> Result<()> {
     let (tun_in_tx, mut tun_in_rx) = mpsc::channel::<Vec<u8>>(chanlen);
 
     let state = Arc::new(State::new(tun_in_tx));
-    let mut listener = create_listener(&state, &config).await?;
+    let mut listener = match &config.interface.listener {
+        ListenerConfig::Udp { udp } => {
+            covert::transport::udp::create_udp_endpoint(&state, &config, udp).await?
+        }
+        ListenerConfig::Icmp { .. } => todo!(),
+    };
 
     let mut tun_buf = vec![0; config.interface.mtu as usize];
     loop {
@@ -173,10 +178,10 @@ async fn run(conf_path: PathBuf, chanlen: Option<u16>) -> Result<()> {
     }
 }
 
-async fn process_tun_packet(
+async fn process_tun_packet<S: PacketSender<R>, R: Clone>(
     state: &State,
     config: &Config,
-    listener: &mut Listener,
+    listener: &mut Endpoint<S, R>,
     packet: &[u8],
 ) -> Result<()> {
     let parsed = PacketHeaders::from_ip_slice(&packet)?;
