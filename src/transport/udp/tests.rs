@@ -16,6 +16,7 @@ fn config(local_sk: crate::Key, remote_pk: crate::Key, endpoint: SocketAddr) -> 
         dev_name: String::new(),
         layout: PacketLayout::default(),
         interface: Interface {
+            hooks: Default::default(),
             liveness: Default::default(),
             addresses: vec![],
             mtu: 1460,

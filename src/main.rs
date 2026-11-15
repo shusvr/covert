@@ -156,6 +156,7 @@ fn read_config(path: &Path) -> anyhow::Result<Arc<Config>> {
 
 async fn run(conf_path: PathBuf, chanlen: Option<u16>) -> Result<()> {
     let config = read_config(&conf_path)?;
+    run_hooks("PreUp", &config.interface.hooks.pre_up, &config.dev_name).await?;
     let mut builder = tun::DeviceBuilder::new()
         .mtu(config.interface.mtu)
         .name(&config.dev_name)
@@ -173,6 +174,65 @@ async fn run(conf_path: PathBuf, chanlen: Option<u16>) -> Result<()> {
         .build_async()
         .context("failed to create a tun device")?;
 
+    let result = async {
+        run_hooks("PostUp", &config.interface.hooks.post_up, &config.dev_name).await?;
+        tokio::select! {
+            result = serve(&tun, &config, chanlen) => result,
+            result = shutdown_signal() => result,
+        }
+    }
+    .await;
+    let pre_down = run_hooks(
+        "PreDown",
+        &config.interface.hooks.pre_down,
+        &config.dev_name,
+    )
+    .await;
+    drop(tun);
+    let post_down = run_hooks(
+        "PostDown",
+        &config.interface.hooks.post_down,
+        &config.dev_name,
+    )
+    .await;
+    // Always attempt both cleanup phases, preserving the original failure.
+    for outcome in [&result, &pre_down, &post_down] {
+        if let Err(err) = outcome {
+            error!("Interface lifecycle: {err:#}");
+        }
+    }
+    result.and(pre_down).and(post_down)
+}
+
+async fn run_hooks(phase: &str, commands: &[String], iface: &str) -> Result<()> {
+    for command in commands {
+        let command = command.replace("%i", iface);
+        info!(phase, %command, "Running interface hook");
+        let status = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .status()
+            .await
+            .with_context(|| format!("failed to execute {phase} hook"))?;
+        if !status.success() {
+            bail!("{phase} hook failed ({status}): {command}");
+        }
+    }
+    Ok(())
+}
+
+async fn shutdown_signal() -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        _ = interrupt.recv() => {},
+        _ = terminate.recv() => {},
+    }
+    Ok(())
+}
+
+async fn serve(tun: &tun::AsyncDevice, config: &Arc<Config>, chanlen: Option<u16>) -> Result<()> {
     let chanlen = chanlen.unwrap_or(512) as usize;
     let (tun_in_tx, tun_in_rx) = mpsc::channel::<Vec<u8>>(chanlen);
 
@@ -181,18 +241,18 @@ async fn run(conf_path: PathBuf, chanlen: Option<u16>) -> Result<()> {
         ListenerConfig::Udp { udp } => {
             let endpoint =
                 covert::transport::udp::create_udp_endpoint(&state, &config, udp).await?;
-            run_endpoint(tun, state, config, endpoint, tun_in_rx).await
+            run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
         }
         ListenerConfig::Icmp { icmp } => {
             let endpoint =
                 covert::transport::icmp::create_icmp_endpoint(&state, &config, icmp).await?;
-            run_endpoint(tun, state, config, endpoint, tun_in_rx).await
+            run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
         }
     }
 }
 
 async fn run_endpoint<S: PacketSender<R>, R: Clone>(
-    tun: tun::AsyncDevice,
+    tun: &tun::AsyncDevice,
     state: Arc<State>,
     config: Arc<Config>,
     mut listener: Endpoint<S, R>,
@@ -246,4 +306,51 @@ async fn process_tun_packet<S: PacketSender<R>, R: Clone>(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn hooks_expand_interface_run_in_order_and_stop_on_failure() {
+        let path = std::env::temp_dir().join(format!("covert-hooks-{}", uuid::Uuid::new_v4()));
+        let commands = vec![
+            format!("printf '%i first\\n' > '{}'", path.display()),
+            format!("printf '%i second\\n' >> '{}'", path.display()),
+            "exit 7".to_owned(),
+            format!("printf 'unexpected' >> '{}'", path.display()),
+        ];
+        let result = run_hooks("PostUp", &commands, "vpn-test").await;
+        let contents = fs::read_to_string(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        assert_eq!(contents, "vpn-test first\nvpn-test second\n");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("PostUp hook failed")
+        );
+    }
+
+    #[test]
+    fn hooks_accept_single_commands_arrays_and_defaults() {
+        let reference = include_str!("../config.toml");
+        let default: Config = toml::from_str(reference).unwrap();
+        assert!(default.interface.hooks.pre_up.is_empty());
+        let configured = reference.replace(
+            "[Interface]",
+            r#"[Interface]
+PreUp = "echo %i"
+PostUp = ["first", "second"]
+PreDown = []
+PostDown = "done"
+"#,
+        );
+        let config: Config = toml::from_str(&configured).unwrap();
+        assert_eq!(config.interface.hooks.pre_up, ["echo %i"]);
+        assert_eq!(config.interface.hooks.post_up, ["first", "second"]);
+        assert!(config.interface.hooks.pre_down.is_empty());
+        assert_eq!(config.interface.hooks.post_down, ["done"]);
+    }
 }

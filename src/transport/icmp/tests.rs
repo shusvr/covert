@@ -18,6 +18,7 @@ async fn raw_receive_processes_data_suppresses_kernel_reply_and_cleans_up() {
         dev_name: String::new(),
         layout: PacketLayout::default(),
         interface: Interface {
+            hooks: Default::default(),
             liveness: Default::default(),
             addresses: vec![],
             mtu: 1400,
@@ -220,6 +221,7 @@ async fn request_reply_handshake_and_bidirectional_data() {
                 dev_name: String::new(),
                 layout: PacketLayout::default(),
                 interface: Interface {
+                    hooks: Default::default(),
                     liveness: Default::default(),
                     addresses: vec![],
                     mtu: 1400,

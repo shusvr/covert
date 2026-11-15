@@ -64,6 +64,16 @@ Mtu = 1450
 # Generate a key pair with `covert genkey`; derive a public key with `covert pubkey`.
 PrivateKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
+# Optional shell hooks; default is no commands. Each accepts a string or an
+# array of strings, run sequentially with sh -c. %i expands to the interface name.
+# PreUp runs before TUN creation; PostUp runs after configuration.
+# PreDown runs before TUN removal; PostDown runs after removal, including on
+# SIGINT/SIGTERM and errors after creation. A failed hook stops its command list.
+# PreUp = "echo preparing %i"
+# PostUp = ["ip route add 10.222.0.0/16 dev %i", "echo %i is ready"]
+# PreDown = "ip route del 10.222.0.0/16 dev %i"
+# PostDown = "echo %i removed"
+
 # Liveness values are in seconds. These interface defaults apply to every peer
 # unless that peer overrides the corresponding value independently.
 Timeout = 28          # Idle lifetime since the last authenticated received packet.

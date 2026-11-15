@@ -1,0 +1,23 @@
+# Install: install -m 644 docs/covert@.service /etc/systemd/system/
+# Put the configuration in /etc/covert/NAME.toml (root-owned, mode 600).
+# Start: systemctl daemon-reload && systemctl enable --now covert@NAME.service
+[Unit]
+Description=Covert VPN tunnel %i
+Wants=network-online.target
+After=network-online.target
+Documentation=file:/etc/covert/%i.toml
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/covert run /etc/covert/%i.toml
+Restart=on-failure
+RestartSec=5s
+# Signal Covert first so it can run PreDown/PostDown before remaining children
+# are terminated. Hooks run as root and must finish within this timeout.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

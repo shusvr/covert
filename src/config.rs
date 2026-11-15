@@ -91,6 +91,34 @@ pub struct Interface {
     #[serde(flatten)]
     pub liveness: LivenessOptions,
     pub listener: ListenerConfig,
+    #[serde(flatten)]
+    pub hooks: InterfaceHooks,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct InterfaceHooks {
+    #[serde(default, deserialize_with = "deserialize_hooks")]
+    pub pre_up: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_hooks")]
+    pub post_up: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_hooks")]
+    pub pre_down: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_hooks")]
+    pub post_down: Vec<String>,
+}
+
+fn deserialize_hooks<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Hooks {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match Hooks::deserialize(de)? {
+        Hooks::One(command) => vec![command],
+        Hooks::Many(commands) => commands,
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
