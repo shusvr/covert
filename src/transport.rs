@@ -423,13 +423,19 @@ pub async fn transmit<R: Clone>(
 ) -> Result<()> {
     trace!(?peer_id, len = packet.len(), "Transmitting");
 
+    fn packet_to_owned(packet: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(packet.len() + 16);
+        buf.extend_from_slice(packet);
+        buf
+    }
+
     let Some(addr) = routing.get(&peer_id).map(|x| x.value().clone()) else {
         trace!(?peer_id, "Peer has not been reached yet, skipping transmit");
         state
             .queued
             .entry(peer_id)
             .or_default()
-            .push_back(packet.to_owned());
+            .push_back(packet_to_owned(packet));
         return Ok(());
     };
 
@@ -437,7 +443,7 @@ pub async fn transmit<R: Clone>(
     if let Some(local_idx) = local_idx
         && let Some((cipher, receiver_idx)) = state.session(local_idx)
     {
-        let (counter, ciphertext) = match cipher.encrypt(packet.to_owned()) {
+        let (counter, ciphertext) = match cipher.encrypt(packet_to_owned(packet)) {
             Ok(encrypted) => encrypted,
             Err(err) => {
                 debug!(?peer_id, "Cipher failed to encrypt, cleaning up");
@@ -464,7 +470,7 @@ pub async fn transmit<R: Clone>(
         .queued
         .entry(peer_id)
         .or_default()
-        .push_back(packet.to_owned());
+        .push_back(packet_to_owned(packet));
     initiate(state, config, routing, sender, peer_id).await?;
 
     Ok(())
