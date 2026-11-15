@@ -33,6 +33,8 @@
 #   orsidx  Default 33. Offset of the 4-byte responder's local session index.
 #   orridx  Default 37. Offset of the 4-byte initiator's local session index,
 #           copied from the initiation's sender index to identify the attempt.
+# A 16-byte AEAD tag follows the last reply field (including oty), before
+# optional padding. Its offset is automatic; the default reply is 57 bytes.
 #
 # Encrypted data fields (also used for keepalives):
 #   odridx  Default 1. Offset of the 4-byte receiver's local session index.

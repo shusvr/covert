@@ -269,11 +269,16 @@ impl PacketLayout {
         .unwrap()
     }
 
-    fn rlen(&self) -> usize {
-        [self.oreph + 32, self.orsi + 4, self.orri + 4, self.orp]
+    // Authentication follows the last reply field, before optional padding.
+    fn reply_tag_offset(&self) -> usize {
+        [self.oreph + 32, self.orsi + 4, self.orri + 4, self.oty + 1]
             .into_iter()
             .max()
             .unwrap()
+    }
+
+    fn rlen(&self) -> usize {
+        (self.reply_tag_offset() + 16).max(self.orp)
     }
 }
 
@@ -368,6 +373,7 @@ pub(crate) fn parse_slice(
                 sender_idx,
                 receiver_idx,
                 eph: ephemeral,
+                auth_tag: get_masked_at(buf, layout.reply_tag_offset(), layout.mask)?,
             });
             let consumed = layout.rlen().max(layout.oty + 1);
             if buf.len() < consumed {
@@ -457,7 +463,9 @@ pub fn append(buf: &mut BytesMut, packet: Packet, layout: &PacketLayout) -> Resu
             eph,
             sender_idx,
             receiver_idx,
+            auth_tag,
         }) => {
+            put_masked_at(out, layout.reply_tag_offset(), &auth_tag, layout.mask);
             put_masked_at(out, layout.orsi, &sender_idx.to_be_bytes(), layout.mask);
             put_masked_at(out, layout.orri, &receiver_idx.to_be_bytes(), layout.mask);
             put_masked_at(out, layout.oreph, &eph, layout.mask);
@@ -547,7 +555,7 @@ mod tests {
             let layout = PacketLayout::random();
             assert!(layout.check().is_ok(), "{layout:?}");
             assert!(layout.ilen() <= 130, "sparse initiation: {layout:?}");
-            assert!(layout.rlen() <= 60, "sparse reply: {layout:?}");
+            assert!(layout.rlen() <= 76, "sparse reply: {layout:?}");
             assert!(layout.odd <= 44, "sparse data header: {layout:?}");
         }
     }
@@ -710,7 +718,7 @@ mod tests {
             layout: PacketLayout::default(),
         };
         let mut src = BytesMut::from(&[0u8; 109][..]);
-        let mut reply = vec![0; 41];
+        let mut reply = vec![0; 57];
         reply[0] = 1;
         src.extend_from_slice(&reply[..40]);
         assert!(matches!(
@@ -762,10 +770,11 @@ mod tests {
                 (
                     Packet::Reply(Replying {
                         eph: [7; 32],
+                        auth_tag: [11; 16],
                         sender_idx: 1,
                         receiver_idx: 2,
                     }),
-                    41,
+                    57,
                 ),
                 (
                     Packet::Data(Data {
@@ -842,6 +851,7 @@ mod tests {
                         sender_idx: 0x87654321,
                         receiver_idx: 0x12345678,
                         eph: [9; 32],
+                        auth_tag: [11; 16],
                     }),
                     &mut buf,
                 )
@@ -873,6 +883,7 @@ mod tests {
             assert_eq!(packet.sender_idx, 0x87654321);
             assert_eq!(packet.receiver_idx, 0x12345678);
             assert_eq!(packet.eph, [9; 32]);
+            assert_eq!(packet.auth_tag, [11; 16]);
             for expected in [&b"payload"[..], &b""[..]] {
                 let Some(Packet::Data(Data {
                     receiver_idx,

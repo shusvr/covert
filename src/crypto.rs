@@ -38,7 +38,7 @@ pub fn sk_to_bytes(sk: &PrivateKey) -> Key {
     seed.as_ref().try_into().unwrap()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Initiating {
     pub(crate) enc_ts: SealedTimestamp,
     pub(crate) sender_idx: u32,
@@ -156,13 +156,30 @@ pub struct Replying {
     pub(crate) eph: Key,
     pub(crate) sender_idx: u32,
     pub(crate) receiver_idx: u32,
+    pub(crate) auth_tag: [u8; 16],
+}
+
+// The reply is bound to the entire original initiation, not just its index.
+fn reply_aad(initiating: &Initiating, replying: &Replying) -> [u8; 32] {
+    let mut hash = DigestContext::new(&SHA256);
+    hash.update(b"covert-reply-v1");
+    hash.update(&initiation_aad(
+        &initiating.ephemeral,
+        &initiating.enc_pub_key,
+        initiating.sender_idx,
+    ));
+    hash.update(&initiating.enc_ts);
+    hash.update(&replying.eph);
+    hash.update(&replying.sender_idx.to_be_bytes());
+    hash.update(&replying.receiver_idx.to_be_bytes());
+    hash.finish().as_ref().try_into().unwrap()
 }
 
 pub fn post_reply(
     remote_pk: &Key,
     pre_shared_key: Option<&Key>,
     sender_idx: u32,
-    receiver_idx: u32,
+    initiating: &Initiating,
 ) -> Result<(Replying, Cipher), Unspecified> {
     let remote_pk = to_pk(remote_pk);
 
@@ -171,28 +188,42 @@ pub fn post_reply(
     let salt = hkdf::Salt::none(HKDF_SHA256);
     let prk = ka::agree_ephemeral(esk, remote_pk, Unspecified, |km| Ok(salt.extract(km)))?;
 
+    let mut replying = Replying {
+        eph: pk_to_bytes(&epk),
+        sender_idx,
+        receiver_idx: initiating.sender_idx,
+        auth_tag: [0; 16],
+    };
+    let aad = reply_aad(initiating, &replying);
     let psk = pre_shared_key.map(|x| &x[..]).unwrap_or(b"");
-    let info = [psk, b"for-session"];
+    // Bind session keys to this handshake too, avoiding key reuse if a reply
+    // ephemeral is ever reused with a different initiation.
+    let info = [psk, b"for-session", &aad];
     let okm = prk.expand(&info, &aead::CHACHA20_POLY1305)?;
     let key = LessSafeKey::new(aead::UnboundKey::from(okm));
-
-    Ok((
-        Replying {
-            eph: pk_to_bytes(&epk),
-            sender_idx,
-            receiver_idx,
-        },
-        Cipher::new(key, false),
-    ))
+    // Empty plaintext yields only a tag. Nonce zero is reserved for this;
+    // data starts at counter 1 and uses distinct role bytes.
+    let tag = key.seal_in_place_separate_tag(
+        Nonce::assume_unique_for_key([0; 12]),
+        Aad::from(&aad),
+        &mut [],
+    )?;
+    replying.auth_tag.copy_from_slice(tag.as_ref());
+    Ok((replying, Cipher::new(key, false)))
 }
 
 pub fn finish(
     local_sk: &Key,
     pre_shared_key: Option<&Key>,
-    eph: Key,
+    initiating: &Initiating,
+    replying: &Replying,
 ) -> Result<Cipher, Unspecified> {
     let local_sk = to_sk(local_sk);
-    let remote_epk = UnparsedPublicKey::new(&X25519, &eph);
+    if replying.receiver_idx != initiating.sender_idx {
+        return Err(Unspecified);
+    }
+    let aad = reply_aad(initiating, replying);
+    let remote_epk = UnparsedPublicKey::new(&X25519, &replying.eph);
 
     let salt = hkdf::Salt::none(HKDF_SHA256);
     let prk = ka::agree(
@@ -202,10 +233,16 @@ pub fn finish(
         |km| Ok(salt.extract(km)),
     )?;
     let psk = pre_shared_key.map(|x| &x[..]).unwrap_or(b"");
-    let info = [psk, b"for-session"];
+    let info = [psk, b"for-session", &aad];
     let okm = prk.expand(&info, &aead::CHACHA20_POLY1305)?;
     let key = LessSafeKey::new(aead::UnboundKey::from(okm));
 
+    let mut tag = replying.auth_tag;
+    key.open_in_place(
+        Nonce::assume_unique_for_key([0; 12]),
+        Aad::from(&aad),
+        &mut tag,
+    )?;
     Ok(Cipher::new(key, true))
 }
 

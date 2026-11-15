@@ -86,9 +86,14 @@ fn test_finish() {
         )
         .unwrap();
         let (remote_pk, timestamp) = pre_reply(&sk_to_bytes(&responder), &initiation).unwrap();
-        let (reply, responder_key) =
-            post_reply(&remote_pk.as_ref().try_into().unwrap(), psk.as_ref(), 0, 0).unwrap();
-        let initiator_key = finish(&local_sk, psk.as_ref(), reply.eph).unwrap();
+        let (reply, responder_key) = post_reply(
+            &remote_pk.as_ref().try_into().unwrap(),
+            psk.as_ref(),
+            0,
+            &initiation,
+        )
+        .unwrap();
+        let initiator_key = finish(&local_sk, psk.as_ref(), &initiation, &reply).unwrap();
         assert_eq!(timestamp, u64::MAX);
 
         let (nonce, message) = responder_key.encrypt(b"session message".to_vec()).unwrap();
@@ -159,18 +164,42 @@ fn test_initiation_rejects_tampering() {
 }
 
 #[test]
-fn test_wrong_psk_rejects_session_data() {
+fn test_wrong_psk_rejects_reply() {
     let initiator = random_sk().unwrap();
+    let responder_key = random_sk().unwrap();
+    let initiation = crate::crypto::initiate(
+        &sk_to_bytes(&initiator),
+        &pk_to_bytes(&responder_key.compute_public_key().unwrap()),
+        123,
+        0,
+    )
+    .unwrap();
     let (reply, responder) = post_reply(
         &pk_to_bytes(&initiator.compute_public_key().unwrap()),
         Some(&[7; 32]),
         0,
-        0,
+        &initiation,
     )
     .unwrap();
-    let initiator = finish(&sk_to_bytes(&initiator), Some(&[8; 32]), reply.eph).unwrap();
+    assert!(
+        finish(
+            &sk_to_bytes(&initiator),
+            Some(&[8; 32]),
+            &initiation,
+            &reply
+        )
+        .is_err()
+    );
+    assert!(finish(&sk_to_bytes(&initiator), None, &initiation, &reply).is_err());
+    let initiator = finish(
+        &sk_to_bytes(&initiator),
+        Some(&[7; 32]),
+        &initiation,
+        &reply,
+    )
+    .unwrap();
     let (counter, data) = responder.encrypt(b"message".to_vec()).unwrap();
-    assert!(initiator.decrypt(counter, data).is_err());
+    assert_eq!(initiator.decrypt(counter, data).unwrap(), b"message");
 }
 
 #[test]
@@ -178,14 +207,22 @@ fn shared_cipher_uses_unique_nonces_and_accepts_reordered_packets() {
     use std::sync::{Arc, Barrier};
 
     let initiator = random_sk().unwrap();
+    let responder_key = random_sk().unwrap();
+    let initiation = crate::crypto::initiate(
+        &sk_to_bytes(&initiator),
+        &pk_to_bytes(&responder_key.compute_public_key().unwrap()),
+        123,
+        0,
+    )
+    .unwrap();
     let (reply, responder) = post_reply(
         &pk_to_bytes(&initiator.compute_public_key().unwrap()),
         None,
         0,
-        0,
+        &initiation,
     )
     .unwrap();
-    let sender = Arc::new(finish(&sk_to_bytes(&initiator), None, reply.eph).unwrap());
+    let sender = Arc::new(finish(&sk_to_bytes(&initiator), None, &initiation, &reply).unwrap());
     let receiver = Arc::new(responder);
     let threads: Vec<_> = (0..4)
         .map(|_| {
@@ -247,4 +284,59 @@ fn shared_cipher_uses_unique_nonces_and_accepts_reordered_packets() {
         .filter(|accepted| *accepted)
         .count();
     assert_eq!(accepted, 4);
+}
+
+#[test]
+fn reply_authenticates_every_field_and_original_initiation() {
+    let initiator = random_sk().unwrap();
+    let responder = random_sk().unwrap();
+    let local_sk = sk_to_bytes(&initiator);
+    let remote_pk = pk_to_bytes(&responder.compute_public_key().unwrap());
+    let initiation = initiate(&local_sk, &remote_pk, 123, 19).unwrap();
+    let (reply, _) = post_reply(
+        &pk_to_bytes(&initiator.compute_public_key().unwrap()),
+        None,
+        23,
+        &initiation,
+    )
+    .unwrap();
+    for field in 0..4 {
+        for byte in 0..[32, 4, 4, 16][field] {
+            let mut tampered = reply;
+            match field {
+                0 => tampered.eph[byte] ^= 1,
+                1 => tampered.sender_idx ^= 1 << (byte * 8),
+                2 => tampered.receiver_idx ^= 1 << (byte * 8),
+                3 => tampered.auth_tag[byte] ^= 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                finish(&local_sk, None, &initiation, &tampered).is_err(),
+                "accepted reply field {field}, byte {byte}"
+            );
+        }
+    }
+    for field in 0..4 {
+        for byte in 0..[32, 48, 24, 4][field] {
+            let mut other = initiation.clone();
+            match field {
+                0 => other.ephemeral[byte] ^= 1,
+                1 => other.enc_pub_key[byte] ^= 1,
+                2 => other.enc_ts[byte] ^= 1,
+                3 => other.sender_idx ^= 1 << (byte * 8),
+                _ => unreachable!(),
+            }
+            // Retargeting the old reply index cannot make its tag valid.
+            let mut retargeted = reply;
+            retargeted.receiver_idx = other.sender_idx;
+            assert!(
+                finish(&local_sk, None, &other, &retargeted).is_err(),
+                "accepted different initiation field {field}, byte {byte}"
+            );
+        }
+    }
+    // Even an independently generated initiation with the same index differs.
+    let other = initiate(&local_sk, &remote_pk, 123, 19).unwrap();
+    assert!(finish(&local_sk, None, &other, &reply).is_err());
+    assert!(finish(&local_sk, None, &initiation, &reply).is_ok());
 }

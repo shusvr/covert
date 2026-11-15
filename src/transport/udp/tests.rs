@@ -54,14 +54,22 @@ fn default_liveness() -> crate::config::Liveness {
 
 fn session_ciphers() -> (crate::crypto::Cipher, crate::crypto::Cipher) {
     let initiator = random_sk().unwrap();
+    let responder_key = random_sk().unwrap();
+    let initiation = crate::crypto::initiate(
+        &sk_to_bytes(&initiator),
+        &pk_to_bytes(&responder_key.compute_public_key().unwrap()),
+        123,
+        0,
+    )
+    .unwrap();
     let (reply, responder) = post_reply(
         &pk_to_bytes(&initiator.compute_public_key().unwrap()),
         None,
         0,
-        0,
+        &initiation,
     )
     .unwrap();
-    let initiator = finish(&sk_to_bytes(&initiator), None, reply.eph).unwrap();
+    let initiator = finish(&sk_to_bytes(&initiator), None, &initiation, &reply).unwrap();
     (initiator, responder)
 }
 
@@ -635,8 +643,7 @@ async fn background_task_recovers_from_invalid_datagrams_and_sends_keepalive() {
         panic!("expected initiation")
     };
     let (remote_pk, _) = pre_reply(&sk_to_bytes(&remote_key), &initiation).unwrap();
-    let (reply, cipher) =
-        post_reply(&remote_pk, Some(&[7; 32]), 123, initiation.sender_idx).unwrap();
+    let (reply, cipher) = post_reply(&remote_pk, Some(&[7; 32]), 123, &initiation).unwrap();
     // Both an unknown type and a truncated handshake must be discarded, allowing
     // the subsequent valid reply to establish a session and timers to keep running.
     for malformed in [&[][..], &[253_u8][..], &[0_u8, 1][..]] {
@@ -1028,4 +1035,53 @@ async fn peer_statistics_survive_rekeys_and_exclude_failed_sends_and_invalid_pac
     assert!(after.peers[0].last_established_at >= before.peers[0].last_established_at);
     assert_eq!(after.peers[0].sent, 5);
     assert_eq!(after.peers[0].received, 5);
+}
+
+#[tokio::test]
+async fn invalid_reply_preserves_pending_handshake_and_valid_reply_is_consumed_once() {
+    let local = random_sk().unwrap();
+    let remote = random_sk().unwrap();
+    let local_sk = sk_to_bytes(&local);
+    let remote_pk = pk_to_bytes(&remote.compute_public_key().unwrap());
+    let config = config(local_sk, remote_pk, "127.0.0.1:1234".parse().unwrap());
+    let (tx, _rx) = mpsc::channel(4);
+    let state = Arc::new(State::new(tx));
+    let initiation = crate::crypto::initiate(&local_sk, &remote_pk, 123, 19).unwrap();
+    state.initiated.insert(
+        19,
+        crate::transport::Initiated::new(config.peers[0].id, None, initiation.clone()),
+    );
+    let (reply, _) = post_reply(
+        &pk_to_bytes(&local.compute_public_key().unwrap()),
+        None,
+        23,
+        &initiation,
+    )
+    .unwrap();
+    let mut tampered = reply;
+    tampered.auth_tag[0] ^= 1;
+    assert!(
+        crate::transport::process_incoming(&state, &config, Packet::Reply(tampered))
+            .await
+            .is_err()
+    );
+    assert!(state.initiated.contains_key(&19));
+    assert!(state.established.is_empty());
+    assert!(matches!(
+        crate::transport::process_incoming(&state, &config, Packet::Reply(reply))
+            .await
+            .unwrap(),
+        Some(crate::transport::ProcessResult::Established {
+            local_idx: 19,
+            replying: None,
+            ..
+        })
+    ));
+    assert!(state.initiated.is_empty());
+    assert!(
+        crate::transport::process_incoming(&state, &config, Packet::Reply(reply))
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

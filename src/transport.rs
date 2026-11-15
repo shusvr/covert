@@ -77,6 +77,7 @@ impl PeerHandle {
     }
 }
 
+#[derive(Clone)]
 pub struct Initiated {
     when: Instant,
     peer_id: Uuid,
@@ -311,7 +312,7 @@ async fn process_incoming(
                 &remote_pk,
                 peer.pre_shared_key.as_ref().map(|k| &k.0),
                 sender_idx,
-                initiating.sender_idx,
+                &initiating,
             )?;
 
             let liveness = peer
@@ -331,7 +332,11 @@ async fn process_incoming(
                 remote_idx = replying.sender_idx,
                 "Handshake reply received"
             );
-            let Some((_, initiated)) = state.initiated.remove(&replying.receiver_idx) else {
+            let Some(initiated) = state
+                .initiated
+                .get(&replying.receiver_idx)
+                .map(|entry| entry.value().clone())
+            else {
                 warn!(
                     receiver_idx = replying.receiver_idx,
                     "Received a reply to an unknown index"
@@ -339,19 +344,23 @@ async fn process_incoming(
                 return Ok(None);
             };
 
-            if initiated.initiating.sender_idx != replying.receiver_idx {
-                warn!(
-                    sender_idx = initiated.initiating.sender_idx,
-                    receiver_idx = replying.receiver_idx,
-                    "Misbehaving peer, i.sender_idx != r.receiver_idx"
-                );
-            }
-
             let cipher = finish(
                 &config.interface.private_key.0,
                 initiated.psk.as_ref(),
-                replying.eph,
+                &initiated.initiating,
+                &replying,
             )?;
+            // Failed authentication leaves the pending initiation available for
+            // the real reply. Consume once, even if valid replies race.
+            if state
+                .initiated
+                .remove_if(&replying.receiver_idx, |_, pending| {
+                    pending.initiating == initiated.initiating
+                })
+                .is_none()
+            {
+                return Ok(None);
+            }
 
             let timestamp = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)?
