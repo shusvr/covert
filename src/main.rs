@@ -18,6 +18,8 @@ use std::{
 use tokio::sync::mpsc;
 use tracing::{Level, error, info, trace, warn};
 
+mod tun_io;
+
 #[derive(Parser)]
 #[command(version = env!("COVERT_VERSION"), about)]
 struct Cli {
@@ -181,9 +183,18 @@ async fn run(conf_path: PathBuf, chanlen: Option<u16>) -> Result<()> {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    let builder = builder.offload(true);
     let tun = builder
         .build_async()
         .context("failed to create a tun device")?;
+
+    #[cfg(target_os = "linux")]
+    tracing::debug!(
+        tcp_gso = tun.tcp_gso(),
+        udp_gso = tun.udp_gso(),
+        "TUN offloading enabled"
+    );
 
     let result = async {
         run_hooks("PostUp", &config.interface.hooks.post_up, &config.dev_name).await?;
@@ -277,24 +288,26 @@ async fn run_endpoint<S: PacketSender<R>, R: Clone>(
     mut listener: Endpoint<S, R>,
     mut tun_in_rx: mpsc::Receiver<Vec<u8>>,
 ) -> Result<()> {
-    let mut tun_buf = vec![0; config.interface.mtu as usize];
+    let mut reader = tun_io::Reader::new(config.interface.mtu);
+    let mut writer = tun_io::Writer::default();
     loop {
         tokio::select! {
-            result = tun.recv(&mut tun_buf) => match result {
-                Ok(len) => {
-                    trace!(len, "Received packet on tun");
-
-                    if let Err(err) = process_tun_packet(&state, &config, &mut listener, &tun_buf[..len]).await {
-                        error!("Failed to process tun packet: {err}");
+            result = reader.recv(tun) => match result {
+                Ok(count) => {
+                    trace!(packets = count, "Received TUN batch");
+                    for index in 0..count {
+                        let packet = reader.packet(index);
+                        if let Err(err) = process_tun_packet(&state, &config, &mut listener, packet).await {
+                            error!("Failed to process tun packet: {err}");
+                        }
                     }
                 }
                 Err(err) => error!("Failed to receive on tun: {err}"),
             },
-            // wack
             opt = tun_in_rx.recv() => if let Some(packet) = opt {
                 trace!(len=packet.len(), "Received packet to tun");
 
-                tun.send(&packet).await?;
+                writer.send(tun, packet, &mut tun_in_rx).await?;
             } else {
                 break Ok(())
             }

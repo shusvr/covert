@@ -59,6 +59,9 @@ Address = "10.111.111.1/24"
 # Optional TUN MTU; default 1450. Use 1400 to leave encapsulation headroom
 # on a typical 1500-byte IPv4 path.
 Mtu = 1450
+# Linux enables TUN GSO/GRO and checksum offload. Covert segments GSO reads
+# into normal IP packets before encryption, and coalesces eligible writes.
+# Offload metadata is local to TUN and is never transmitted to peers.
 
 # Required: base64-encoded 32-byte X25519 private key. This is a placeholder.
 # Generate a key pair with `covert genkey`; derive a public key with `covert pubkey`.
