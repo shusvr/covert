@@ -322,6 +322,7 @@ dependencies = [
  "futures",
  "hickory-proto",
  "ipnet",
+ "libc",
  "serde",
  "socket2",
  "thiserror",

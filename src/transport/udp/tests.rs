@@ -721,3 +721,106 @@ async fn maintenance_initiates_without_a_socket_and_stops_when_tun_closes() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test]
+async fn batch_sender_preserves_datagrams_destinations_order_and_layout() {
+    use crate::codec::{Data, DataFlags};
+    let left = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let right = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let addresses = [left.local_addr().unwrap(), right.local_addr().unwrap()];
+    let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+    let layout = PacketLayout {
+        mask: 0x12345678,
+        odp: 80,
+        ..PacketLayout::default()
+    };
+    let (mut sender, recv) = futures::channel::mpsc::channel(512);
+    // Prequeue more than two batches plus a partial tail before starting the worker.
+    let count = BATCH_SIZE * 2 + 7;
+    for index in 0..count {
+        sender
+            .send((
+                Packet::Data(Data {
+                    receiver_idx: index as u32,
+                    counter: index as u64,
+                    flags: DataFlags::empty(),
+                    ciphertext: vec![index as u8; index % 20],
+                }),
+                addresses[index % 2],
+            ))
+            .await
+            .unwrap();
+    }
+    drop(sender);
+    let worker = tokio::spawn(sender_task(socket.clone(), layout, recv));
+    let socket_source = socket.local_addr().unwrap();
+    let check = |socket: UdpSocket, parity: usize| async move {
+        let mut framed = UdpFramed::new(socket, Codec::new(layout));
+        for index in (parity..count).step_by(2) {
+            let (packet, source) = timeout(Duration::from_secs(3), framed.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(source, socket_source);
+            let Packet::Data(data) = packet else {
+                panic!("expected data");
+            };
+            assert_eq!(data.receiver_idx, index as u32);
+            assert_eq!(data.counter, index as u64);
+            assert_eq!(data.ciphertext, vec![index as u8; index % 20]);
+        }
+    };
+    tokio::join!(check(left, 0), check(right, 1));
+    timeout(Duration::from_secs(3), worker)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn batch_sender_keeps_unsent_tail_after_partial_send_and_bad_packet() {
+    use crate::codec::{Data, DataFlags};
+    let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let destination = receiver.local_addr().unwrap();
+    let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+    let (mut sender, recv) = futures::channel::mpsc::channel(8);
+    for (counter, size) in [(1, 8), (2, 65536), (3, 9)] {
+        sender
+            .send((
+                Packet::Data(Data {
+                    receiver_idx: 7,
+                    counter,
+                    flags: DataFlags::empty(),
+                    ciphertext: vec![42; size],
+                }),
+                destination,
+            ))
+            .await
+            .unwrap();
+    }
+    drop(sender);
+    let worker = tokio::spawn(sender_task(socket, PacketLayout::default(), recv));
+    let mut framed = UdpFramed::new(receiver, Codec::new(PacketLayout::default()));
+    for expected in [1, 3] {
+        let (packet, _) = timeout(Duration::from_secs(3), framed.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let Packet::Data(data) = packet else {
+            panic!("expected data");
+        };
+        assert_eq!(data.counter, expected);
+    }
+    timeout(Duration::from_secs(3), worker)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        timeout(Duration::from_millis(30), framed.next())
+            .await
+            .is_err(),
+        "a successful datagram was resent"
+    );
+}
