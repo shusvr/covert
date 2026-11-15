@@ -213,7 +213,7 @@ async fn process_incoming(
             if let Some(existing) = local_idx.and_then(|index| state.established.get(&index))
                 && existing.timestamp >= timestamp
             {
-                warn!("Possible replay attack, received old timestamp");
+                debug!("Possible replay attack, received old timestamp");
                 return Ok(None);
             }
 

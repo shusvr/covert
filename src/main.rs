@@ -145,6 +145,24 @@ fn read_config(path: &Path) -> anyhow::Result<Arc<Config>> {
 
     let listener_tag = config.interface.listener.tag();
 
+    if let Some(suggested_mtu) = config.interface.listener.suggested_mtu(&config.layout) {
+        if suggested_mtu == 0 {
+            warn!(
+                transport = listener_tag,
+                path_mtu = 1500,
+                "Packet layout framing or minimum padding cannot fit a 1500-byte IPv4 path, even with a smaller TUN MTU"
+            );
+        } else if usize::from(config.interface.mtu) > suggested_mtu {
+            warn!(
+                transport = listener_tag,
+                mtu = config.interface.mtu,
+                suggested_mtu,
+                path_mtu = 1500,
+                "Configured TUN MTU exceeds the suggested MTU for this packet layout; encapsulated packets may exceed 1500 bytes"
+            );
+        }
+    }
+
     let mut mismatch = false;
     for p in &config.peers {
         let peer_tag = p.transport.tag();
@@ -349,6 +367,34 @@ async fn process_tun_packet<S: PacketSender<R>, R: Clone>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suggested_mtu_accounts_for_transport_layout_and_padding() {
+        for (listener, expected) in [
+            ("Udp = { udp = {} }", Some(1438)),
+            ("Icmp = { icmp = {} }", Some(1438)),
+            (
+                "Icmp = { icmp = { Mode = \"OnlyUnreachable\" } }",
+                Some(1434),
+            ),
+            ("Ntp = { ntp = {} }", Some(1382)),
+            ("Dns = { dns = {} }", None),
+        ] {
+            let listener: ListenerConfig = toml::from_str(listener).unwrap();
+            let mut layout = PacketLayout::default();
+            assert_eq!(listener.suggested_mtu(&layout), expected);
+            layout.odd += 20;
+            assert_eq!(
+                listener.suggested_mtu(&layout),
+                expected.map(|mtu| mtu - 20)
+            );
+            layout.odp = 1500;
+            assert_eq!(listener.suggested_mtu(&layout), expected.map(|_| 0));
+            layout.odp = 0;
+            layout.odd = usize::MAX;
+            assert_eq!(listener.suggested_mtu(&layout), expected.map(|_| 0));
+        }
+    }
 
     #[tokio::test]
     async fn hooks_expand_interface_run_in_order_and_stop_on_failure() {

@@ -112,8 +112,8 @@ impl FromStr for PacketLayout {
         for pair in s.split('&') {
             let (k, v) = pair.split_once("=").ok_or(Error::InvalidLayout("pair"))?;
             let v = v
-                .parse::<usize>()
-                .map_err(|_| Error::InvalidLayout("non int"))?;
+                .parse::<u16>()
+                .map_err(|_| Error::InvalidLayout("non int"))? as usize;
 
             match k {
                 "m" => {

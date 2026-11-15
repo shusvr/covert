@@ -46,6 +46,17 @@ fn default_icmp_id() -> u16 {
     1339
 }
 
+impl IcmpListenerConfig {
+    pub(crate) fn packet_overhead(&self) -> usize {
+        // IPv4 + ICMP, plus the tunnel ID/sequence prefix in unreachable mode.
+        28 + if self.mode == IcmpMode::OnlyUnreachable {
+            4
+        } else {
+            0
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct IcmpTransportPeerConfig {

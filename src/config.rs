@@ -189,6 +189,26 @@ make_listen_peer_cfgs!(
     Dns, dns, DnsListenerConfig, DnsTransportPeerConfig;
 );
 
+impl ListenerConfig {
+    /// Largest inner IP packet fitting a 1500-byte IPv4 path with this layout.
+    /// None means the transport fragments packets; zero means even minimum
+    /// data framing/padding cannot fit, regardless of the configured TUN MTU.
+    pub fn suggested_mtu(&self, layout: &PacketLayout) -> Option<usize> {
+        let budget = match self {
+            Self::Udp { .. } => 1500 - 28,
+            Self::Icmp { icmp } => 1500 - icmp.packet_overhead(),
+            // IPv4/UDP + NTP header, then a four-byte-aligned extension
+            // containing its header and the Covert payload length (8 bytes).
+            Self::Ntp { .. } => ((1500 - 28 - 48) & !3usize) - 8,
+            Self::Dns { .. } => return None,
+        };
+        if layout.odp > budget {
+            return Some(0);
+        }
+        Some(budget.saturating_sub(layout.odd).saturating_sub(16))
+    }
+}
+
 fn deserialize_addrs<'de, D>(deserializer: D) -> Result<Vec<IpNet>, D::Error>
 where
     D: serde::Deserializer<'de>,
