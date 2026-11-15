@@ -135,6 +135,7 @@ impl State {
 }
 
 pub mod icmp;
+pub mod ntp;
 pub mod udp;
 
 pub struct Endpoint<S, R> {

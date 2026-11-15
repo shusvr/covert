@@ -243,6 +243,10 @@ async fn serve(tun: &tun::AsyncDevice, config: &Arc<Config>, chanlen: Option<u16
                 covert::transport::udp::create_udp_endpoint(&state, &config, udp).await?;
             run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
         }
+        ListenerConfig::Ntp { ntp } => {
+            let endpoint = covert::transport::ntp::create_ntp_endpoint(&state, config, ntp).await?;
+            run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
+        }
         ListenerConfig::Icmp { icmp } => {
             let endpoint =
                 covert::transport::icmp::create_icmp_endpoint(&state, &config, icmp).await?;

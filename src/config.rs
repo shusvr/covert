@@ -2,6 +2,7 @@ use crate::{
     codec::PacketLayout,
     transport::{
         icmp::{IcmpListenerConfig, IcmpTransportPeerConfig},
+        ntp::{NtpListenerConfig, NtpTransportPeerConfig},
         udp::{UdpListenerConfig, UdpTransportPeerConfig},
     },
 };
@@ -183,6 +184,7 @@ macro_rules! make_listen_peer_cfgs {
 make_listen_peer_cfgs!(
     Udp, udp, UdpListenerConfig, UdpTransportPeerConfig;
     Icmp, icmp, IcmpListenerConfig, IcmpTransportPeerConfig;
+    Ntp, ntp, NtpListenerConfig, NtpTransportPeerConfig;
 );
 
 fn deserialize_addrs<'de, D>(deserializer: D) -> Result<Vec<IpNet>, D::Error>
