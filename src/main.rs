@@ -50,6 +50,8 @@ enum Command {
     },
     /// Generate a random packet layout
     Genlayout,
+    /// Generate a random UUID v4.
+    Genuuid,
 }
 
 #[tokio::main]
@@ -82,6 +84,10 @@ async fn main() -> Result<()> {
         Command::Genlayout => {
             let layout = PacketLayout::random().to_string();
             println!("{layout}");
+            Ok(())
+        }
+        Command::Genuuid => {
+            println!("{}", uuid::Uuid::new_v4());
             Ok(())
         }
         Command::Pubkey { private_key } => {
