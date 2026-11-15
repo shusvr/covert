@@ -1,6 +1,7 @@
 use circular_buffer::FixedCircularBuffer;
 use dashmap::DashMap;
 use futures::{Sink, SinkExt};
+use serde::Serialize;
 use std::{
     fmt::Debug,
     sync::{
@@ -35,11 +36,7 @@ pub struct PeerHandle {
     liveness: Liveness,
     since: Instant,
 
-    // for statistical purposes
-    #[expect(dead_code)]
-    sent: AtomicU64,
-    #[expect(dead_code)]
-    received: AtomicU64,
+    statistics: Arc<PeerStatistics>,
 }
 
 impl PeerHandle {
@@ -59,8 +56,7 @@ impl PeerHandle {
             next_keepalive_ms: AtomicU64::new(liveness.next_ka()),
             liveness,
             since: Instant::now(),
-            sent: 0.into(),
-            received: 0.into(),
+            statistics: Arc::new(PeerStatistics::default()),
         }
     }
 
@@ -99,7 +95,38 @@ impl Initiated {
     }
 }
 
+#[derive(Default)]
+struct PeerStatistics {
+    sent: AtomicU64,
+    received: AtomicU64,
+    first_established_at: AtomicU64,
+    last_established_at: AtomicU64,
+}
+
+#[derive(Serialize)]
+pub struct StatusSnapshot {
+    pub session: Uuid,
+    pub peers: Vec<PeerStatus>,
+}
+
+#[derive(Serialize)]
+pub struct PeerStatus {
+    pub id: Uuid,
+    pub psk: bool,
+    pub allowed_ips: Vec<String>,
+    pub transport: &'static str,
+    pub status: &'static str,
+    /// Unix milliseconds, absent until the first successful handshake.
+    pub first_established_at: Option<u64>,
+    pub last_established_at: Option<u64>,
+    /// Plaintext bytes accepted by the transport sender / authenticated on receive.
+    pub sent: u64,
+    pub received: u64,
+}
+
 pub struct State {
+    session_id: Uuid,
+    peer_statistics: DashMap<Uuid, Arc<PeerStatistics>>,
     established: DashMap<u32, PeerHandle>,
     initiated: DashMap<u32, Initiated>,
     peering: DashMap<Uuid, u32>,
@@ -110,11 +137,77 @@ pub struct State {
 impl State {
     pub fn new(tun_in_tx: mpsc::Sender<Vec<u8>>) -> Self {
         Self {
+            session_id: Uuid::new_v4(),
+            peer_statistics: Default::default(),
             tun_in_tx,
             established: Default::default(),
             initiated: Default::default(),
             peering: Default::default(),
             queued: Default::default(),
+        }
+    }
+
+    fn register_statistics(&self, handle: &mut PeerHandle) {
+        let statistics = self
+            .peer_statistics
+            .entry(handle.peer_id)
+            .or_insert_with(|| handle.statistics.clone())
+            .clone();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let _ = statistics.first_established_at.compare_exchange(
+            0,
+            now,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        statistics.last_established_at.store(now, Ordering::Relaxed);
+        handle.statistics = statistics;
+    }
+
+    pub fn status(&self, config: &Config) -> StatusSnapshot {
+        let peers = config
+            .peers
+            .iter()
+            .map(|peer| {
+                let statistics = self
+                    .peer_statistics
+                    .get(&peer.id)
+                    .map(|entry| entry.value().clone());
+                let load = |value: fn(&PeerStatistics) -> &AtomicU64| {
+                    statistics
+                        .as_ref()
+                        .map_or(0, |s| value(s).load(Ordering::Relaxed))
+                };
+                let first = load(|s| &s.first_established_at);
+                let last = load(|s| &s.last_established_at);
+                let transport = peer.transport.tag();
+                PeerStatus {
+                    id: peer.id,
+                    psk: peer.pre_shared_key.is_some(),
+                    allowed_ips: peer.allowed_ips.iter().map(ToString::to_string).collect(),
+                    transport: if transport == "none" {
+                        config.interface.listener.tag()
+                    } else {
+                        transport
+                    },
+                    status: if self.has_live_connection(peer.id) {
+                        "connected"
+                    } else {
+                        "disconnected"
+                    },
+                    first_established_at: (first != 0).then_some(first),
+                    last_established_at: (last != 0).then_some(last),
+                    sent: load(|s| &s.sent),
+                    received: load(|s| &s.received),
+                }
+            })
+            .collect();
+        StatusSnapshot {
+            session: self.session_id,
+            peers,
         }
     }
 
@@ -319,6 +412,10 @@ async fn process_incoming(
                 trace!(receiver_idx, "Plaintext is empty, keepalive");
                 return Ok(None);
             }
+            handle
+                .statistics
+                .received
+                .fetch_add(plaintext.len() as u64, Ordering::Relaxed);
             // Decryption is synchronous; release the map guard before TUN delivery.
             drop(handle);
             trace!(
@@ -438,6 +535,11 @@ pub async fn transmit<R: Clone>(
     if let Some(local_idx) = local_idx
         && let Some((cipher, receiver_idx)) = state.session(local_idx)
     {
+        let packet_len = packet.len();
+        let statistics = state
+            .established
+            .get(&local_idx)
+            .map(|handle| handle.statistics.clone());
         let (counter, ciphertext) = match cipher.encrypt(packet_to_owned(packet)) {
             Ok(encrypted) => encrypted,
             Err(err) => {
@@ -454,6 +556,11 @@ pub async fn transmit<R: Clone>(
             ciphertext,
         });
         sender.send((packet, addr)).await?;
+        if let Some(statistics) = statistics {
+            statistics
+                .sent
+                .fetch_add(packet_len as u64, Ordering::Relaxed);
+        }
         return Ok(());
     }
 
@@ -553,9 +660,10 @@ async fn process_packet<R: Debug + Clone>(
         Some(ProcessResult::Established {
             local_idx,
             replying,
-            handle,
+            mut handle,
         }) => {
             let peer_id = handle.peer_id;
+            state.register_statistics(&mut handle);
             routing.insert(peer_id, route.clone());
             state.established.insert(local_idx, handle);
             state.peering.insert(peer_id, local_idx);
@@ -601,6 +709,11 @@ async fn flush_queued<R: Debug + Clone>(
             .get_mut(&peer_id)
             .and_then(|mut queue| queue.pop_front());
         let Some(plaintext) = packet else { break };
+        let bytes = plaintext.len();
+        let statistics = state
+            .established
+            .get(&local_idx)
+            .map(|handle| handle.statistics.clone());
         let (counter, ciphertext) = match cipher.encrypt(plaintext) {
             Ok(encrypted) => encrypted,
             Err(err) => {
@@ -617,6 +730,9 @@ async fn flush_queued<R: Debug + Clone>(
         });
 
         sender.send((packet, route.clone())).await?;
+        if let Some(statistics) = statistics {
+            statistics.sent.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
         sent += 1;
     }
     state

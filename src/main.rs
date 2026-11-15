@@ -18,6 +18,7 @@ use std::{
 use tokio::sync::mpsc;
 use tracing::{Level, error, info, trace, warn};
 
+mod rpc;
 mod tun_io;
 
 #[derive(Parser)]
@@ -38,6 +39,11 @@ enum Command {
         /// Capacity of the internal message channel.
         #[arg(short, long)]
         chanlen: Option<u16>,
+
+        /// Stream JSON status on a Unix socket; omit PATH to use the runtime directory.
+        /// Place CONFIG before a bare -r to avoid ambiguity with the optional PATH.
+        #[arg(short = 'r', long, num_args = 0..=1, value_name = "PATH")]
+        rpc: Option<Option<PathBuf>>,
 
         config: PathBuf,
     },
@@ -65,7 +71,11 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_max_level(log_level).init();
 
     match cli.command {
-        Command::Run { config, chanlen } => run(config, chanlen).await,
+        Command::Run {
+            config,
+            chanlen,
+            rpc,
+        } => run(config, chanlen, rpc).await,
         Command::Genkey => {
             let private_key = random_sk().context("failed to generate private key")?;
             let public_key = private_key
@@ -191,8 +201,25 @@ fn read_config(path: &Path) -> anyhow::Result<Arc<Config>> {
     Ok(config.into())
 }
 
-async fn run(conf_path: PathBuf, chanlen: Option<u16>) -> Result<()> {
+async fn run(
+    conf_path: PathBuf,
+    chanlen: Option<u16>,
+    rpc_path: Option<Option<PathBuf>>,
+) -> Result<()> {
     let config = read_config(&conf_path)?;
+    let rpc = match rpc_path {
+        None => None,
+        Some(path) => {
+            let path = match path {
+                Some(path) => path,
+                None => rpc::default_path(&config.dev_name)?,
+            };
+            let server = rpc::Server::bind(&path)
+                .with_context(|| format!("failed to bind RPC socket {}", path.display()))?;
+            info!(path = %path.display(), "RPC socket listening");
+            Some(server)
+        }
+    };
     run_hooks("PreUp", &config.interface.hooks.pre_up, &config.dev_name).await?;
     let mut builder = tun::DeviceBuilder::new()
         .mtu(config.interface.mtu)
@@ -223,7 +250,7 @@ async fn run(conf_path: PathBuf, chanlen: Option<u16>) -> Result<()> {
     let result = async {
         run_hooks("PostUp", &config.interface.hooks.post_up, &config.dev_name).await?;
         tokio::select! {
-            result = serve(&tun, &config, chanlen) => result,
+            result = serve(&tun, &config, chanlen, rpc.as_ref()) => result,
             result = shutdown_signal() => result,
         }
     }
@@ -278,30 +305,50 @@ async fn shutdown_signal() -> Result<()> {
     Ok(())
 }
 
-async fn serve(tun: &tun::AsyncDevice, config: &Arc<Config>, chanlen: Option<u16>) -> Result<()> {
+async fn serve(
+    tun: &tun::AsyncDevice,
+    config: &Arc<Config>,
+    chanlen: Option<u16>,
+    rpc: Option<&rpc::Server>,
+) -> Result<()> {
     let chanlen = chanlen.unwrap_or(512) as usize;
     let (tun_in_tx, tun_in_rx) = mpsc::channel::<Vec<u8>>(chanlen);
 
     let state = Arc::new(State::new(tun_in_tx));
-    match &config.interface.listener {
-        ListenerConfig::Udp { udp } => {
-            let endpoint =
-                covert::transport::udp::create_udp_endpoint(&state, &config, udp).await?;
-            run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
+    let rpc_state = state.clone();
+    let endpoint = async {
+        match &config.interface.listener {
+            ListenerConfig::Udp { udp } => {
+                let endpoint =
+                    covert::transport::udp::create_udp_endpoint(&state, &config, udp).await?;
+                run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
+            }
+            ListenerConfig::Dns { dns } => {
+                let endpoint =
+                    covert::transport::dns::create_dns_endpoint(&state, config, dns).await?;
+                run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
+            }
+            ListenerConfig::Ntp { ntp } => {
+                let endpoint =
+                    covert::transport::ntp::create_ntp_endpoint(&state, config, ntp).await?;
+                run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
+            }
+            ListenerConfig::Icmp { icmp } => {
+                let endpoint =
+                    covert::transport::icmp::create_icmp_endpoint(&state, &config, icmp).await?;
+                run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
+            }
         }
-        ListenerConfig::Dns { dns } => {
-            let endpoint = covert::transport::dns::create_dns_endpoint(&state, config, dns).await?;
-            run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
+    };
+    if let Some(server) = rpc {
+        tokio::select! {
+            result = endpoint => result,
+            result = server.serve(rpc_state, config.clone()) => {
+                result.context("RPC listener failed")
+            }
         }
-        ListenerConfig::Ntp { ntp } => {
-            let endpoint = covert::transport::ntp::create_ntp_endpoint(&state, config, ntp).await?;
-            run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
-        }
-        ListenerConfig::Icmp { icmp } => {
-            let endpoint =
-                covert::transport::icmp::create_icmp_endpoint(&state, &config, icmp).await?;
-            run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
-        }
+    } else {
+        endpoint.await
     }
 }
 
@@ -367,6 +414,30 @@ async fn process_tun_packet<S: PacketSender<R>, R: Clone>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rpc_flag_accepts_missing_or_explicit_path() {
+        for (args, expected) in [
+            (vec!["covert", "run", "co1.toml"], None),
+            (vec!["covert", "run", "co1.toml", "-r"], Some(None)),
+            (vec!["covert", "run", "co1.toml", "--rpc"], Some(None)),
+            (
+                vec!["covert", "run", "co1.toml", "-r", "./rpc.sock"],
+                Some(Some(PathBuf::from("./rpc.sock"))),
+            ),
+            (
+                vec!["covert", "run", "-r", "./rpc.sock", "co1.toml"],
+                Some(Some(PathBuf::from("./rpc.sock"))),
+            ),
+        ] {
+            let Command::Run { rpc, config, .. } = Cli::try_parse_from(args).unwrap().command
+            else {
+                panic!("expected run");
+            };
+            assert_eq!(rpc, expected);
+            assert_eq!(config, PathBuf::from("co1.toml"));
+        }
+    }
 
     #[test]
     fn suggested_mtu_accounts_for_transport_layout_and_padding() {

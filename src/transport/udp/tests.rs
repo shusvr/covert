@@ -589,6 +589,16 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
         b"reply"
     );
 
+    for (state, config) in [(&state_a, &config_a), (&state_b, &config_b)] {
+        let snapshot = state.status(config);
+        let peer = &snapshot.peers[0];
+        assert_eq!(peer.status, "connected");
+        assert_eq!(peer.sent, 30); // queued first + queued second + hello/reply
+        assert_eq!(peer.received, 30);
+        assert!(peer.first_established_at.is_some());
+        assert_eq!(peer.first_established_at, peer.last_established_at);
+    }
+
     // The periodic check skips both live connections, including learned endpoints.
     initiate_disconnected_peers(&state_a, &config_a, &a.routing, &mut a.sender).await;
     initiate_disconnected_peers(&state_b, &config_b, &b.routing, &mut b.sender).await;
@@ -597,6 +607,8 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
 
     // A missing session is retried even when the peering entry still exists.
     state_a.established.remove(&local_a);
+    assert_eq!(state_a.status(&config_a).peers[0].status, "disconnected");
+    assert_eq!(state_a.status(&config_a).peers[0].sent, 30);
     initiate_disconnected_peers(&state_a, &config_a, &a.routing, &mut a.sender).await;
     let (packet, _) = receive(&mut b).await;
     assert!(matches!(packet, Packet::Initiating(_)));
@@ -935,4 +947,103 @@ async fn batch_receiver_reports_truncation_and_reuses_buffers_for_large_and_smal
         assert_eq!(&batch[0].bytes[..batch[0].len], &bytes[..batch[0].len]);
         batch[0].bytes.resize(MAX_DATAGRAM_SIZE, 0);
     }
+}
+
+#[tokio::test]
+async fn peer_statistics_survive_rekeys_and_exclude_failed_sends_and_invalid_packets() {
+    use crate::codec::{Data, DataFlags};
+    let address: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+    let key = random_sk().unwrap();
+    let config = config(
+        sk_to_bytes(&key),
+        pk_to_bytes(&key.compute_public_key().unwrap()),
+        address,
+    );
+    let id = config.peers[0].id;
+    let (tx, mut rx) = mpsc::channel(4);
+    let state = Arc::new(State::new(tx));
+    let snapshot = state.status(&config);
+    assert_eq!(snapshot.peers[0].status, "disconnected");
+    assert!(snapshot.peers[0].first_established_at.is_none());
+    let (remote, local) = session_ciphers();
+    let mut handle = PeerHandle::new(id, 2, local, 0, default_liveness());
+    state.register_statistics(&mut handle);
+    state.established.insert(1, handle);
+    state.peering.insert(id, 1);
+    let routes = DashMap::new();
+    routes.insert(id, address);
+    let mut successful = futures::sink::unfold((), |(), _: (Packet, SocketAddr)| {
+        futures::future::ready(Ok::<_, crate::codec::Error>(()))
+    });
+    transmit(&state, &config, &routes, &mut successful, id, b"hello")
+        .await
+        .unwrap();
+    let mut failing = futures::sink::unfold((), |(), _: (Packet, SocketAddr)| {
+        futures::future::ready(Err::<(), _>(crate::codec::Error::Io(
+            std::io::Error::other("test failure"),
+        )))
+    });
+    assert!(
+        transmit(&state, &config, &routes, &mut failing, id, b"not counted")
+            .await
+            .is_err()
+    );
+    for (bytes, flags) in [
+        (b"reply".to_vec(), DataFlags::empty()),
+        (vec![], DataFlags::JUNK),
+        (b"junk".to_vec(), DataFlags::JUNK),
+    ] {
+        let (counter, ciphertext) = remote.encrypt(bytes).unwrap();
+        process_packet(
+            &state,
+            &config,
+            Packet::Data(Data {
+                receiver_idx: 1,
+                counter,
+                ciphertext,
+                flags,
+            }),
+            address,
+            &routes,
+            &mut successful,
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(rx.try_recv().unwrap(), b"reply");
+    assert!(rx.try_recv().is_err());
+    let before = state.status(&config);
+    assert_eq!(before.peers[0].sent, 5);
+    assert_eq!(before.peers[0].received, 5);
+    process_packet(
+        &state,
+        &config,
+        Packet::Data(Data {
+            receiver_idx: 1,
+            counter: 99,
+            ciphertext: vec![0; 32],
+            flags: DataFlags::empty(),
+        }),
+        address,
+        &routes,
+        &mut successful,
+    )
+    .await
+    .unwrap();
+    assert_eq!(state.status(&config).peers[0].status, "disconnected");
+    let (_, cipher) = session_ciphers();
+    let mut rekey = PeerHandle::new(id, 3, cipher, 1, default_liveness());
+    state.register_statistics(&mut rekey);
+    state.established.insert(2, rekey);
+    state.peering.insert(id, 2);
+    let after = state.status(&config);
+    assert_eq!(after.session, snapshot.session);
+    assert_eq!(after.peers[0].status, "connected");
+    assert_eq!(
+        after.peers[0].first_established_at,
+        before.peers[0].first_established_at
+    );
+    assert!(after.peers[0].last_established_at >= before.peers[0].last_established_at);
+    assert_eq!(after.peers[0].sent, 5);
+    assert_eq!(after.peers[0].received, 5);
 }
