@@ -30,7 +30,6 @@ pub enum IcmpMode {
     #[default]
     EchoReply,
     OnlyEcho,
-    OnlyUnreachable,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -44,17 +43,6 @@ pub struct IcmpListenerConfig {
 
 fn default_icmp_id() -> u16 {
     1339
-}
-
-impl IcmpListenerConfig {
-    pub(crate) fn packet_overhead(&self) -> usize {
-        // IPv4 + ICMP, plus the tunnel ID/sequence prefix in unreachable mode.
-        28 + if self.mode == IcmpMode::OnlyUnreachable {
-            4
-        } else {
-            0
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -177,21 +165,10 @@ async fn sender_task(
                 dst.echo_type(matches!(&packet, Packet::Initiating(_)), id, &mut sequence)
             }
             IcmpMode::OnlyEcho => dst.echo_type(true, id, &mut sequence),
-            IcmpMode::OnlyUnreachable => etherparse::Icmpv4Type::Unknown {
-                type_u8: 3,
-                code_u8: 1,
-                bytes5to8: [0; 4],
-            },
         };
 
         buf.clear();
         buf.resize(8, 0);
-        if mode == IcmpMode::OnlyUnreachable {
-            // Tunnel framing inside the ICMP payload, not the reserved header word.
-            buf.extend_from_slice(&id.to_be_bytes());
-            buf.extend_from_slice(&sequence.to_be_bytes());
-            sequence = sequence.wrapping_add(1);
-        }
         if let Err(err) = codec.encode(packet, &mut buf) {
             error!("Failed to encode a packet: {err}");
             continue;
@@ -269,27 +246,13 @@ fn echo_payload(bytes: &[u8], id: u16, mode: IcmpMode) -> Option<(Ipv4Addr, &[u8
     if header.checksum != header.icmp_type.calc_checksum(payload) {
         return None;
     }
-    let payload = match mode {
-        IcmpMode::EchoReply if matches!(icmp[0], 0 | 8) && icmp[1] == 0 => {
-            if u16::from_be_bytes([icmp[4], icmp[5]]) != id {
-                return None;
-            }
-            payload
-        }
-        IcmpMode::OnlyEcho if icmp[0] == 8 && icmp[1] == 0 => {
-            if u16::from_be_bytes([icmp[4], icmp[5]]) != id {
-                return None;
-            }
-            payload
-        }
-        IcmpMode::OnlyUnreachable if icmp[0] == 3 && icmp[1] == 1 => {
-            if payload.len() < 4 || u16::from_be_bytes([payload[0], payload[1]]) != id {
-                return None;
-            }
-            &payload[4..]
-        }
-        _ => return None,
-    };
+    if !matches!(icmp[0], 0 | 8)
+        || icmp[1] != 0
+        || (mode == IcmpMode::OnlyEcho && icmp[0] != 8)
+        || u16::from_be_bytes([icmp[4], icmp[5]]) != id
+    {
+        return None;
+    }
     Some((
         Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15]),
         payload,
@@ -332,12 +295,7 @@ async fn receiver_task<S: PacketSender<IcmpRoute>>(
         }
         let offset = (received[0] as usize & 15) * 4;
         let is_request = received[offset] == 8;
-        let metadata = offset
-            + if mode == IcmpMode::OnlyUnreachable {
-                8
-            } else {
-                4
-            };
+        let metadata = offset + 4;
         let echo_id = u16::from_be_bytes([received[metadata], received[metadata + 1]]);
         let seq = u16::from_be_bytes([received[metadata + 2], received[metadata + 3]]);
         let data_index = match &packet {

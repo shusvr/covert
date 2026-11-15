@@ -204,11 +204,7 @@ fn initiator_requests_increment_and_responder_replies_echo_query_metadata() {
 #[tokio::test]
 #[ignore = "requires an isolated network namespace with CAP_NET_RAW, CAP_NET_ADMIN and nft"]
 async fn request_reply_handshake_and_bidirectional_data() {
-    for mode in [
-        IcmpMode::EchoReply,
-        IcmpMode::OnlyEcho,
-        IcmpMode::OnlyUnreachable,
-    ] {
+    for mode in [IcmpMode::EchoReply, IcmpMode::OnlyEcho] {
         use crate::{
             config::{Interface, ListenerConfig, Peer, PeerTransport},
             crypto::{pk_to_bytes, random_sk, sk_to_bytes},

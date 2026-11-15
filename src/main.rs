@@ -450,10 +450,7 @@ mod tests {
         for (listener, expected) in [
             ("Udp = { udp = {} }", Some(1438)),
             ("Icmp = { icmp = {} }", Some(1438)),
-            (
-                "Icmp = { icmp = { Mode = \"OnlyUnreachable\" } }",
-                Some(1434),
-            ),
+            ("Icmp = { icmp = { Mode = \"OnlyEcho\" } }", Some(1438)),
             ("Ntp = { ntp = {} }", Some(1382)),
             ("Dns = { dns = {} }", None),
         ] {

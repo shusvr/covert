@@ -197,8 +197,7 @@ impl ListenerConfig {
     /// data framing/padding cannot fit, regardless of the configured TUN MTU.
     pub fn suggested_mtu(&self, layout: &PacketLayout) -> Option<usize> {
         let budget = match self {
-            Self::Udp { .. } => 1500 - 28,
-            Self::Icmp { icmp } => 1500 - icmp.packet_overhead(),
+            Self::Udp { .. } | Self::Icmp { .. } => 1500 - 28,
             // IPv4/UDP + NTP header, then a four-byte-aligned extension
             // containing its header and the Covert payload length (8 bytes).
             Self::Ntp { .. } => ((1500 - 28 - 48) & !3usize) - 8,
