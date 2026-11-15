@@ -130,6 +130,7 @@ pub struct Peer {
     pub pre_shared_key: Option<PrivKey>,
     #[serde(rename = "AllowedIPs", deserialize_with = "deserialize_addrs")]
     pub allowed_ips: Vec<IpNet>,
+    #[serde(default)]
     pub transport: PeerTransport,
     #[serde(flatten)]
     pub liveness: LivenessOptions,
@@ -151,17 +152,20 @@ macro_rules! make_listen_peer_cfgs {
             }
         }
 
-        #[derive(Debug, Clone, Deserialize)]
+        #[derive(Debug, Clone, Deserialize, Default)]
         #[serde(rename_all = "PascalCase")]
         pub enum PeerTransport {
-            $($var { $lower: $peer }),*
+            $($var { $lower: $peer }),*,
+            #[default]
+            None,
         }
 
         impl PeerTransport {
             pub fn tag(&self) -> &'static str {
-                match self {$(
-                    Self::$var { .. } => stringify!($lower)
-                ),*}
+                match self {
+                    $( Self::$var { .. } => stringify!($lower) ),*,
+                    Self::None {} => "none",
+                }
             }
 
             $(

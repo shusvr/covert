@@ -16,7 +16,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::mpsc;
-use tracing::{Level, debug, error, info, trace, warn};
+use tracing::{Level, error, info, trace, warn};
 
 #[derive(Parser)]
 #[command(version = env!("COVERT_VERSION"), about)]
@@ -133,7 +133,7 @@ fn read_config(path: &Path) -> anyhow::Result<Arc<Config>> {
     let conf_text = fs::read_to_string(&path).context("failed to read the file")?;
     let mut config = toml::from_str::<Config>(&conf_text).context("invalid config")?;
     config.dev_name = file_name.strip_suffix(".toml").unwrap().to_owned();
-    debug!(?path, "Config: {config:#?}");
+    trace!(?path, "Config: {config:#?}");
 
     let listener_tag = config.interface.listener.tag();
 
@@ -142,7 +142,7 @@ fn read_config(path: &Path) -> anyhow::Result<Arc<Config>> {
         let peer_tag = p.transport.tag();
 
         info!(?p.peer_id, transport=peer_tag, %p.public_key, psk=?&p.pre_shared_key.is_some(), "Peer");
-        if listener_tag != peer_tag {
+        if listener_tag != peer_tag && peer_tag != "none" {
             mismatch = true;
         }
     }

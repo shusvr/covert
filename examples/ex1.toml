@@ -10,4 +10,4 @@ Port = 5551 # Remove ONLY `Port` for default params, keep the table to infer the
 [[Peer]]
 AllowedIPs = "10.111.111.2/32"
 PublicKey = "R5Is9GsHJMrSgwCKMRqku214d6Slt6a9u4RyerJ5kQw="
-[[Peer.Transport.Udp]]
+# [[Peer.Transport.Udp]]
