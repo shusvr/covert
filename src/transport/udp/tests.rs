@@ -645,7 +645,7 @@ async fn background_task_recovers_from_invalid_datagrams_and_sends_keepalive() {
         post_reply(&remote_pk, Some(&[7; 32]), 123, initiation.sender_idx).unwrap();
     // Both an unknown type and a truncated handshake must be discarded, allowing
     // the subsequent valid reply to establish a session and timers to keep running.
-    for malformed in [&[253_u8][..], &[0_u8, 1][..]] {
+    for malformed in [&[][..], &[253_u8][..], &[0_u8, 1][..]] {
         remote
             .sender
             .get_ref()
@@ -823,4 +823,116 @@ async fn batch_sender_keeps_unsent_tail_after_partial_send_and_bad_packet() {
             .is_err(),
         "a successful datagram was resent"
     );
+}
+
+#[tokio::test]
+async fn batch_receiver_preserves_boundaries_sources_and_partial_tail() {
+    use crate::codec::{Data, DataFlags};
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let destination = socket.local_addr().unwrap();
+    let senders = [
+        UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap(),
+        UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap(),
+    ];
+    let sources = [
+        senders[0].local_addr().unwrap(),
+        senders[1].local_addr().unwrap(),
+    ];
+    let layout = PacketLayout {
+        mask: 0x12345678,
+        odp: 80,
+        ..PacketLayout::default()
+    };
+    for bytes in [&[][..], &[253][..], &[0, 1][..]] {
+        senders[0].send_to(bytes, destination).await.unwrap();
+    }
+    let count = BATCH_SIZE * 2 + 7;
+    for index in 0..count {
+        let mut bytes = BytesMut::new();
+        crate::codec::append(
+            &mut bytes,
+            Packet::Data(Data {
+                receiver_idx: index as u32,
+                counter: index as u64,
+                flags: DataFlags::empty(),
+                ciphertext: vec![index as u8; index % 20],
+            }),
+            &layout,
+        )
+        .unwrap();
+        senders[index % 2]
+            .send_to(&bytes, destination)
+            .await
+            .unwrap();
+    }
+    let mut batch: Vec<_> = (0..BATCH_SIZE).map(|_| ReceivedDatagram::new()).collect();
+    let mut received = 0;
+    while received < count + 3 {
+        let n = timeout(
+            Duration::from_secs(3),
+            socket.async_io(tokio::io::Interest::READABLE, || {
+                try_receive_batch(&socket, &mut batch)
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(n > 0 && n <= BATCH_SIZE);
+        #[cfg(target_os = "linux")]
+        if received == 0 {
+            assert_eq!(n, BATCH_SIZE);
+        }
+        for packet in &batch[..n] {
+            assert!(!packet.truncated);
+            let decoded = crate::codec::parse_slice(&packet.bytes[..packet.len], &layout);
+            if received < 3 {
+                assert!(!matches!(decoded, Some(Ok(_))));
+            } else {
+                let index = received - 3;
+                assert_eq!(packet.address, sources[index % 2]);
+                let Some(Ok((Packet::Data(data), consumed))) = decoded else {
+                    panic!("expected data");
+                };
+                assert_eq!(consumed, packet.len);
+                assert_eq!(data.receiver_idx, index as u32);
+                assert_eq!(data.counter, index as u64);
+                assert_eq!(data.ciphertext, vec![index as u8; index % 20]);
+            }
+            received += 1;
+        }
+    }
+    assert_eq!(
+        try_receive_batch(&socket, &mut batch).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[tokio::test]
+async fn batch_receiver_reports_truncation_and_reuses_buffers_for_large_and_small_packets() {
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let mut batch = vec![ReceivedDatagram::new()];
+    batch[0].bytes.truncate(128);
+    for size in [512, 65507, 5, 0] {
+        let bytes = vec![42; size];
+        sender
+            .send_to(&bytes, socket.local_addr().unwrap())
+            .await
+            .unwrap();
+        let n = timeout(
+            Duration::from_secs(3),
+            socket.async_io(tokio::io::Interest::READABLE, || {
+                try_receive_batch(&socket, &mut batch)
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(batch[0].address, sender.local_addr().unwrap());
+        assert_eq!(batch[0].truncated, size == 512);
+        assert_eq!(batch[0].len, size.min(batch[0].bytes.len()));
+        assert_eq!(&batch[0].bytes[..batch[0].len], &bytes[..batch[0].len]);
+        batch[0].bytes.resize(MAX_DATAGRAM_SIZE, 0);
+    }
 }

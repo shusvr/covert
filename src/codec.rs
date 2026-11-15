@@ -319,6 +319,20 @@ pub enum Error {
 
 /// Consumes one complete packet, leaving incomplete or invalid input untouched.
 pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet, Error>> {
+    match parse_slice(buf, layout)? {
+        Ok((packet, consumed)) => {
+            buf.advance(consumed);
+            Some(Ok(packet))
+        }
+        Err(err) => Some(Err(err)),
+    }
+}
+
+/// Parses a borrowed packet without copying the encoded header or advancing a buffer.
+pub(crate) fn parse_slice(
+    buf: &[u8],
+    layout: &PacketLayout,
+) -> Option<Result<(Packet, usize), Error>> {
     if buf.len() < layout.oty + 1 {
         return None;
     }
@@ -342,8 +356,7 @@ pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet,
             if buf.len() < consumed {
                 return None;
             }
-            buf.advance(consumed);
-            return Some(Ok(packet));
+            return Some(Ok((packet, consumed)));
         }
         // reply
         1 => {
@@ -360,8 +373,7 @@ pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet,
             if buf.len() < consumed {
                 return None;
             }
-            buf.advance(consumed);
-            return Some(Ok(packet));
+            return Some(Ok((packet, consumed)));
         }
         // data
         2 => {
@@ -382,14 +394,16 @@ pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet,
                 return None;
             }
             let data = buf[layout.odd..end].to_vec();
-            buf.advance(consumed);
 
-            return Some(Ok(Packet::Data(Data {
-                receiver_idx,
-                flags,
-                counter,
-                ciphertext: data,
-            })));
+            return Some(Ok((
+                Packet::Data(Data {
+                    receiver_idx,
+                    flags,
+                    counter,
+                    ciphertext: data,
+                }),
+                consumed,
+            )));
         }
         _ => return Some(Err(Error::UnexpectedTy(ty))),
     }

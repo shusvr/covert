@@ -1,6 +1,6 @@
 use crate::{
     Result,
-    codec::{self, Codec, Packet, PacketLayout},
+    codec::{self, Packet, PacketLayout},
     config::Config,
     transport::{Endpoint, PacketSender, State, maintain_peers, process_packet},
 };
@@ -14,9 +14,10 @@ use std::{
     sync::Arc,
 };
 use tokio::{net::UdpSocket, task::JoinSet};
-use tokio_util::udp::UdpFramed;
 use tracing::{error, trace};
 use uuid::Uuid;
+#[cfg(test)]
+use {crate::codec::Codec, tokio_util::udp::UdpFramed};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -78,7 +79,7 @@ async fn socket_listener_task<S: PacketSender<UdpRoute> + Clone + Send + 'static
     recv: mpsc::Receiver<(Packet, UdpRoute)>,
     mut sender: S,
 ) {
-    let mut framed = UdpFramed::new(socket.clone(), Codec::new(config.layout));
+    let mut incoming: Vec<_> = (0..BATCH_SIZE).map(|_| ReceivedDatagram::new()).collect();
 
     // Dropping the receive task also stops its independent maintenance task.
     let mut maintenance = JoinSet::new();
@@ -89,31 +90,36 @@ async fn socket_listener_task<S: PacketSender<UdpRoute> + Clone + Send + 'static
         routing.clone(),
         sender.clone(),
     ));
-    loop {
+    'receive: loop {
         tokio::select! {
             _ = state.tun_in_tx.closed() => break,
             result = maintenance.join_next() => {
                 error!(?result, "UDP worker exited; stopping endpoint");
                 break;
             }
-            result = framed.next() => {
-                match result {
-                    Some(Ok((packet, addr))) => {
-                        trace!(?addr, "Received a packet on udp socket");
-
-                        match process_packet(&state, &config, packet, addr, &routing, &mut sender).await {
-                            Ok(true) => {},
-                            Ok(false) => break,
-                            Err(err) => error!("Failed to process incoming packet: {err}"),
-                        }
+            result = socket.async_io(tokio::io::Interest::READABLE, || try_receive_batch(&socket, &mut incoming)) => {
+                let count = match result {
+                    Ok(count) => count,
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(err) => { error!("Failed to receive UDP batch: {err}"); break; }
+                };
+                trace!(packets = count, "Received UDP batch");
+                for datagram in &incoming[..count] {
+                    let addr = datagram.address;
+                    if datagram.truncated {
+                        trace!(%addr, "Discarding truncated UDP datagram");
+                        continue;
                     }
-                    Some(Err(err)) => {
-                        // UdpFramed retains a datagram when decode_eof returns an error.
-                        // Discard it so the next poll can receive a new datagram.
-                        framed.read_buffer_mut().clear();
-                        error!("Failed to parse the packet on udp socket: {err}");
+                    let packet = match codec::parse_slice(&datagram.bytes[..datagram.len], &config.layout) {
+                        Some(Ok((packet, consumed))) if consumed == datagram.len => packet,
+                        Some(Err(err)) => { trace!(%addr, %err, "Discarding malformed UDP datagram"); continue; }
+                        _ => { trace!(%addr, "Discarding incomplete UDP datagram or trailing data"); continue; }
+                    };
+                    match process_packet(&state, &config, packet, addr, &routing, &mut sender).await {
+                        Ok(true) => {},
+                        Ok(false) => break 'receive,
+                        Err(err) => error!("Failed to process incoming packet: {err}"),
                     }
-                    None => break,
                 }
             }
         }
@@ -121,6 +127,124 @@ async fn socket_listener_task<S: PacketSender<UdpRoute> + Clone + Send + 'static
 }
 
 const BATCH_SIZE: usize = 64;
+
+const MAX_DATAGRAM_SIZE: usize = 65535;
+
+struct ReceivedDatagram {
+    bytes: BytesMut,
+    len: usize,
+    address: SocketAddr,
+    truncated: bool,
+}
+impl ReceivedDatagram {
+    fn new() -> Self {
+        Self {
+            bytes: BytesMut::zeroed(MAX_DATAGRAM_SIZE),
+            len: 0,
+            address: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            truncated: false,
+        }
+    }
+}
+
+fn try_receive_batch(socket: &UdpSocket, batch: &mut [ReceivedDatagram]) -> io::Result<usize> {
+    use std::os::fd::AsRawFd;
+    if batch.is_empty() {
+        return Ok(0);
+    }
+    debug_assert!(batch.len() <= BATCH_SIZE);
+    // The syscall fills storage and packet bytes. All allocations are fully
+    // initialized, stationary, and exclusively borrowed until it returns.
+    let mut addresses: Vec<libc::sockaddr_storage> = batch
+        .iter()
+        .map(|_| unsafe { std::mem::zeroed() })
+        .collect();
+    let mut vectors: Vec<_> = batch
+        .iter_mut()
+        .map(|datagram| libc::iovec {
+            iov_base: datagram.bytes.as_mut_ptr().cast(),
+            iov_len: datagram.bytes.len(),
+        })
+        .collect();
+    let mut messages: Vec<libc::msghdr> = batch
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
+            header.msg_name = (&mut addresses[index] as *mut libc::sockaddr_storage).cast();
+            header.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as _;
+            header.msg_iov = &mut vectors[index];
+            header.msg_iovlen = 1;
+            header
+        })
+        .collect();
+    #[cfg(target_os = "linux")]
+    let (count, lengths) = {
+        let mut multi: Vec<_> = messages
+            .iter()
+            .map(|header| libc::mmsghdr {
+                msg_hdr: *header,
+                msg_len: 0,
+            })
+            .collect();
+        // MSG_DONTWAIT drains only available datagrams; no timeout or fill delay.
+        let count = unsafe {
+            libc::recvmmsg(
+                socket.as_raw_fd(),
+                multi.as_mut_ptr(),
+                multi.len() as _,
+                libc::MSG_DONTWAIT,
+                std::ptr::null_mut(),
+            )
+        };
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let count = count as usize;
+        let lengths: Vec<_> = multi[..count]
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                messages[index] = message.msg_hdr;
+                message.msg_len as usize
+            })
+            .collect();
+        (count, lengths)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (count, lengths) = {
+        let len =
+            unsafe { libc::recvmsg(socket.as_raw_fd(), &mut messages[0], libc::MSG_DONTWAIT) };
+        if len < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        (1, vec![len as usize])
+    };
+    for index in 0..count {
+        let header = &messages[index];
+        let size = header.msg_namelen as usize;
+        if size > std::mem::size_of::<libc::sockaddr_storage>() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid UDP source address length",
+            ));
+        }
+        // The kernel initialized msg_namelen bytes as a socket address in storage.
+        let mut storage = socket2::SockAddrStorage::zeroed();
+        // The platform sockaddr_storage layout is supported by SockAddrStorage.
+        unsafe {
+            *storage.view_as::<libc::sockaddr_storage>() = addresses[index];
+        }
+        let address = unsafe { socket2::SockAddr::new(storage, header.msg_namelen) };
+        batch[index].address = address.as_socket().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid UDP source address")
+        })?;
+        batch[index].len = lengths[index].min(batch[index].bytes.len());
+        batch[index].truncated =
+            header.msg_flags & libc::MSG_TRUNC != 0 || lengths[index] > batch[index].bytes.len();
+    }
+    Ok(count)
+}
 
 struct Datagram {
     bytes: BytesMut,
