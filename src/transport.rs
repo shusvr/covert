@@ -134,6 +134,7 @@ impl State {
     }
 }
 
+pub mod dns;
 pub mod icmp;
 pub mod ntp;
 pub mod udp;

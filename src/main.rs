@@ -142,6 +142,17 @@ fn read_config(path: &Path) -> anyhow::Result<Arc<Config>> {
         let peer_tag = p.transport.tag();
 
         info!(?p.peer_id, transport=peer_tag, %p.public_key, psk=?&p.pre_shared_key.is_some(), "Peer");
+        let liveness = p.liveness.unpack_with_fallback(&config.interface.liveness);
+        let twice_keepalive = (u64::from(liveness.ka_delay) + u64::from(liveness.ka_jitter)) * 2;
+        if liveness.timeout != 0 && liveness.timeout < twice_keepalive {
+            warn!(
+                peer_id = ?p.peer_id,
+                keepalive = liveness.ka_delay,
+                keepalive_jitter = liveness.ka_jitter,
+                timeout = liveness.timeout,
+                "Peer timeout is less than twice the maximum configured keepalive interval"
+            );
+        }
         if listener_tag != peer_tag && peer_tag != "none" {
             mismatch = true;
         }
@@ -241,6 +252,10 @@ async fn serve(tun: &tun::AsyncDevice, config: &Arc<Config>, chanlen: Option<u16
         ListenerConfig::Udp { udp } => {
             let endpoint =
                 covert::transport::udp::create_udp_endpoint(&state, &config, udp).await?;
+            run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
+        }
+        ListenerConfig::Dns { dns } => {
+            let endpoint = covert::transport::dns::create_dns_endpoint(&state, config, dns).await?;
             run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
         }
         ListenerConfig::Ntp { ntp } => {

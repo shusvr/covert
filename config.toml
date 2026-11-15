@@ -116,6 +116,24 @@ Port = 40676
 # Allow up to 87 bytes for IPv4/UDP/NTP/extension framing and alignment.
 # Configured packet-layout padding applies inside the NTP extension.
 
+# DNS alternative: replace the listener table with:
+# [Interface.Listener.Dns.dns]
+# Port = 53               # Default 53; use 0 for an ephemeral client source port.
+# Domain = "tunnel.example" # Same suffix on both ends, default tunnel.example.
+# PollInterval = 1        # Seconds between idle client polls; must be > 0.
+# Known endpoints initiate TXT IN queries. Responders echo the question and DNS
+# ID in authoritative TXT answers (TTL 0), one response per query. Both advertise
+# standard EDNS(0) UDP size 1232. Query data uses base32 labels; answers use base64
+# TXT strings. Domain names and labels obey the DNS size limits. Large encrypted
+# packets (including layout padding) are fragmented and reassembled, with bounded
+# queues and a 10-second reassembly lifetime. Clients poll to retrieve server data.
+# Lost queries/replies are retried up to five times; responders cache answers so
+# retries receive the same fragment. Idle polls carry encrypted keepalives.
+# Direct IPv4 UDP only: point Endpoint at another Covert instance, not a recursive
+# resolver. Domain is a framing suffix, not a request to resolve or register it.
+# This is a custom DNS tunnel: high query rates/encoded names remain recognizable.
+# Port 53 may require privileges and must not be occupied by another DNS service.
+
 # Optional peer list; omit all [[Peer]] sections for an empty list.
 # Repeat this section for additional peers. Every peer's transport must match
 # the interface listener, and its tunnel address must be distinct from ours.
@@ -157,3 +175,7 @@ Endpoint = "192.0.2.2:40676"
 # NTP peer alternative (numeric IPv4:port; omit Endpoint on the responder):
 # [Peer.Transport.Ntp.ntp]
 # Endpoint = "192.0.2.2:123"
+
+# DNS peer alternative (omit Endpoint on the responder):
+# [Peer.Transport.Dns.dns]
+# Endpoint = "192.0.2.2:53"

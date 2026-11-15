@@ -147,7 +147,8 @@ impl FromStr for PacketLayout {
 
 impl PacketLayout {
     pub fn random() -> Self {
-        const MAX_PADDING: usize = 16;
+        // Keep shuffled headers compact: at most four unused bytes per gap.
+        const MAX_PADDING: usize = 4;
 
         fn offsets<const N: usize>(oty: usize, sizes: [usize; N]) -> ([usize; N], usize) {
             let mut order = std::array::from_fn::<_, N, _>(|i| i);
@@ -531,6 +532,9 @@ mod tests {
         for _ in 0..1024 {
             let layout = PacketLayout::random();
             assert!(layout.check().is_ok(), "{layout:?}");
+            assert!(layout.ilen() <= 130, "sparse initiation: {layout:?}");
+            assert!(layout.rlen() <= 60, "sparse reply: {layout:?}");
+            assert!(layout.odd <= 44, "sparse data header: {layout:?}");
         }
     }
 
