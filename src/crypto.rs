@@ -7,6 +7,7 @@ use aws_lc_rs::{
         self as ka, EphemeralPrivateKey, ParsedPublicKey, PrivateKey, PublicKey, UnparsedPublicKey,
         X25519,
     },
+    digest::{Context as DigestContext, SHA256},
     encoding::{AsBigEndian, Curve25519SeedBin},
     error::Unspecified,
     hkdf::{self, HKDF_SHA256},
@@ -45,6 +46,18 @@ pub struct Initiating {
     pub(crate) ephemeral: Key,
 }
 
+// Hash canonical fields rather than layout bytes, masks or random padding.
+// The encrypted timestamp authenticates itself through its existing AEAD tag,
+// so it must not be included in its own AAD (which would be circular).
+fn initiation_aad(ephemeral: &Key, enc_pub_key: &SealedKey, sender_idx: u32) -> [u8; 32] {
+    let mut hash = DigestContext::new(&SHA256);
+    hash.update(b"covert-initiation-v1");
+    hash.update(ephemeral);
+    hash.update(enc_pub_key);
+    hash.update(&sender_idx.to_be_bytes());
+    hash.finish().as_ref().try_into().unwrap()
+}
+
 pub fn initiate(
     local_sk: &Key,
     remote_pk: &Key,
@@ -74,13 +87,14 @@ pub fn initiate(
     )?;
     inout[32..].copy_from_slice(tag.as_ref());
 
+    let aad = initiation_aad(&pk_to_bytes(&epk), &inout, sender_idx);
     let mut enc_ts = [0; 24];
     enc_ts[..8].copy_from_slice(&timestamp.to_be_bytes());
     let mut nonce = [0; 12];
     nonce[11] = 1;
     let tag = aes.seal_in_place_separate_tag(
         Nonce::assume_unique_for_key(nonce),
-        Aad::from(&inout),
+        Aad::from(&aad),
         &mut enc_ts[..8],
     )?;
     enc_ts[8..].copy_from_slice(tag.as_ref());
@@ -93,13 +107,15 @@ pub fn initiate(
     })
 }
 
-pub fn pre_reply(
-    local_sk: &Key,
-    mut enc_pub_key: SealedKey,
-    ephemeral: Key,
-    mut enc_ts: SealedTimestamp,
-) -> Result<(Key, u64), Unspecified> {
+pub fn pre_reply(local_sk: &Key, initiating: &Initiating) -> Result<(Key, u64), Unspecified> {
     let local_sk = to_sk(local_sk);
+    let Initiating {
+        mut enc_pub_key,
+        ephemeral,
+        mut enc_ts,
+        sender_idx,
+    } = *initiating;
+    let aad = initiation_aad(&ephemeral, &enc_pub_key, sender_idx);
     let remote_epk = to_pk(&ephemeral);
 
     let salt = hkdf::Salt::none(HKDF_SHA256);
@@ -116,7 +132,7 @@ pub fn pre_reply(
     nonce[11] = 1;
     let timestamp = cipher.open_in_place(
         Nonce::assume_unique_for_key(nonce),
-        Aad::from(&enc_pub_key),
+        Aad::from(&aad),
         &mut enc_ts,
     )?;
     let timestamp = u64::from_be_bytes(timestamp.try_into().map_err(|_| Unspecified)?);

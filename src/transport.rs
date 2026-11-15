@@ -283,12 +283,7 @@ async fn process_incoming(
                 remote_idx = initiating.sender_idx,
                 "Handshake initiation received"
             );
-            let (remote_pk, timestamp) = pre_reply(
-                &config.interface.private_key.0,
-                initiating.enc_pub_key,
-                initiating.ephemeral,
-                initiating.enc_ts,
-            )?;
+            let (remote_pk, timestamp) = pre_reply(&config.interface.private_key.0, &initiating)?;
 
             let Some(peer) = config
                 .peers

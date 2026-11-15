@@ -95,13 +95,7 @@ async fn generic_send_only_sink_registers_handshake_and_rolls_back_on_failure() 
                     };
                     // A synchronous reply must be able to find this pending session.
                     assert!(state.initiated.contains_key(&initiation.sender_idx));
-                    pre_reply(
-                        &remote_sk,
-                        initiation.enc_pub_key,
-                        initiation.ephemeral,
-                        initiation.enc_ts,
-                    )
-                    .unwrap();
+                    pre_reply(&remote_sk, &initiation).unwrap();
                     if fail_send {
                         Err(crate::codec::Error::from(std::io::Error::other(
                             "send failed",
@@ -389,13 +383,7 @@ async fn background_task_retries_peers_with_known_endpoints() {
         state.initiated.get(&initiation.sender_idx).unwrap().peer_id,
         known_peer
     );
-    pre_reply(
-        &sk_to_bytes(&remote_key),
-        initiation.enc_pub_key,
-        initiation.ephemeral,
-        initiation.enc_ts,
-    )
-    .unwrap();
+    pre_reply(&sk_to_bytes(&remote_key), &initiation).unwrap();
     // No response: the background task must retry without any TUN traffic.
     let (packet, _) = timeout(Duration::from_secs(7), receiver.sender.next())
         .await
@@ -646,13 +634,7 @@ async fn background_task_recovers_from_invalid_datagrams_and_sends_keepalive() {
     let Packet::Initiating(initiation) = packet else {
         panic!("expected initiation")
     };
-    let (remote_pk, _) = pre_reply(
-        &sk_to_bytes(&remote_key),
-        initiation.enc_pub_key,
-        initiation.ephemeral,
-        initiation.enc_ts,
-    )
-    .unwrap();
+    let (remote_pk, _) = pre_reply(&sk_to_bytes(&remote_key), &initiation).unwrap();
     let (reply, cipher) =
         post_reply(&remote_pk, Some(&[7; 32]), 123, initiation.sender_idx).unwrap();
     // Both an unknown type and a truncated handshake must be discarded, allowing

@@ -67,8 +67,7 @@ fn test_pre_reply() {
     )
     .unwrap();
 
-    let (pk, timestamp) =
-        pre_reply(&sk_to_bytes(&sk2), i.enc_pub_key, i.ephemeral, i.enc_ts).unwrap();
+    let (pk, timestamp) = pre_reply(&sk_to_bytes(&sk2), &i).unwrap();
     assert_eq!(timestamp, u64::MAX);
     assert_eq!(pk.as_ref(), pk_to_bytes(&sk1.compute_public_key().unwrap()));
 }
@@ -86,13 +85,7 @@ fn test_finish() {
             0,
         )
         .unwrap();
-        let (remote_pk, timestamp) = pre_reply(
-            &sk_to_bytes(&responder),
-            initiation.enc_pub_key,
-            initiation.ephemeral,
-            initiation.enc_ts,
-        )
-        .unwrap();
+        let (remote_pk, timestamp) = pre_reply(&sk_to_bytes(&responder), &initiation).unwrap();
         let (reply, responder_key) =
             post_reply(&remote_pk.as_ref().try_into().unwrap(), psk.as_ref(), 0, 0).unwrap();
         let initiator_key = finish(&local_sk, psk.as_ref(), reply.eph).unwrap();
@@ -136,29 +129,33 @@ fn test_finish() {
 fn test_initiation_rejects_tampering() {
     let initiator = random_sk().unwrap();
     let responder = random_sk().unwrap();
-    for tamper_timestamp in [false, true] {
-        let mut initiation = initiate(
-            &sk_to_bytes(&initiator),
-            &pk_to_bytes(&responder.compute_public_key().unwrap()),
-            123,
-            0,
-        )
-        .unwrap();
-        if tamper_timestamp {
-            initiation.enc_ts[0] ^= 1;
-        } else {
-            initiation.enc_pub_key[0] ^= 1;
+    let initiation = initiate(
+        &sk_to_bytes(&initiator),
+        &pk_to_bytes(&responder.compute_public_key().unwrap()),
+        123,
+        0x12345678,
+    )
+    .unwrap();
+    // Every byte of every field must be authenticated, including sender index
+    // (previously mutable without invalidating the timestamp tag).
+    for field in 0..4 {
+        let len = [32, 48, 24, 4][field];
+        for byte in 0..len {
+            let mut tampered = initiation.clone();
+            match field {
+                0 => tampered.ephemeral[byte] ^= 1,
+                1 => tampered.enc_pub_key[byte] ^= 1,
+                2 => tampered.enc_ts[byte] ^= 1,
+                3 => tampered.sender_idx ^= 1 << (byte * 8),
+                _ => unreachable!(),
+            }
+            assert!(
+                pre_reply(&sk_to_bytes(&responder), &tampered).is_err(),
+                "accepted tampered field {field}, byte {byte}"
+            );
         }
-        assert!(
-            pre_reply(
-                &sk_to_bytes(&responder),
-                initiation.enc_pub_key,
-                initiation.ephemeral,
-                initiation.enc_ts
-            )
-            .is_err()
-        );
     }
+    assert!(pre_reply(&sk_to_bytes(&responder), &initiation).is_ok());
 }
 
 #[test]

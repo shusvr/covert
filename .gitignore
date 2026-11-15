@@ -1,2 +1,5 @@
 /target
 .env
+captures/
+report.md
+scripts/publish.sh
