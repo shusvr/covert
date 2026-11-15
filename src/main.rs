@@ -323,6 +323,12 @@ async fn serve(
                     covert::transport::udp::create_udp_endpoint(&state, &config, udp).await?;
                 run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
             }
+            ListenerConfig::Webrtc { webrtc } => {
+                let endpoint =
+                    covert::transport::webrtc::create_webrtc_endpoint(&state, config, webrtc)
+                        .await?;
+                run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
+            }
             ListenerConfig::Dns { dns } => {
                 let endpoint =
                     covert::transport::dns::create_dns_endpoint(&state, config, dns).await?;

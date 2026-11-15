@@ -119,6 +119,13 @@ Port = 40676
 # Allow up to 87 bytes for IPv4/UDP/NTP/extension framing and alignment.
 # Configured packet-layout padding applies inside the NTP extension.
 
+# WebRTC alternative: genuine unordered ICE/DTLS/SCTP data channel.
+# [Interface.Listener.Webrtc.webrtc]
+# Port = 40676           # TCP SDP signaling port, default 40676.
+# IceServers = []        # Optional STUN URLs; default no external servers.
+# ICE negotiates separate UDP ports: allow those through the firewall too.
+# Larger padded messages are fragmented by SCTP. See docs/webrtc.md.
+
 # DNS alternative: replace the listener table with:
 # [Interface.Listener.Dns.dns]
 # Port = 53               # Default 53; use 0 for an ephemeral client source port.
@@ -182,3 +189,7 @@ Endpoint = "192.0.2.2:40676"
 # DNS peer alternative (omit Endpoint on the responder):
 # [Peer.Transport.Dns.dns]
 # Endpoint = "192.0.2.2:53"
+
+# WebRTC peer alternative (Endpoint is the remote TCP signaling address):
+# [Peer.Transport.Webrtc.webrtc]
+# Endpoint = "192.0.2.1:40676" # Optional; omit on the answering peer.

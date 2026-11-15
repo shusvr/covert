@@ -231,6 +231,7 @@ pub mod dns;
 pub mod icmp;
 pub mod ntp;
 pub mod udp;
+pub mod webrtc;
 
 pub struct Endpoint<S, R> {
     pub sender: S,

@@ -5,6 +5,7 @@ use crate::{
         icmp::{IcmpListenerConfig, IcmpTransportPeerConfig},
         ntp::{NtpListenerConfig, NtpTransportPeerConfig},
         udp::{UdpListenerConfig, UdpTransportPeerConfig},
+        webrtc::{WebrtcListenerConfig, WebrtcTransportPeerConfig},
     },
 };
 use base64::prelude::*;
@@ -187,6 +188,7 @@ make_listen_peer_cfgs!(
     Icmp, icmp, IcmpListenerConfig, IcmpTransportPeerConfig;
     Ntp, ntp, NtpListenerConfig, NtpTransportPeerConfig;
     Dns, dns, DnsListenerConfig, DnsTransportPeerConfig;
+    Webrtc, webrtc, WebrtcListenerConfig, WebrtcTransportPeerConfig;
 );
 
 impl ListenerConfig {
@@ -200,7 +202,7 @@ impl ListenerConfig {
             // IPv4/UDP + NTP header, then a four-byte-aligned extension
             // containing its header and the Covert payload length (8 bytes).
             Self::Ntp { .. } => ((1500 - 28 - 48) & !3usize) - 8,
-            Self::Dns { .. } => return None,
+            Self::Dns { .. } | Self::Webrtc { .. } => return None,
         };
         if layout.odp > budget {
             return Some(0);
