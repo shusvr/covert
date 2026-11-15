@@ -45,7 +45,7 @@ async fn handshake_data_roles_and_reply_correlation() {
                 },
             },
             peers: vec![Peer {
-                peer_id: Uuid::new_v4(),
+                id: Uuid::new_v4(),
                 public_key: pk,
                 pre_shared_key: None,
                 allowed_ips: vec![],
@@ -126,8 +126,8 @@ async fn handshake_data_roles_and_reply_correlation() {
     .await
     .unwrap();
     timeout(Duration::from_secs(6), async {
-        while !a_state.has_live_connection(a_config.peers[0].peer_id)
-            || !b_state.has_live_connection(b_config.peers[0].peer_id)
+        while !a_state.has_live_connection(a_config.peers[0].id)
+            || !b_state.has_live_connection(b_config.peers[0].id)
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -137,54 +137,33 @@ async fn handshake_data_roles_and_reply_correlation() {
     assert!(
         !a_endpoint
             .routing
-            .get(&a_config.peers[0].peer_id)
+            .get(&a_config.peers[0].id)
             .unwrap()
             .server
     );
     assert!(
         b_endpoint
             .routing
-            .get(&b_config.peers[0].peer_id)
+            .get(&b_config.peers[0].id)
             .unwrap()
             .server
     );
     // Polls must refresh authenticated activity on both sides while idle.
-    let a_index = *a_state
-        .peering
-        .get(&a_config.peers[0].peer_id)
-        .unwrap()
-        .value();
-    let b_index = *b_state
-        .peering
-        .get(&b_config.peers[0].peer_id)
-        .unwrap()
-        .value();
+    let a_index = *a_state.peering.get(&a_config.peers[0].id).unwrap().value();
+    let b_index = *b_state.peering.get(&b_config.peers[0].id).unwrap().value();
     tokio::time::sleep(Duration::from_secs(9)).await;
-    assert!(a_state.has_live_connection(a_config.peers[0].peer_id));
-    assert!(b_state.has_live_connection(b_config.peers[0].peer_id));
+    assert!(a_state.has_live_connection(a_config.peers[0].id));
+    assert!(b_state.has_live_connection(b_config.peers[0].id));
     assert_eq!(
-        *a_state
-            .peering
-            .get(&a_config.peers[0].peer_id)
-            .unwrap()
-            .value(),
+        *a_state.peering.get(&a_config.peers[0].id).unwrap().value(),
         a_index
     );
     assert_eq!(
-        *b_state
-            .peering
-            .get(&b_config.peers[0].peer_id)
-            .unwrap()
-            .value(),
+        *b_state.peering.get(&b_config.peers[0].id).unwrap().value(),
         b_index
     );
     a_endpoint
-        .trasmit(
-            &a_state,
-            &a_config,
-            a_config.peers[0].peer_id,
-            b"client data",
-        )
+        .trasmit(&a_state, &a_config, a_config.peers[0].id, b"client data")
         .await
         .unwrap();
     assert_eq!(
@@ -195,12 +174,7 @@ async fn handshake_data_roles_and_reply_correlation() {
         b"client data"
     );
     b_endpoint
-        .trasmit(
-            &b_state,
-            &b_config,
-            b_config.peers[0].peer_id,
-            b"server data",
-        )
+        .trasmit(&b_state, &b_config, b_config.peers[0].id, b"server data")
         .await
         .unwrap();
     assert_eq!(

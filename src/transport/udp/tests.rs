@@ -27,7 +27,7 @@ fn config(local_sk: crate::Key, remote_pk: crate::Key, endpoint: SocketAddr) -> 
         },
         peers: vec![Peer {
             liveness: Default::default(),
-            peer_id: Uuid::new_v4(),
+            id: Uuid::new_v4(),
             public_key: remote_pk.into(),
             pre_shared_key: Some([7; 32].into()),
             allowed_ips: vec![],
@@ -75,7 +75,7 @@ async fn generic_send_only_sink_registers_handshake_and_rolls_back_on_failure() 
             pk_to_bytes(&remote_key.compute_public_key().unwrap()),
             "127.0.0.1:1234".parse().unwrap(),
         );
-        let peer_id = config.peers[0].peer_id;
+        let peer_id = config.peers[0].id;
         let (tx, _rx) = mpsc::channel(4);
         let state = Arc::new(State::new(tx));
         let routing: DashMap<_, _> = [(peer_id, String::from("test-route"))]
@@ -191,7 +191,7 @@ async fn expired_session_queues_traffic_and_reinitiates() {
         pk_to_bytes(&remote_key.compute_public_key().unwrap()),
         remote.local_addr().unwrap(),
     );
-    let peer_id = config.peers[0].peer_id;
+    let peer_id = config.peers[0].id;
     let (tx, _rx) = mpsc::channel(4);
     let state = State::new(tx);
     let (cipher, _) = session_ciphers();
@@ -248,7 +248,7 @@ async fn received_keepalive_refreshes_session_and_invalid_data_removes_it() {
         pk_to_bytes(&remote_key.compute_public_key().unwrap()),
         from,
     );
-    let peer_id = config.peers[0].peer_id;
+    let peer_id = config.peers[0].id;
     let (tx, mut rx) = mpsc::channel(4);
     let state = Arc::new(State::new(tx));
     let (sender, receiver) = session_ciphers();
@@ -363,9 +363,9 @@ async fn background_task_retries_peers_with_known_endpoints() {
         pk_to_bytes(&remote_key.compute_public_key().unwrap()),
         socket.local_addr().unwrap(),
     );
-    let known_peer = config.peers[0].peer_id;
+    let known_peer = config.peers[0].id;
     let mut unknown = config.peers[0].clone();
-    unknown.peer_id = Uuid::new_v4();
+    unknown.id = Uuid::new_v4();
     unknown.transport = PeerTransport::Udp {
         udp: UdpTransportPeerConfig { endpoint: None },
     };
@@ -431,8 +431,8 @@ async fn handshake_and_bidirectional_data_use_local_and_remote_indexes() {
         pk_to_bytes(&key_a.compute_public_key().unwrap()),
         socket_a.local_addr().unwrap(),
     );
-    let peer_a = config_a.peers[0].peer_id;
-    let peer_b = config_b.peers[0].peer_id;
+    let peer_a = config_a.peers[0].id;
+    let peer_b = config_b.peers[0].id;
     let (tx_a, mut rx_a) = mpsc::channel(4);
     let (tx_b, mut rx_b) = mpsc::channel(4);
     let state_a = Arc::new(State::new(tx_a));
@@ -690,7 +690,7 @@ async fn maintenance_initiates_without_a_socket_and_stops_when_tun_closes() {
         pk_to_bytes(&remote.compute_public_key().unwrap()),
         "127.0.0.1:1234".parse().unwrap(),
     ));
-    let peer_id = config.peers[0].peer_id;
+    let peer_id = config.peers[0].id;
     let (tun_tx, tun_rx) = mpsc::channel(1);
     let state = Arc::new(State::new(tun_tx));
     let routing = Arc::new(

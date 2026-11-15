@@ -52,7 +52,7 @@ pub async fn create_udp_endpoint(
         config
             .peers
             .iter()
-            .filter_map(|p| p.transport.udp()?.endpoint.map(|e| (p.peer_id, e)))
+            .filter_map(|p| p.transport.udp()?.endpoint.map(|e| (p.id, e)))
             .collect::<DashMap<_, _>>(),
     );
     let (sender, recv) = mpsc::channel(512);

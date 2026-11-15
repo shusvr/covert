@@ -425,7 +425,7 @@ pub async fn create_dns_endpoint(
                 .into());
             }
             routes.insert(
-                peer.peer_id,
+                peer.id,
                 DnsRoute {
                     address,
                     server: false,

@@ -115,7 +115,7 @@ pub async fn create_icmp_endpoint(
                 p.transport
                     .icmp()?
                     .endpoint
-                    .map(|e| (p.peer_id, IcmpRoute::request(e)))
+                    .map(|e| (p.id, IcmpRoute::request(e)))
             })
             .collect::<DashMap<_, _>>(),
     );

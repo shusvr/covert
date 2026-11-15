@@ -126,8 +126,8 @@ fn deserialize_hooks<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<String>, D:
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Peer {
-    #[serde(skip, default = "random_uuid")]
-    pub peer_id: Uuid,
+    #[serde(default = "random_uuid")]
+    pub id: Uuid,
     pub public_key: PubKey,
     pub pre_shared_key: Option<PrivKey>,
     #[serde(rename = "AllowedIPs", deserialize_with = "deserialize_addrs")]

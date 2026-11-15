@@ -184,7 +184,7 @@ pub async fn create_ntp_endpoint(
                 .into());
             }
             routes.insert(
-                peer.peer_id,
+                peer.id,
                 NtpRoute {
                     address,
                     server: false,

@@ -167,12 +167,12 @@ fn read_config(path: &Path) -> anyhow::Result<Arc<Config>> {
     for p in &config.peers {
         let peer_tag = p.transport.tag();
 
-        info!(?p.peer_id, transport=peer_tag, %p.public_key, psk=?&p.pre_shared_key.is_some(), "Peer");
+        info!(peer_id=?p.id, transport=peer_tag, %p.public_key, psk=?&p.pre_shared_key.is_some(), "Peer");
         let liveness = p.liveness.unpack_with_fallback(&config.interface.liveness);
         let twice_keepalive = (u64::from(liveness.ka_delay) + u64::from(liveness.ka_jitter)) * 2;
         if liveness.timeout != 0 && liveness.timeout < twice_keepalive {
             warn!(
-                peer_id = ?p.peer_id,
+                peer_id = ?p.id,
                 keepalive = liveness.ka_delay,
                 keepalive_jitter = liveness.ka_jitter,
                 timeout = liveness.timeout,
@@ -355,7 +355,7 @@ async fn process_tun_packet<S: PacketSender<R>, R: Clone>(
 
     for p in config.peers.iter() {
         if p.allowed_ips.iter().any(|x| x.contains(&dst)) {
-            if let Err(err) = listener.trasmit(state, config, p.peer_id, packet).await {
+            if let Err(err) = listener.trasmit(state, config, p.id, packet).await {
                 error!("Failed to transmit: {err}");
             }
         }

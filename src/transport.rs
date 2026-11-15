@@ -206,10 +206,10 @@ async fn process_incoming(
                 return Ok(None);
             };
 
-            debug!(peer_id = ?peer.peer_id, remote_idx = initiating.sender_idx, timestamp, "Handshake initiation accepted");
+            debug!(peer_id = ?peer.id, remote_idx = initiating.sender_idx, timestamp, "Handshake initiation accepted");
 
             // Established sessions are indexed by our own index, not the sender's.
-            let local_idx = state.peering.get(&peer.peer_id).map(|entry| *entry.value());
+            let local_idx = state.peering.get(&peer.id).map(|entry| *entry.value());
             if let Some(existing) = local_idx.and_then(|index| state.established.get(&index))
                 && existing.timestamp >= timestamp
             {
@@ -228,13 +228,8 @@ async fn process_incoming(
             let liveness = peer
                 .liveness
                 .unpack_with_fallback(&config.interface.liveness);
-            let handle = PeerHandle::new(
-                peer.peer_id,
-                initiating.sender_idx,
-                cipher,
-                timestamp,
-                liveness,
-            );
+            let handle =
+                PeerHandle::new(peer.id, initiating.sender_idx, cipher, timestamp, liveness);
             ProcessResult::Established {
                 local_idx: sender_idx,
                 replying: Some(replying),
@@ -276,7 +271,7 @@ async fn process_incoming(
             let peer = config
                 .peers
                 .iter()
-                .find(|p| p.peer_id == initiated.peer_id)
+                .find(|p| p.id == initiated.peer_id)
                 .unwrap();
             let liveness = peer
                 .liveness
@@ -368,7 +363,7 @@ pub async fn initiate<R: Clone>(
         return Ok(());
     }
 
-    if let Some(peer) = config.peers.iter().find(|p| p.peer_id == peer_id) {
+    if let Some(peer) = config.peers.iter().find(|p| p.id == peer_id) {
         let timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -487,9 +482,9 @@ async fn initiate_disconnected_peers<R: Clone>(
         .initiated
         .retain(|_, pending| pending.when.elapsed() < Duration::from_secs(60));
     for peer in &config.peers {
-        if routing.contains_key(&peer.peer_id) && !state.has_live_connection(peer.peer_id) {
-            if let Err(err) = initiate(state, config, routing, &mut *sender, peer.peer_id).await {
-                error!(peer_id = ?peer.peer_id, "Failed to initiate handshake: {err}");
+        if routing.contains_key(&peer.id) && !state.has_live_connection(peer.id) {
+            if let Err(err) = initiate(state, config, routing, &mut *sender, peer.id).await {
+                error!(peer_id = ?peer.id, "Failed to initiate handshake: {err}");
             }
         }
     }
@@ -502,13 +497,10 @@ async fn send_keepalives<R: Clone>(
     sender: &mut impl PacketSender<R>,
 ) {
     for peer in &config.peers {
-        let Some(addr) = routing
-            .get(&peer.peer_id)
-            .map(|entry| entry.value().clone())
-        else {
+        let Some(addr) = routing.get(&peer.id).map(|entry| entry.value().clone()) else {
             continue;
         };
-        let Some(index) = state.peering.get(&peer.peer_id).map(|entry| *entry.value()) else {
+        let Some(index) = state.peering.get(&peer.id).map(|entry| *entry.value()) else {
             continue;
         };
         let Some((cipher, receiver_idx)) = state.established.get(&index).and_then(|handle| {
@@ -536,13 +528,13 @@ async fn send_keepalives<R: Clone>(
                                 Ordering::Relaxed,
                             );
                         }
-                        trace!(peer_id = ?peer.peer_id, receiver_idx, counter, "Keepalive sent")
+                        trace!(peer_id = ?peer.id, receiver_idx, counter, "Keepalive sent")
                     }
-                    Err(err) => error!(peer_id = ?peer.peer_id, "Failed to send keepalive: {err}"),
+                    Err(err) => error!(peer_id = ?peer.id, "Failed to send keepalive: {err}"),
                 }
             }
             Err(_) => {
-                debug!(peer_id = ?peer.peer_id, "Cipher failed to encrypt keepalive, cleaning up");
+                debug!(peer_id = ?peer.id, "Cipher failed to encrypt keepalive, cleaning up");
                 state.established.remove(&index);
             }
         }

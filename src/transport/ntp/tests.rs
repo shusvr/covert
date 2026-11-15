@@ -93,7 +93,7 @@ async fn handshake_data_roles_and_reply_correlation() {
                 },
             },
             peers: vec![Peer {
-                peer_id: Uuid::new_v4(),
+                id: Uuid::new_v4(),
                 public_key: pk,
                 pre_shared_key: None,
                 allowed_ips: vec![],
@@ -162,8 +162,8 @@ async fn handshake_data_roles_and_reply_correlation() {
     .await
     .unwrap();
     timeout(Duration::from_secs(3), async {
-        while !a_state.has_live_connection(a_config.peers[0].peer_id)
-            || !b_state.has_live_connection(b_config.peers[0].peer_id)
+        while !a_state.has_live_connection(a_config.peers[0].id)
+            || !b_state.has_live_connection(b_config.peers[0].id)
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -173,14 +173,14 @@ async fn handshake_data_roles_and_reply_correlation() {
     assert!(
         !a_endpoint
             .routing
-            .get(&a_config.peers[0].peer_id)
+            .get(&a_config.peers[0].id)
             .unwrap()
             .server
     );
     assert!(
         b_endpoint
             .routing
-            .get(&b_config.peers[0].peer_id)
+            .get(&b_config.peers[0].id)
             .unwrap()
             .server
     );
@@ -188,7 +188,7 @@ async fn handshake_data_roles_and_reply_correlation() {
         .trasmit(
             &a_state,
             &a_config,
-            a_config.peers[0].peer_id,
+            a_config.peers[0].id,
             b"client data",
         )
         .await
@@ -204,7 +204,7 @@ async fn handshake_data_roles_and_reply_correlation() {
         .trasmit(
             &b_state,
             &b_config,
-            b_config.peers[0].peer_id,
+            b_config.peers[0].id,
             b"server data",
         )
         .await

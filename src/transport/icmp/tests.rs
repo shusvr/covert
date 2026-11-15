@@ -232,7 +232,7 @@ async fn request_reply_handshake_and_bidirectional_data() {
                 },
                 peers: vec![Peer {
                     liveness: Default::default(),
-                    peer_id: uuid::Uuid::new_v4(),
+                    id: uuid::Uuid::new_v4(),
                     public_key: pk,
                     pre_shared_key: None,
                     allowed_ips: vec![],
@@ -264,8 +264,8 @@ async fn request_reply_handshake_and_bidirectional_data() {
             .await
             .unwrap();
         timeout(Duration::from_secs(3), async {
-            while !a_state.has_live_connection(a_config.peers[0].peer_id)
-                || !b_state.has_live_connection(b_config.peers[0].peer_id)
+            while !a_state.has_live_connection(a_config.peers[0].id)
+                || !b_state.has_live_connection(b_config.peers[0].id)
             {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -275,7 +275,7 @@ async fn request_reply_handshake_and_bidirectional_data() {
         assert!(
             a_endpoint
                 .routing
-                .get(&a_config.peers[0].peer_id)
+                .get(&a_config.peers[0].id)
                 .unwrap()
                 .reply
                 .is_none()
@@ -283,7 +283,7 @@ async fn request_reply_handshake_and_bidirectional_data() {
         assert!(
             b_endpoint
                 .routing
-                .get(&b_config.peers[0].peer_id)
+                .get(&b_config.peers[0].id)
                 .unwrap()
                 .reply
                 .is_some()
@@ -293,7 +293,7 @@ async fn request_reply_handshake_and_bidirectional_data() {
             .trasmit(
                 &a_state,
                 &a_config,
-                a_config.peers[0].peer_id,
+                a_config.peers[0].id,
                 b"request data",
             )
             .await
@@ -309,7 +309,7 @@ async fn request_reply_handshake_and_bidirectional_data() {
             .trasmit(
                 &b_state,
                 &b_config,
-                b_config.peers[0].peer_id,
+                b_config.peers[0].id,
                 b"reply data",
             )
             .await
