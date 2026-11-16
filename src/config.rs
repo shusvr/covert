@@ -262,12 +262,12 @@ pub enum InnerAddresses {
 pub type PubKey = Key<false>;
 pub type PrivKey = Key<true>;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct Key<const PRIV: bool>(pub [u8; 32]);
+#[derive(Clone, PartialEq, Eq)]
+pub struct Key<const PRIV: bool>(pub zeroize::Zeroizing<[u8; 32]>);
 
 impl<const PRIV: bool> From<[u8; 32]> for Key<PRIV> {
     fn from(bytes: [u8; 32]) -> Self {
-        Self(bytes)
+        Self(zeroize::Zeroizing::new(bytes))
     }
 }
 
@@ -276,13 +276,17 @@ impl<'de, const PRIV: bool> Deserialize<'de> for Key<PRIV> {
     where
         D: serde::Deserializer<'de>,
     {
-        let arr = BASE64_STANDARD
-            .decode(&String::deserialize(deserializer)?)
-            .map_err(|err| serde::de::Error::custom(err))?;
-        let bytes = arr
+        let encoded = zeroize::Zeroizing::new(String::deserialize(deserializer)?);
+        let arr = zeroize::Zeroizing::new(
+            BASE64_STANDARD
+                .decode(encoded.as_bytes())
+                .map_err(|err| serde::de::Error::custom(err))?,
+        );
+        let bytes: [u8; 32] = arr
+            .as_slice()
             .try_into()
             .map_err(|_| serde::de::Error::custom("key length must be 32 bytes"))?;
-        Ok(Self(bytes))
+        Ok(Self::from(bytes))
     }
 }
 
@@ -291,7 +295,7 @@ impl<const PRIV: bool> Display for Key<PRIV> {
         if PRIV && cfg!(not(debug_assertions)) {
             write!(f, "<REDACTED>")
         } else {
-            let b64 = BASE64_STANDARD.encode(&self.0);
+            let b64 = BASE64_STANDARD.encode(&*self.0);
             write!(f, "{b64}")
         }
     }
@@ -304,7 +308,7 @@ impl<const PRIV: bool> Debug for Key<PRIV> {
         if PRIV && cfg!(not(debug_assertions)) {
             d.field(&"<REDACTED>").finish()
         } else {
-            let b64 = BASE64_STANDARD.encode(&self.0);
+            let b64 = BASE64_STANDARD.encode(&*self.0);
             d.field(&b64).finish()
         }
     }

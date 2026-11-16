@@ -81,12 +81,16 @@ impl PeerHandle {
 pub struct Initiated {
     when: Instant,
     peer_id: Uuid,
-    psk: Option<Key>,
+    psk: Option<zeroize::Zeroizing<Key>>,
     initiating: Initiating,
 }
 
 impl Initiated {
-    pub fn new(peer_id: Uuid, psk: Option<Key>, initiating: Initiating) -> Self {
+    pub fn new(
+        peer_id: Uuid,
+        psk: Option<zeroize::Zeroizing<Key>>,
+        initiating: Initiating,
+    ) -> Self {
         Self {
             peer_id,
             psk,
@@ -289,7 +293,7 @@ async fn process_incoming(
             let Some(peer) = config
                 .peers
                 .iter()
-                .find(|p| p.public_key.0 == remote_pk.as_ref())
+                .find(|p| p.public_key.0.as_slice() == remote_pk.as_ref())
             else {
                 let pubkey: PubKey = remote_pk.into();
                 warn!(?pubkey, "Received initiating from an unknown peer");
@@ -310,7 +314,7 @@ async fn process_incoming(
             let sender_idx = fastrand::u32(..);
             let (replying, cipher) = post_reply(
                 &remote_pk,
-                peer.pre_shared_key.as_ref().map(|k| &k.0),
+                peer.pre_shared_key.as_ref().map(|k| &*k.0),
                 sender_idx,
                 &initiating,
             )?;
@@ -346,7 +350,7 @@ async fn process_incoming(
 
             let cipher = finish(
                 &config.interface.private_key.0,
-                initiated.psk.as_ref(),
+                initiated.psk.as_deref(),
                 &initiated.initiating,
                 &replying,
             )?;
@@ -484,7 +488,7 @@ pub async fn initiate<R: Clone>(
             sender_idx,
             Initiated::new(
                 peer_id,
-                peer.pre_shared_key.as_ref().map(|key| key.0),
+                peer.pre_shared_key.as_ref().map(|key| key.0.clone()),
                 initiating.clone(),
             ),
         );

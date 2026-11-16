@@ -558,6 +558,7 @@ dependencies = [
  "tun-rs",
  "uuid",
  "webrtc",
+ "zeroize",
 ]
 
 [[package]]

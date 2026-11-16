@@ -81,10 +81,10 @@ async fn main() -> Result<()> {
             let public_key = private_key
                 .compute_public_key()
                 .context("failed to derive public key")?;
-            println!(
-                "Private key: {}",
-                BASE64_STANDARD.encode(sk_to_bytes(&private_key))
-            );
+            let private_bytes = zeroize::Zeroizing::new(sk_to_bytes(&private_key));
+            let encoded_private =
+                zeroize::Zeroizing::new(BASE64_STANDARD.encode(private_bytes.as_slice()));
+            println!("Private key: {}", encoded_private.as_str());
             println!(
                 "Public key: {}",
                 BASE64_STANDARD.encode(pk_to_bytes(&public_key))
@@ -102,21 +102,24 @@ async fn main() -> Result<()> {
         }
         Command::Pubkey { private_key } => {
             let private_key = match private_key {
-                Some(key) => key,
+                Some(key) => zeroize::Zeroizing::new(key),
                 None => {
-                    let mut key = String::new();
+                    let mut key = zeroize::Zeroizing::new(String::new());
                     io::stdin()
                         .read_to_string(&mut key)
                         .context("failed to read private key from stdin")?;
                     key
                 }
             };
-            let decoded = BASE64_STANDARD
-                .decode(private_key.trim())
-                .context("private key must be valid base64")?;
-            let key: covert::Key = decoded
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("private key must be 32 bytes"))?;
+            let decoded = zeroize::Zeroizing::new(
+                BASE64_STANDARD
+                    .decode(private_key.trim())
+                    .context("private key must be valid base64")?,
+            );
+            let key = zeroize::Zeroizing::new(
+                <covert::Key>::try_from(decoded.as_slice())
+                    .map_err(|_| anyhow::anyhow!("private key must be 32 bytes"))?,
+            );
             let public_key = to_sk(&key)
                 .compute_public_key()
                 .context("failed to derive public key")?;
@@ -148,7 +151,8 @@ fn read_config(path: &Path) -> anyhow::Result<Arc<Config>> {
         bail!("Config is not a valid file or doesn't exit");
     }
 
-    let conf_text = fs::read_to_string(&path).context("failed to read the file")?;
+    let conf_text =
+        zeroize::Zeroizing::new(fs::read_to_string(&path).context("failed to read the file")?);
     let mut config = toml::from_str::<Config>(&conf_text).context("invalid config")?;
     config.dev_name = file_name.strip_suffix(".toml").unwrap().to_owned();
     trace!(?path, "Config: {config:#?}");
