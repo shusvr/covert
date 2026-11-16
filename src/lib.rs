@@ -10,6 +10,7 @@ pub type Nonce = [u8; 12];
 pub mod codec;
 pub mod config;
 pub mod crypto;
+pub mod sans;
 pub mod transport;
 
 #[derive(Debug, Error)]

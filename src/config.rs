@@ -15,6 +15,7 @@ use std::{
     fmt::{Debug, Display},
     net::IpAddr,
     str::FromStr,
+    time::Duration,
 };
 use uuid::Uuid;
 
@@ -59,6 +60,11 @@ pub struct Liveness {
 }
 
 impl Liveness {
+    pub fn has_expired(&self, since_established: Duration, since_last_seen: Duration) -> bool {
+        (since_established > Duration::from_secs(self.max_age) && self.max_age != 0)
+            || (since_last_seen > Duration::from_secs(self.timeout) && self.timeout != 0)
+    }
+
     pub fn next_ka(&self) -> u64 {
         ((self.ka_delay as f64 + (self.ka_jitter as f64 * (fastrand::f64() * 2.0 - 1.0))) * 1000.0)
             .max(1000.0) as u64

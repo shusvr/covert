@@ -1,7 +1,7 @@
 use crate::crypto::{Initiating, Replying};
 
 use bitflags::bitflags;
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use futures::channel::mpsc;
 use std::{io, str::FromStr};
 use thiserror::Error;
@@ -302,6 +302,14 @@ pub enum Packet {
     Initiating(Initiating),
     Reply(Replying),
     Data(Data),
+}
+
+impl Packet {
+    pub fn to_bytes(self, layout: &PacketLayout) -> Result<Bytes, Error> {
+        let mut buf = BytesMut::new();
+        append(&mut buf, self, layout)?;
+        Ok(buf.freeze())
+    }
 }
 
 #[derive(Debug, Error)]
