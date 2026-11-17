@@ -180,7 +180,7 @@ impl Tunnel {
         match packet {
             Packet::Initiating(initiating) => {
                 let decoded = DecodedInitiation::decode(&self.local_sk, initiating)?;
-                self.process_initiation(decoded)?;
+                self.accept_initiation(decoded)?;
             }
             Packet::Reply(replying) => {
                 if let State::Initiated { initiated, .. } = &self.state
@@ -259,7 +259,7 @@ impl Tunnel {
     }
 
     /// Apply a decoded initiation without repeating its cryptographic decoding.
-    pub fn process_initiation(&mut self, decoded: DecodedInitiation) -> Result<()> {
+    pub fn accept_initiation(&mut self, decoded: DecodedInitiation) -> Result<()> {
         if decoded.public_key != self.remote_pk {
             debug!(
                 sender_idx = decoded.initiation.sender_idx,

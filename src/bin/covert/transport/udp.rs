@@ -153,7 +153,7 @@ async fn run_udp(
                 let before = peer.tunnel.established_at();
                 let is_data = matches!(packet, Packet::Data(_));
                 let result = match decoded_initiation {
-                    Some(decoded) => peer.tunnel.process_initiation(decoded),
+                    Some(decoded) => peer.tunnel.accept_initiation(decoded),
                     None => peer.tunnel.process_incoming_packet(packet),
                 };
                 match result.map_err(anyhow::Error::from).and_then(|()| peer.advance(id, state))

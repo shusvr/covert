@@ -368,14 +368,14 @@ fn decoded_initiation_exposes_identity_and_retains_replay_checks() {
     };
     let decoded = DecodedInitiation::decode(&responder.local_sk, initiation.clone()).unwrap();
     assert_eq!(decoded.public_key, public_key(&initiator.local_sk));
-    responder.process_initiation(decoded).unwrap();
+    responder.accept_initiation(decoded).unwrap();
     responder.process_new_packets().unwrap();
     let reply = responder.read_outbound_packet().unwrap();
     initiator.process_incoming_packet(reply).unwrap();
     let established = responder.established_at();
 
     let replay = DecodedInitiation::decode(&responder.local_sk, initiation.clone()).unwrap();
-    responder.process_initiation(replay).unwrap();
+    responder.accept_initiation(replay).unwrap();
     responder.process_new_packets().unwrap();
     assert_eq!(responder.established_at(), established);
     assert!(responder.read_outbound_packet().is_none());

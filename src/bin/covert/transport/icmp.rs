@@ -271,7 +271,7 @@ fn process_echo(
     }
     let before = peer.tunnel.established_at();
     match decoded {
-        Some(decoded) => peer.tunnel.process_initiation(decoded)?,
+        Some(decoded) => peer.tunnel.accept_initiation(decoded)?,
         None => peer.tunnel.process_incoming_packet(packet)?,
     }
     peer.advance(id, state)?;

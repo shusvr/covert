@@ -26,21 +26,21 @@
 #           including its authentication tag.
 #   oiets   Default 85. Offset of the 24-byte encrypted timestamp,
 #           including its authentication tag; used for handshake replay checks.
-#   oisidx  Default 81. Offset of the 4-byte sender's local session index.
+#   oisi    Default 81. Offset of the 4-byte sender's local session index.
 #
 # Handshake reply fields:
 #   oreph   Default 1. Offset of the 32-byte ephemeral public key.
-#   orsidx  Default 33. Offset of the 4-byte responder's local session index.
-#   orridx  Default 37. Offset of the 4-byte initiator's local session index,
+#   orsi    Default 33. Offset of the 4-byte responder's local session index.
+#   orri    Default 37. Offset of the 4-byte initiator's local session index,
 #           copied from the initiation's sender index to identify the attempt.
 # A 16-byte AEAD tag follows the last reply field (including oty), before
 # optional padding. Its offset is automatic; the default reply is 57 bytes.
 #
 # Encrypted data fields (also used for keepalives):
-#   odridx  Default 1. Offset of the 4-byte receiver's local session index.
+#   odri    Default 1. Offset of the 4-byte receiver's local session index.
 #   odctr   Default 5. Offset of the 8-byte encryption counter/nonce value.
 #   odf     Default 13. Offset of the 1-byte flags bitset. Bit 0 (value 1)
-#           marks a keepalive; ordinary data uses zero flags.
+#           marks a keepalive or junk packet; ordinary data uses zero flags.
 #   oddl    Default 14. Offset of the 4-byte ciphertext length in bytes,
 #           including the authentication tag, excluding headers and padding.
 #   odd     Default 18. Start of the variable-length encrypted payload,
@@ -50,7 +50,7 @@
 # Multi-byte integer fields use big-endian byte order before XOR masking.
 # Offsets may overlap between different packet types, but fields in the same
 # packet type must not overlap each other or oty. Unused padding is randomized.
-# Layout = "m=0&oty=0&oieph=1&oiepk=33&oiets=85&oisidx=81&oreph=1&orsidx=33&orridx=37&odridx=1&odctr=5&odf=13&oddl=14&odd=18"
+# Layout = "m=0&oty=0&oieph=1&oiepk=33&oiets=85&oisi=81&oreph=1&orsi=33&orri=37&odri=1&odctr=5&odf=13&oddl=14&odd=18"
 
 [Interface]
 # Required: one IP/CIDR or an array. Bare IPv4/IPv6 addresses become /32 or /128.
