@@ -172,10 +172,14 @@ impl ListenerConfig {
         let budget = match self {
             Self::Udp { .. } | Self::Icmp { .. } => 1500 - 28,
         };
-        if layout.odp > budget {
+        if usize::from(layout.odp) > budget {
             return Some(0);
         }
-        Some(budget.saturating_sub(layout.odd).saturating_sub(16))
+        Some(
+            budget
+                .saturating_sub(usize::from(layout.odd))
+                .saturating_sub(16),
+        )
     }
 }
 

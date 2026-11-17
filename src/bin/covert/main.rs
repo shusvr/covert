@@ -520,9 +520,14 @@ mod tests {
             );
             layout.odp = 1500;
             assert_eq!(listener.suggested_mtu(&layout), expected.map(|_| 0));
-            layout.odp = 0;
-            layout.odd = usize::MAX;
+            layout.odp = u16::MAX;
             assert_eq!(listener.suggested_mtu(&layout), expected.map(|_| 0));
+            layout.odp = 0;
+            layout.odd = u8::MAX;
+            assert_eq!(
+                listener.suggested_mtu(&layout),
+                Some(1472 - usize::from(u8::MAX) - 16)
+            );
         }
     }
 

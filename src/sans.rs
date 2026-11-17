@@ -496,4 +496,5 @@ fn timestamp() -> u64 {
 }
 
 #[cfg(test)]
+#[path = "./tests/sans.rs"]
 mod tests;

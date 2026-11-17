@@ -18,6 +18,7 @@ pub type SealedKey = [u8; 48];
 pub type SealedTimestamp = [u8; 24];
 
 #[cfg(test)]
+#[path = "./tests/crypto.rs"]
 mod tests;
 
 pub fn random_sk() -> Result<PrivateKey, Unspecified> {
