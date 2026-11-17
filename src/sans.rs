@@ -1,9 +1,17 @@
+//! Transport-independent tunnel state machine.
+//!
+//! Emits `tracing` events under `covert::sans`: info for established sessions,
+//! debug for handshakes/expiry/rejections, trace for packet metadata/keepalives,
+//! and warn for local processing failures. Keys and packet contents are omitted.
+//! The host application is responsible for installing a tracing subscriber.
+
 use std::{
     collections::VecDeque,
     time::{Duration, Instant, SystemTime},
 };
 
 use bytes::{Bytes, BytesMut};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     codec::{self, Data, DataFlags, Packet, PacketLayout},
@@ -79,7 +87,9 @@ pub struct DecodedInitiation {
 impl DecodedInitiation {
     /// Decode the peer identity before choosing which tunnel should handle it.
     pub fn decode(local_sk: &Key, initiation: Initiating) -> Result<Self> {
-        let (public_key, timestamp) = crypto::pre_reply(local_sk, &initiation)?;
+        let (public_key, timestamp) = crypto::pre_reply(local_sk, &initiation).inspect_err(|err| {
+            debug!(sender_idx = initiation.sender_idx, %err, "Rejected initiation: authentication failed");
+        })?;
         Ok(Self {
             initiation,
             public_key,
@@ -96,6 +106,13 @@ impl Tunnel {
         remote_pk: Key,
         psk: Option<Key>,
     ) -> Self {
+        debug!(
+            timeout = liveness.timeout,
+            max_age = liveness.max_age,
+            keepalive = liveness.ka_delay,
+            keepalive_jitter = liveness.ka_jitter,
+            "Created idle tunnel"
+        );
         Self {
             layout,
             local_sk,
@@ -114,15 +131,31 @@ impl Tunnel {
         let mut buf = Vec::with_capacity(packet.len() + 16);
         buf.extend_from_slice(packet);
         self.queue.push_back(buf);
+        trace!(
+            packet_len = packet.len(),
+            queued = self.queue.len(),
+            "Queued plaintext packet"
+        );
     }
 
     pub fn write_incoming(&mut self, packet: &[u8]) {
         self.received.extend_from_slice(packet);
+        trace!(
+            input_len = packet.len(),
+            buffered = self.received.len(),
+            "Buffered incoming bytes"
+        );
     }
 
     /// Start a handshake, retaining queued plaintext for the new session.
     pub fn initiate(&mut self) -> Result<()> {
-        let initiated = crypto::initiate(&self.local_sk, &self.remote_pk, timestamp(), index())?;
+        let initiated = crypto::initiate(&self.local_sk, &self.remote_pk, timestamp(), index())
+            .inspect_err(|err| warn!(%err, "Failed to create initiation"))?;
+        debug!(
+            local_idx = initiated.sender_idx,
+            queued = self.queue.len(),
+            "Starting handshake"
+        );
         self.state = State::Initiated {
             initiated,
             last_initiated: None,
@@ -132,7 +165,10 @@ impl Tunnel {
     }
 
     fn process_received(&mut self) -> Result<()> {
-        while let Some(packet) = codec::parse(&mut self.received, &self.layout).transpose()? {
+        while let Some(packet) = codec::parse(&mut self.received, &self.layout)
+            .transpose()
+            .inspect_err(|err| debug!(%err, "Rejected buffered packet: codec error"))?
+        {
             self.process_incoming_packet(packet)?;
         }
         Ok(())
@@ -150,10 +186,14 @@ impl Tunnel {
                 if let State::Initiated { initiated, .. } = &self.state
                     && initiated.sender_idx == replying.receiver_idx
                 {
-                    let cipher =
-                        crypto::finish(&self.local_sk, self.psk.as_ref(), initiated, &replying)?;
+                    let cipher = crypto::finish(&self.local_sk, self.psk.as_ref(), initiated, &replying)
+                        .inspect_err(|err| debug!(local_idx = initiated.sender_idx,
+                            sender_idx = replying.sender_idx, %err, "Rejected reply: authentication failed"))?;
                     let local_idx = initiated.sender_idx;
                     self.establish(cipher, local_idx, replying.sender_idx, 0);
+                } else {
+                    debug!(receiver_idx = replying.receiver_idx, sender_idx = replying.sender_idx,
+                        local_idx = ?self.local_index(), "Ignored reply: no matching initiation");
                 }
             }
             Packet::Data(Data {
@@ -172,20 +212,46 @@ impl Tunnel {
                 } = &mut self.state
                 {
                     if incoming_idx != *local_idx {
+                        trace!(
+                            receiver_idx = incoming_idx,
+                            local_idx = *local_idx,
+                            "Ignored data: receiver index mismatch"
+                        );
                         return Ok(());
                     }
                     if self.liveness.has_expired(now - *established, now - *seen) {
-                        // connection has expired
+                        debug!(
+                            local_idx = *local_idx,
+                            age_secs = (now - *established).as_secs(),
+                            idle_secs = (now - *seen).as_secs(),
+                            "Session expired on incoming data; rekeying"
+                        );
                         self.initiate()?;
                     } else {
                         // conn is live, decrypt
 
-                        let plaintext = cipher.decrypt(counter, ciphertext)?;
-                        if !flags.contains(DataFlags::JUNK) {
+                        let plaintext = cipher.decrypt(counter, ciphertext).inspect_err(|err| {
+                            debug!(local_idx = *local_idx, counter, %err,
+                                "Rejected data: authentication or counter validation failed");
+                        })?;
+                        let keepalive = flags.contains(DataFlags::JUNK);
+                        trace!(
+                            local_idx = *local_idx,
+                            counter,
+                            keepalive,
+                            plaintext_len = plaintext.len(),
+                            "Authenticated incoming data"
+                        );
+                        if !keepalive {
                             self.decrypted.push_back(plaintext);
                         }
                         *seen = now;
                     }
+                } else {
+                    trace!(
+                        receiver_idx = incoming_idx,
+                        "Ignored data: session not established"
+                    );
                 }
             }
         }
@@ -195,6 +261,10 @@ impl Tunnel {
     /// Apply a decoded initiation without repeating its cryptographic decoding.
     pub fn process_initiation(&mut self, decoded: DecodedInitiation) -> Result<()> {
         if decoded.public_key != self.remote_pk {
+            debug!(
+                sender_idx = decoded.initiation.sender_idx,
+                "Ignored initiation: peer identity mismatch"
+            );
             return Ok(());
         }
         if matches!(self.state, State::Initiated { .. }) {
@@ -202,6 +272,10 @@ impl Tunnel {
                 crypto::pk_to_bytes(&crypto::to_sk(&self.local_sk).compute_public_key()?);
             // For competing handshakes, the smaller static public key initiates.
             if local_public_key < self.remote_pk {
+                debug!(
+                    sender_idx = decoded.initiation.sender_idx,
+                    "Ignored competing initiation: retaining initiator role"
+                );
                 return Ok(());
             }
         }
@@ -209,15 +283,24 @@ impl Tunnel {
             self.state,
             State::Established { timestamp: old, .. } if old >= decoded.timestamp
         ) {
+            debug!(
+                sender_idx = decoded.initiation.sender_idx,
+                "Ignored initiation: stale or replayed timestamp"
+            );
             return Ok(());
         }
+        debug!(
+            sender_idx = decoded.initiation.sender_idx,
+            "Accepted initiation; replying"
+        );
         let local_idx = index();
         let (reply, cipher) = crypto::post_reply(
             &self.remote_pk,
             self.psk.as_ref(),
             local_idx,
             &decoded.initiation,
-        )?;
+        )
+        .inspect_err(|err| warn!(local_idx, %err, "Failed to create handshake reply"))?;
         self.outbound
             .retain(|packet| !matches!(packet, Packet::Initiating(_)));
         self.establish(
@@ -227,11 +310,18 @@ impl Tunnel {
             decoded.timestamp,
         );
         self.outbound.push_back(Packet::Reply(reply));
+        debug!(local_idx, "Queued handshake reply");
         Ok(())
     }
 
     fn establish(&mut self, cipher: Cipher, local_idx: u32, receiver_idx: u32, timestamp: u64) {
         let now = Instant::now();
+        info!(
+            local_idx,
+            receiver_idx,
+            queued = self.queue.len(),
+            "Session established"
+        );
         self.state = State::Established {
             cipher,
             local_idx,
@@ -259,14 +349,26 @@ impl Tunnel {
                 let now = Instant::now();
 
                 if self.liveness.has_expired(now - *established, now - *seen) {
-                    // conn has expired
+                    debug!(
+                        receiver_idx = *receiver_idx,
+                        age_secs = (now - *established).as_secs(),
+                        idle_secs = (now - *seen).as_secs(),
+                        "Session expired during maintenance; rekeying"
+                    );
                     self.initiate()?;
                 } else {
                     // conn is live, encrypt
 
                     let mut added = false;
                     while let Some(packet) = self.queue.pop_front() {
-                        let (counter, ciphertext) = cipher.encrypt(packet)?;
+                        let plaintext_len = packet.len();
+                        let (counter, ciphertext) = cipher
+                            .encrypt(packet)
+                            .inspect_err(|err| warn!(%err, "Failed to encrypt queued packet"))?;
+                        trace!(
+                            receiver_idx = *receiver_idx,
+                            counter, plaintext_len, "Encrypted outgoing data"
+                        );
                         let data = Data {
                             receiver_idx: *receiver_idx,
                             flags: DataFlags::empty(),
@@ -279,7 +381,10 @@ impl Tunnel {
 
                     // if we aren't sending data, see if we need to send ka
                     if !added && now > *next_ka {
-                        let (counter, ciphertext) = cipher.encrypt(Vec::with_capacity(16))?;
+                        let (counter, ciphertext) = cipher
+                            .encrypt(Vec::with_capacity(16))
+                            .inspect_err(|err| warn!(%err, "Failed to encrypt keepalive"))?;
+                        trace!(receiver_idx = *receiver_idx, counter, "Queued keepalive");
                         let data = Data {
                             receiver_idx: *receiver_idx,
                             flags: DataFlags::JUNK,
@@ -300,14 +405,17 @@ impl Tunnel {
                 let now = Instant::now();
                 match last_initiated {
                     Some(last) if now - *last > Duration::from_secs(10) => {
-                        // refresh initiation
-
-                        let initiating = crypto::initiate(
-                            &self.local_sk,
-                            &self.remote_pk,
-                            timestamp(),
-                            index(),
-                        )?;
+                        debug!(
+                            local_idx = initiated.sender_idx,
+                            "Handshake retry timer expired"
+                        );
+                        let initiating =
+                            crypto::initiate(&self.local_sk, &self.remote_pk, timestamp(), index())
+                                .inspect_err(|err| warn!(%err, "Failed to refresh initiation"))?;
+                        debug!(
+                            local_idx = initiating.sender_idx,
+                            "Queued refreshed initiation"
+                        );
                         self.outbound
                             .push_back(Packet::Initiating(initiating.clone()));
                         *initiated = initiating;
@@ -315,7 +423,7 @@ impl Tunnel {
                     }
                     Some(_) => {}
                     None => {
-                        // our first time, send as is
+                        debug!(local_idx = initiated.sender_idx, "Queued initial handshake");
                         self.outbound
                             .push_back(Packet::Initiating(initiated.clone()));
                         *last_initiated = Some(now);
@@ -331,7 +439,8 @@ impl Tunnel {
         self.read_outbound_packet()
             .map(|p| {
                 let mut buf = BytesMut::new();
-                codec::append(&mut buf, p, &self.layout)?;
+                codec::append(&mut buf, p, &self.layout)
+                    .inspect_err(|err| warn!(%err, "Failed to encode outbound packet"))?;
                 Ok(buf.freeze())
             })
             .transpose()
