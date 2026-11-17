@@ -129,6 +129,9 @@ impl Tunnel {
             initiation.sender_idx,
             &initiation,
         )?;
+        // Abandon any unsent initiation when accepting the peer's handshake.
+        self.outbound
+            .retain(|packet| !matches!(packet, Packet::Initiating(_)));
         self.establish(cipher, initiation.sender_idx, timestamp);
         self.outbound.push_back(Packet::Reply(reply));
 
@@ -144,6 +147,19 @@ impl Tunnel {
             match packet {
                 Packet::Initiating(initiating) => {
                     let (public_key, timestamp) = crypto::pre_reply(&self.local_sk, &initiating)?;
+
+                    if matches!(self.state, State::Initiated { .. })
+                        && self.remote_pk == Some(public_key)
+                    {
+                        let local_public_key = crypto::pk_to_bytes(
+                            &crypto::to_sk(&self.local_sk).compute_public_key()?,
+                        );
+                        // For competing handshakes, the smaller static public
+                        // key remains the initiator; the other peer responds.
+                        if local_public_key < public_key {
+                            continue;
+                        }
+                    }
 
                     if !matches!(
                         self.state,
@@ -331,3 +347,6 @@ fn timestamp() -> u64 {
         .unwrap()
         .as_secs()
 }
+
+#[cfg(test)]
+mod tests;
