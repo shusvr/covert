@@ -46,8 +46,7 @@ impl Udp {
         listener: &UdpListenerConfig,
     ) -> Result<(Self, Endpoint<UdpAdapter>)> {
         let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, listener.port)).await?;
-        let endpoint = Endpoint::new(UdpAdapter::default(), config.clone())
-            .map_err(anyhow::Error::from_boxed)?;
+        let endpoint = Endpoint::new(UdpAdapter::default(), config.clone())?;
         Ok((
             Self {
                 socket,

@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use crate::Result;
 use bytes::{Bytes, BytesMut};
 use tracing::{debug, info, trace, warn};
 
@@ -18,16 +19,6 @@ use crate::{
     config::Liveness,
     crypto::{self, Cipher, Initiating, Key},
 };
-
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("Codec: {0}")]
-    Codec(#[from] codec::Error),
-    #[error("Crypto error")]
-    Crypto(#[from] aws_lc_rs::error::Unspecified),
-}
-
-pub type Result<T = ()> = std::result::Result<T, Error>;
 
 enum State {
     Idle,

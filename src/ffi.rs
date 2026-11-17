@@ -11,6 +11,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 use crate::crypto::Key;
+use crate::{Error, Result};
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     ptr, slice,
@@ -21,7 +22,6 @@ pub const EMPTY: i32 = 1;
 pub const INVALID: i32 = -1;
 pub const FAILED: i32 = -2;
 pub const PANIC: i32 = -3;
-type Result<T = ()> = std::result::Result<T, i32>;
 
 #[repr(C)]
 pub struct Buffer {
@@ -32,22 +32,24 @@ pub struct Buffer {
 fn guard(f: impl FnOnce() -> Result) -> i32 {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(Ok(())) => OK,
-        Ok(Err(e)) => e,
+        Ok(Err(Error::Empty)) => EMPTY,
+        Ok(Err(Error::InvalidArgument(_))) => INVALID,
+        Ok(Err(_)) => FAILED,
         Err(_) => PANIC,
     }
 }
 unsafe fn get<'a, T>(p: *const T) -> Result<&'a T> {
-    unsafe { p.as_ref() }.ok_or(INVALID)
+    unsafe { p.as_ref() }.ok_or(Error::InvalidArgument("invalid FFI argument"))
 }
 unsafe fn get_mut<'a, T>(p: *mut T) -> Result<&'a mut T> {
-    unsafe { p.as_mut() }.ok_or(INVALID)
+    unsafe { p.as_mut() }.ok_or(Error::InvalidArgument("invalid FFI argument"))
 }
 unsafe fn bytes<'a>(p: *const u8, n: usize) -> Result<&'a [u8]> {
     if n == 0 {
         return Ok(&[]);
     }
     if p.is_null() || n > isize::MAX as usize {
-        return Err(INVALID);
+        return Err(Error::InvalidArgument("invalid FFI argument"));
     }
     Ok(unsafe { slice::from_raw_parts(p, n) })
 }
@@ -112,4 +114,22 @@ pub use tunnel::*;
 #[unsafe(no_mangle)]
 pub extern "C" fn covert_abi_version() -> u32 {
     2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_errors_preserve_the_c_status_contract() {
+        assert_eq!(guard(|| Ok(())), OK);
+        assert_eq!(guard(|| Err(Error::Empty)), EMPTY);
+        assert_eq!(guard(|| Err(Error::InvalidArgument("bad input"))), INVALID);
+        assert_eq!(guard(|| Err(Error::MalformedDatagram)), FAILED);
+        assert_eq!(
+            guard(|| Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into())),
+            FAILED
+        );
+        assert_eq!(guard(|| panic!("caught at C boundary")), PANIC);
+    }
 }

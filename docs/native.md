@@ -32,6 +32,18 @@ The C ABI is version 2. In particular, the legacy `covert_tunnel_process` now
 explicitly takes a `uint8_t flush_on_error` (0 or 1), matching the Rust API.
 Consumers must rebuild against the matching header and library together.
 
+## Rust errors
+
+The Rust APIs share `covert::Error` and `covert::Result<T>`. Codec, crypto,
+tunnel, transport and internal FFI work use the same error type. Underlying
+I/O, IP parsing, crypto, layout parsing and external adapter errors retain their
+sources through `std::error::Error::source()`; adapters can use
+`covert::Error::adapter` to preserve errors from external libraries.
+
+The C ABI continues returning its existing integer status codes. The FFI boundary
+maps shared Rust errors into those codes and catches panics; this refactor does
+not change the C ABI version or function signatures.
+
 ## Main configuration API
 
 `CovertConfig` is an opaque pointer to `crate::config::Config` itself. There is no

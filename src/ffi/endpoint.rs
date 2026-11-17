@@ -54,18 +54,28 @@ pub unsafe extern "C" fn covert_endpoint_client_new(
         let out = unsafe { get_mut(out)? };
         *out = ptr::null_mut();
         if mode > 1 {
-            return Err(INVALID);
+            return Err(Error::InvalidArgument("invalid FFI argument"));
         }
         let live = unsafe { get(liveness)? };
         // Config uses u32 seconds; reject truncation at this boundary.
         let liveness = LivenessOptions {
-            timeout: Some(live.timeout.try_into().map_err(|_| INVALID)?),
-            max_age: Some(live.max_age.try_into().map_err(|_| INVALID)?),
+            timeout: Some(
+                live.timeout
+                    .try_into()
+                    .map_err(|_| Error::InvalidArgument("invalid FFI argument"))?,
+            ),
+            max_age: Some(
+                live.max_age
+                    .try_into()
+                    .map_err(|_| Error::InvalidArgument("invalid FFI argument"))?,
+            ),
             keepalive: Some(live.ka_delay),
             keepalive_jitter: Some(live.ka_jitter),
         };
         let layout = *unsafe { get(layout)? };
-        layout.check().map_err(|_| INVALID)?;
+        layout
+            .check()
+            .map_err(|_| Error::InvalidArgument("invalid FFI argument"))?;
         let config = Config {
             dev_name: String::new(),
             layout,
@@ -109,7 +119,7 @@ pub unsafe extern "C" fn covert_endpoint_tun_write(
         unsafe { get_mut(endpoint)? }
             .endpoint
             .tun_write(unsafe { bytes(data, len)? })
-            .map_err(|_| INVALID)
+            .map_err(|_| Error::InvalidArgument("invalid FFI argument"))
     })
 }
 #[unsafe(no_mangle)]
@@ -121,11 +131,10 @@ pub unsafe extern "C" fn covert_endpoint_out_write(
     guard(|| {
         match unsafe { get_mut(endpoint)? }
             .endpoint
-            .process_datagram((), unsafe { bytes(data, len)? })
-            .map_err(|_| FAILED)?
+            .process_datagram((), unsafe { bytes(data, len)? })?
         {
             true => Ok(()),
-            false => Err(EMPTY),
+            false => Err(Error::Empty),
         }
     })
 }
@@ -144,14 +153,8 @@ pub unsafe extern "C" fn covert_endpoint_read_outbound(
             .lock()
             .unwrap()
             .pop_front()
-            .ok_or(EMPTY)?;
-        output(
-            out,
-            packet
-                .to_bytes(&client.layout)
-                .map_err(|_| FAILED)?
-                .to_vec(),
-        );
+            .ok_or(Error::Empty)?;
+        output(out, packet.to_bytes(&client.layout)?.to_vec());
         Ok(())
     })
 }
@@ -166,7 +169,7 @@ pub unsafe extern "C" fn covert_endpoint_tun_read(
             .endpoint
             .tun_read()
             .next()
-            .ok_or(EMPTY)?;
+            .ok_or(Error::Empty)?;
         output(out, packet);
         Ok(())
     })
@@ -197,7 +200,7 @@ fn from_engine(config: Config, echo_reply_client: bool) -> Result<ClientEndpoint
         outbound: Mutex::new(VecDeque::new()),
         echo_reply_client,
     };
-    let endpoint = Endpoint::new(adapter, config).map_err(|_| FAILED)?;
+    let endpoint = Endpoint::new(adapter, config)?;
     Ok(ClientEndpoint { endpoint, layout })
 }
 

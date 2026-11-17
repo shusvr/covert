@@ -25,13 +25,17 @@ pub unsafe extern "C" fn covert_layout_new(
     guard(|| {
         let out = unsafe { get_mut(out)? };
         *out = ptr::null_mut();
-        let text = std::str::from_utf8(unsafe { bytes(text, len)? }).map_err(|_| INVALID)?;
+        let text = std::str::from_utf8(unsafe { bytes(text, len)? })
+            .map_err(|_| Error::InvalidArgument("invalid FFI argument"))?;
         let layout = if text.is_empty() {
             PacketLayout::default()
         } else {
-            text.parse().map_err(|_| INVALID)?
+            text.parse()
+                .map_err(|_| Error::InvalidArgument("invalid FFI argument"))?
         };
-        layout.check().map_err(|_| INVALID)?;
+        layout
+            .check()
+            .map_err(|_| Error::InvalidArgument("invalid FFI argument"))?;
         *out = Box::into_raw(Box::new(layout));
         Ok(())
     })
@@ -69,8 +73,7 @@ pub unsafe extern "C" fn covert_codec_parse(
         *out = ptr::null_mut();
         *consumed = 0;
         let (p, n) = codec::parse_slice(unsafe { bytes(data, len)? }, unsafe { get(layout)? })
-            .ok_or(EMPTY)?
-            .map_err(|_| FAILED)?;
+            .ok_or(Error::Empty)??;
         *out = Box::into_raw(Box::new(p));
         *consumed = n;
         Ok(())
@@ -84,9 +87,7 @@ pub unsafe extern "C" fn covert_codec_encode(
 ) -> i32 {
     guard(|| {
         let out = unsafe { get_mut(out)? };
-        let v = clone_packet(unsafe { get(packet)? })
-            .to_bytes(unsafe { get(layout)? })
-            .map_err(|_| FAILED)?;
+        let v = clone_packet(unsafe { get(packet)? }).to_bytes(unsafe { get(layout)? })?;
         output(out, v.to_vec());
         Ok(())
     })
@@ -103,7 +104,8 @@ pub unsafe extern "C" fn covert_packet_data_new(
     guard(|| {
         let out = unsafe { get_mut(out)? };
         *out = ptr::null_mut();
-        let flags = DataFlags::from_bits(flags).ok_or(INVALID)?;
+        let flags =
+            DataFlags::from_bits(flags).ok_or(Error::InvalidArgument("invalid FFI argument"))?;
         let p = Packet::Data(Data {
             receiver_idx: index,
             counter,
@@ -140,7 +142,7 @@ pub unsafe extern "C" fn covert_packet_data(
         let flags = unsafe { get_mut(flags)? };
         let out = unsafe { get_mut(out)? };
         let Packet::Data(p) = (unsafe { get(packet)? }) else {
-            return Err(INVALID);
+            return Err(Error::InvalidArgument("invalid FFI argument"));
         };
         *index = p.receiver_idx;
         *counter = p.counter;

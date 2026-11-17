@@ -1,3 +1,6 @@
+mod error;
+pub use error::{Error, Result};
+
 pub mod codec;
 pub mod config;
 pub mod crypto;

@@ -126,13 +126,15 @@ impl Adapter for EchoAdapter {
         previous: Option<&IcmpRoute>,
         next: &IcmpRoute,
         other_routes: impl Iterator<Item = &'a IcmpRoute>,
-    ) -> covert::transport::Result<()> {
+    ) -> covert::Result<()> {
         if let Some(filter) = &self.firewall {
-            filter.update_route(
-                previous.and_then(IcmpRoute::reply_key),
-                next.reply_key(),
-                other_routes,
-            )?;
+            filter
+                .update_route(
+                    previous.and_then(IcmpRoute::reply_key),
+                    next.reply_key(),
+                    other_routes,
+                )
+                .map_err(covert::Error::adapter)?;
         }
         Ok(())
     }
@@ -159,7 +161,7 @@ impl Icmp {
             pending: Mutex::new(Vec::new()),
             firewall: Some(firewall),
         };
-        let endpoint = Endpoint::new(adapter, config.clone()).map_err(anyhow::Error::from_boxed)?;
+        let endpoint = Endpoint::new(adapter, config.clone())?;
         Ok((
             Self {
                 socket,

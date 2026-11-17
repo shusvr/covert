@@ -746,7 +746,7 @@ impl Adapter for Hooks {
             .borrow_mut()
             .push((previous.copied(), *next, others.copied().collect()));
         if *next == 8 {
-            return Err("route side effect failed".into());
+            return Err(Error::adapter("route side effect failed"));
         }
         Ok(())
     }

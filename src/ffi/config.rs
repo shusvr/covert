@@ -23,7 +23,7 @@ pub(super) fn report(error: *mut Buffer, message: &str) -> Result {
     if !error.is_null() {
         output(unsafe { get_mut(error)? }, message.as_bytes().to_vec());
     }
-    Err(INVALID)
+    Err(Error::InvalidArgument("invalid FFI argument"))
 }
 fn key_text(text: &str) -> Result<Key> {
     let clean = Zeroizing::new(
@@ -35,28 +35,41 @@ fn key_text(text: &str) -> Result<Key> {
         STANDARD
             .decode(&*clean)
             .or_else(|_| STANDARD_NO_PAD.decode(&*clean))
-            .map_err(|_| INVALID)?,
+            .map_err(|_| Error::InvalidArgument("invalid FFI argument"))?,
     );
-    decoded.as_slice().try_into().map_err(|_| INVALID)
+    decoded
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::InvalidArgument("invalid FFI argument"))
 }
 fn nets(text: &str) -> Result<Vec<IpNet>> {
     text.split(|c: char| c == ',' || c.is_whitespace())
         .filter(|s| !s.is_empty())
         .map(|s| {
             if s.contains('/') {
-                s.parse().map_err(|_| INVALID)
+                s.parse()
+                    .map_err(|_| Error::InvalidArgument("invalid FFI argument"))
             } else {
-                let ip: IpAddr = s.parse().map_err(|_| INVALID)?;
-                IpNet::new(ip, if ip.is_ipv4() { 32 } else { 128 }).map_err(|_| INVALID)
+                let ip: IpAddr = s
+                    .parse()
+                    .map_err(|_| Error::InvalidArgument("invalid FFI argument"))?;
+                IpNet::new(ip, if ip.is_ipv4() { 32 } else { 128 })
+                    .map_err(|_| Error::InvalidArgument("invalid FFI argument"))
             }
         })
         .collect()
 }
 fn peer(config: &ConfigHandle, index: usize) -> Result<&Peer> {
-    config.peers.get(index).ok_or(INVALID)
+    config
+        .peers
+        .get(index)
+        .ok_or(Error::InvalidArgument("invalid FFI argument"))
 }
 fn peer_mut(config: &mut ConfigHandle, index: usize) -> Result<&mut Peer> {
-    config.peers.get_mut(index).ok_or(INVALID)
+    config
+        .peers
+        .get_mut(index)
+        .ok_or(Error::InvalidArgument("invalid FFI argument"))
 }
 fn liveness(config: &ConfigHandle, index: usize) -> Result<&LivenessOptions> {
     if index == INTERFACE {
@@ -73,9 +86,12 @@ fn liveness_mut(config: &mut ConfigHandle, index: usize) -> Result<&mut Liveness
     }
 }
 pub(super) fn validate(config: &ConfigHandle) -> Result {
-    config.layout.check().map_err(|_| INVALID)?;
+    config
+        .layout
+        .check()
+        .map_err(|_| Error::InvalidArgument("invalid FFI argument"))?;
     if config.interface.mtu == 0 {
-        return Err(INVALID);
+        return Err(Error::InvalidArgument("invalid FFI argument"));
     }
     Ok(())
 }
@@ -124,7 +140,7 @@ pub unsafe extern "C" fn covert_config_remove_peer(config: *mut ConfigHandle, in
     guard(|| {
         let config = unsafe { get_mut(config)? };
         if index >= config.peers.len() {
-            return Err(INVALID);
+            return Err(Error::InvalidArgument("invalid FFI argument"));
         }
         config.peers.remove(index);
         Ok(())
@@ -151,16 +167,19 @@ pub unsafe extern "C" fn covert_config_set_string(
     guard(|| {
         let config = unsafe { get_mut(config)? };
         let text = std::str::from_utf8(unsafe { bytes(data, len)? })
-            .map_err(|_| INVALID)?
+            .map_err(|_| Error::InvalidArgument("invalid FFI argument"))?
             .trim();
         match (index, field) {
             (INTERFACE, 0) => {
                 let layout: PacketLayout = if text.is_empty() {
                     Default::default()
                 } else {
-                    text.parse().map_err(|_| INVALID)?
+                    text.parse()
+                        .map_err(|_| Error::InvalidArgument("invalid FFI argument"))?
                 };
-                layout.check().map_err(|_| INVALID)?;
+                layout
+                    .check()
+                    .map_err(|_| Error::InvalidArgument("invalid FFI argument"))?;
                 config.layout = layout;
             }
             (INTERFACE, 1) => config.dev_name = text.to_owned(),
@@ -176,38 +195,51 @@ pub unsafe extern "C" fn covert_config_set_string(
             }
             (index, 6) => peer_mut(config, index)?.allowed_ips = nets(text)?,
             (index, 7) => {
-                let transport = if text.is_empty() {
-                    PeerTransport::None
-                } else {
-                    match peer(config, index)?.transport {
-                        PeerTransport::Udp { .. } => PeerTransport::Udp {
-                            udp: UdpTransportPeerConfig {
-                                endpoint: Some(text.parse().map_err(|_| INVALID)?),
-                            },
-                        },
-                        PeerTransport::Icmp { .. } => PeerTransport::Icmp {
-                            icmp: IcmpTransportPeerConfig {
-                                endpoint: Some(text.parse().map_err(|_| INVALID)?),
-                            },
-                        },
-                        PeerTransport::None => match config.interface.listener {
-                            ListenerConfig::Udp { .. } => PeerTransport::Udp {
+                let transport =
+                    if text.is_empty() {
+                        PeerTransport::None
+                    } else {
+                        match peer(config, index)?.transport {
+                            PeerTransport::Udp { .. } => PeerTransport::Udp {
                                 udp: UdpTransportPeerConfig {
-                                    endpoint: Some(text.parse().map_err(|_| INVALID)?),
+                                    endpoint: Some(text.parse().map_err(|_| {
+                                        Error::InvalidArgument("invalid FFI argument")
+                                    })?),
                                 },
                             },
-                            ListenerConfig::Icmp { .. } => PeerTransport::Icmp {
+                            PeerTransport::Icmp { .. } => PeerTransport::Icmp {
                                 icmp: IcmpTransportPeerConfig {
-                                    endpoint: Some(text.parse().map_err(|_| INVALID)?),
+                                    endpoint: Some(text.parse().map_err(|_| {
+                                        Error::InvalidArgument("invalid FFI argument")
+                                    })?),
                                 },
                             },
-                        },
-                    }
-                };
+                            PeerTransport::None => match config.interface.listener {
+                                ListenerConfig::Udp { .. } => PeerTransport::Udp {
+                                    udp: UdpTransportPeerConfig {
+                                        endpoint: Some(text.parse().map_err(|_| {
+                                            Error::InvalidArgument("invalid FFI argument")
+                                        })?),
+                                    },
+                                },
+                                ListenerConfig::Icmp { .. } => PeerTransport::Icmp {
+                                    icmp: IcmpTransportPeerConfig {
+                                        endpoint: Some(text.parse().map_err(|_| {
+                                            Error::InvalidArgument("invalid FFI argument")
+                                        })?),
+                                    },
+                                },
+                            },
+                        }
+                    };
                 peer_mut(config, index)?.transport = transport;
             }
-            (index, 8) => peer_mut(config, index)?.id = text.parse().map_err(|_| INVALID)?,
-            _ => return Err(INVALID),
+            (index, 8) => {
+                peer_mut(config, index)?.id = text
+                    .parse()
+                    .map_err(|_| Error::InvalidArgument("invalid FFI argument"))?
+            }
+            _ => return Err(Error::InvalidArgument("invalid FFI argument")),
         };
         Ok(())
     })
@@ -234,9 +266,13 @@ pub unsafe extern "C" fn covert_config_get_string(
                 .collect::<Vec<_>>()
                 .join(","),
             (index, 4) => STANDARD.encode(&*peer(config, index)?.public_key.0),
-            (index, 5) => {
-                STANDARD.encode(&*peer(config, index)?.pre_shared_key.as_ref().ok_or(EMPTY)?.0)
-            }
+            (index, 5) => STANDARD.encode(
+                &*peer(config, index)?
+                    .pre_shared_key
+                    .as_ref()
+                    .ok_or(Error::Empty)?
+                    .0,
+            ),
             (index, 6) => peer(config, index)?
                 .allowed_ips
                 .iter()
@@ -244,12 +280,12 @@ pub unsafe extern "C" fn covert_config_get_string(
                 .collect::<Vec<_>>()
                 .join(","),
             (index, 7) => match &peer(config, index)?.transport {
-                PeerTransport::Udp { udp } => udp.endpoint.ok_or(EMPTY)?.to_string(),
-                PeerTransport::Icmp { icmp } => icmp.endpoint.ok_or(EMPTY)?.to_string(),
-                PeerTransport::None => return Err(EMPTY),
+                PeerTransport::Udp { udp } => udp.endpoint.ok_or(Error::Empty)?.to_string(),
+                PeerTransport::Icmp { icmp } => icmp.endpoint.ok_or(Error::Empty)?.to_string(),
+                PeerTransport::None => return Err(Error::Empty),
             },
             (index, 8) => peer(config, index)?.id.to_string(),
-            _ => return Err(INVALID),
+            _ => return Err(Error::InvalidArgument("invalid FFI argument")),
         };
         output(out, value.into_bytes());
         Ok(())
@@ -266,9 +302,11 @@ pub unsafe extern "C" fn covert_config_set_u32(
         let config = unsafe { get_mut(config)? };
         match (index, field) {
             (INTERFACE, 16) => {
-                let mtu = value.try_into().map_err(|_| INVALID)?;
+                let mtu = value
+                    .try_into()
+                    .map_err(|_| Error::InvalidArgument("invalid FFI argument"))?;
                 if mtu == 0 {
-                    return Err(INVALID);
+                    return Err(Error::InvalidArgument("invalid FFI argument"));
                 }
                 config.interface.mtu = mtu
             }
@@ -282,7 +320,7 @@ pub unsafe extern "C" fn covert_config_set_u32(
                             mode: IcmpMode::EchoReply,
                         },
                     },
-                    _ => return Err(INVALID),
+                    _ => return Err(Error::InvalidArgument("invalid FFI argument")),
                 }
             }
             (index, 17) => {
@@ -294,22 +332,26 @@ pub unsafe extern "C" fn covert_config_set_u32(
                         icmp: IcmpTransportPeerConfig { endpoint: None },
                     },
                     2 => PeerTransport::None,
-                    _ => return Err(INVALID),
+                    _ => return Err(Error::InvalidArgument("invalid FFI argument")),
                 }
             }
             (INTERFACE, 18) => match &mut config.interface.listener {
-                ListenerConfig::Udp { udp } => udp.port = value.try_into().map_err(|_| INVALID)?,
-                _ => return Err(INVALID),
+                ListenerConfig::Udp { udp } => {
+                    udp.port = value
+                        .try_into()
+                        .map_err(|_| Error::InvalidArgument("invalid FFI argument"))?
+                }
+                _ => return Err(Error::InvalidArgument("invalid FFI argument")),
             },
             (INTERFACE, 19) => match &mut config.interface.listener {
                 ListenerConfig::Icmp { icmp } => {
                     icmp.mode = match value {
                         0 => IcmpMode::EchoReply,
                         1 => IcmpMode::OnlyEcho,
-                        _ => return Err(INVALID),
+                        _ => return Err(Error::InvalidArgument("invalid FFI argument")),
                     }
                 }
-                _ => return Err(INVALID),
+                _ => return Err(Error::InvalidArgument("invalid FFI argument")),
             },
             (index, 20..=23) => {
                 let live = liveness_mut(config, index)?;
@@ -320,7 +362,7 @@ pub unsafe extern "C" fn covert_config_set_u32(
                     _ => &mut live.keepalive_jitter,
                 } = Some(value)
             }
-            _ => return Err(INVALID),
+            _ => return Err(Error::InvalidArgument("invalid FFI argument")),
         };
         Ok(())
     })
@@ -348,14 +390,14 @@ pub unsafe extern "C" fn covert_config_get_u32(
             },
             (INTERFACE, 18) => match &config.interface.listener {
                 ListenerConfig::Udp { udp } => u32::from(udp.port),
-                _ => return Err(INVALID),
+                _ => return Err(Error::InvalidArgument("invalid FFI argument")),
             },
             (INTERFACE, 19) => match &config.interface.listener {
                 ListenerConfig::Icmp { icmp } => match icmp.mode {
                     IcmpMode::EchoReply => 0,
                     IcmpMode::OnlyEcho => 1,
                 },
-                _ => return Err(INVALID),
+                _ => return Err(Error::InvalidArgument("invalid FFI argument")),
             },
             (index, 20..=23) => {
                 let live = liveness(config, index)?;
@@ -365,9 +407,9 @@ pub unsafe extern "C" fn covert_config_get_u32(
                     22 => live.keepalive,
                     _ => live.keepalive_jitter,
                 }
-                .ok_or(EMPTY)?
+                .ok_or(Error::Empty)?
             }
-            _ => return Err(INVALID),
+            _ => return Err(Error::InvalidArgument("invalid FFI argument")),
         };
         *out = value;
         Ok(())
@@ -386,7 +428,7 @@ pub unsafe extern "C" fn covert_config_clear_u32(
             21 => &mut live.max_age,
             22 => &mut live.keepalive,
             23 => &mut live.keepalive_jitter,
-            _ => return Err(INVALID),
+            _ => return Err(Error::InvalidArgument("invalid FFI argument")),
         } = None;
         Ok(())
     })
@@ -413,7 +455,7 @@ pub unsafe extern "C" fn covert_config_public_key(
         let out = unsafe { get_mut(out)? };
         let config = unsafe { get(config)? };
         let key = crate::crypto::to_sk(&config.interface.private_key.0);
-        let public = key.compute_public_key().map_err(|_| FAILED)?;
+        let public = key.compute_public_key()?;
         output(out, STANDARD.encode(public.as_ref()).into_bytes());
         Ok(())
     })

@@ -49,7 +49,7 @@ macro_rules! tunnel_action {
     ($name:ident, $method:ident $(, ($($aname:ident: $aty:ty),* $(,)?))?) => {
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $name(t: *mut Tunnel $(, $($aname: $aty)*)?) -> i32 {
-            guard(|| unsafe { get_mut(t)? }.$method($($($aname),*)?).map_err(|_| FAILED))
+            guard(|| unsafe { get_mut(t)? }.$method($($($aname),*)?))
         }
     };
 }
@@ -58,11 +58,9 @@ tunnel_action!(covert_tunnel_initiate, initiate);
 pub unsafe extern "C" fn covert_tunnel_process(t: *mut Tunnel, flush_on_err: u8) -> i32 {
     guard(|| {
         if flush_on_err > 1 {
-            return Err(INVALID);
+            return Err(Error::InvalidArgument("invalid FFI argument"));
         }
-        unsafe { get_mut(t)? }
-            .process_new_packets(flush_on_err != 0)
-            .map_err(|_| FAILED)
+        unsafe { get_mut(t)? }.process_new_packets(flush_on_err != 0)
     })
 }
 macro_rules! tunnel_write {
@@ -83,20 +81,15 @@ pub unsafe extern "C" fn covert_tunnel_process_packet(
     t: *mut Tunnel,
     packet: *const Packet,
 ) -> i32 {
-    guard(|| {
-        unsafe { get_mut(t)? }
-            .process_incoming_packet(clone_packet(unsafe { get(packet)? }))
-            .map_err(|_| FAILED)
-    })
+    guard(|| unsafe { get_mut(t)? }.process_incoming_packet(clone_packet(unsafe { get(packet)? })))
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn covert_tunnel_read_outbound(t: *mut Tunnel, out: *mut Buffer) -> i32 {
     guard(|| {
         let out = unsafe { get_mut(out)? };
         let v = unsafe { get_mut(t)? }
-            .read_outbound()
-            .map_err(|_| FAILED)?
-            .ok_or(EMPTY)?;
+            .read_outbound()?
+            .ok_or(Error::Empty)?;
         output(out, v.to_vec());
         Ok(())
     })
@@ -105,7 +98,7 @@ pub unsafe extern "C" fn covert_tunnel_read_outbound(t: *mut Tunnel, out: *mut B
 pub unsafe extern "C" fn covert_tunnel_read_packet(t: *mut Tunnel, out: *mut Buffer) -> i32 {
     guard(|| {
         let out = unsafe { get_mut(out)? };
-        let v = unsafe { get_mut(t)? }.read_packet().ok_or(EMPTY)?;
+        let v = unsafe { get_mut(t)? }.read_packet().ok_or(Error::Empty)?;
         output(out, v);
         Ok(())
     })
@@ -118,7 +111,9 @@ pub unsafe extern "C" fn covert_tunnel_read_outbound_packet(
     guard(|| {
         let out = unsafe { get_mut(out)? };
         *out = ptr::null_mut();
-        let p = unsafe { get_mut(t)? }.read_outbound_packet().ok_or(EMPTY)?;
+        let p = unsafe { get_mut(t)? }
+            .read_outbound_packet()
+            .ok_or(Error::Empty)?;
         *out = Box::into_raw(Box::new(p));
         Ok(())
     })
@@ -134,7 +129,7 @@ pub unsafe extern "C" fn covert_tunnel_is_live(t: *const Tunnel, out: *mut u8) -
 pub unsafe extern "C" fn covert_tunnel_local_index(t: *const Tunnel, out: *mut u32) -> i32 {
     guard(|| {
         let out = unsafe { get_mut(out)? };
-        *out = unsafe { get(t)? }.local_index().ok_or(EMPTY)?;
+        *out = unsafe { get(t)? }.local_index().ok_or(Error::Empty)?;
         Ok(())
     })
 }

@@ -1,3 +1,4 @@
+use crate::{Error, Result};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use aws_lc_rs::{
@@ -21,8 +22,8 @@ pub type SealedTimestamp = [u8; 24];
 #[path = "./tests/crypto.rs"]
 mod tests;
 
-pub fn random_sk() -> Result<PrivateKey, Unspecified> {
-    PrivateKey::generate(&X25519)
+pub fn random_sk() -> Result<PrivateKey> {
+    PrivateKey::generate(&X25519).map_err(Into::into)
 }
 
 pub fn to_sk(k: &Key) -> PrivateKey {
@@ -67,7 +68,7 @@ pub fn initiate(
     remote_pk: &Key,
     timestamp: u64,
     sender_idx: u32,
-) -> Result<Initiating, Unspecified> {
+) -> Result<Initiating> {
     let remote_pk = to_pk(remote_pk);
     let local_sk = to_sk(local_sk);
     let rng = SystemRandom::new();
@@ -111,7 +112,7 @@ pub fn initiate(
     })
 }
 
-pub fn pre_reply(local_sk: &Key, initiating: &Initiating) -> Result<(Key, u64), Unspecified> {
+pub fn pre_reply(local_sk: &Key, initiating: &Initiating) -> Result<(Key, u64)> {
     let local_sk = to_sk(local_sk);
     let Initiating {
         mut enc_pub_key,
@@ -184,7 +185,7 @@ pub fn post_reply(
     pre_shared_key: Option<&Key>,
     sender_idx: u32,
     initiating: &Initiating,
-) -> Result<(Replying, Cipher), Unspecified> {
+) -> Result<(Replying, Cipher)> {
     let remote_pk = to_pk(remote_pk);
 
     let esk = EphemeralPrivateKey::generate(&X25519, &SystemRandom::new())?;
@@ -221,10 +222,10 @@ pub fn finish(
     pre_shared_key: Option<&Key>,
     initiating: &Initiating,
     replying: &Replying,
-) -> Result<Cipher, Unspecified> {
+) -> Result<Cipher> {
     let local_sk = to_sk(local_sk);
     if replying.receiver_idx != initiating.sender_idx {
-        return Err(Unspecified);
+        return Err(Error::Crypto(Unspecified));
     }
     let aad = reply_aad(initiating, replying);
     let remote_epk = UnparsedPublicKey::new(&X25519, &replying.eph);
@@ -277,7 +278,7 @@ impl Cipher {
         Nonce::assume_unique_for_key(bytes)
     }
 
-    pub fn encrypt(&self, mut data: Vec<u8>) -> Result<(u64, Vec<u8>), Unspecified> {
+    pub fn encrypt(&self, mut data: Vec<u8>) -> Result<(u64, Vec<u8>)> {
         let value = self
             .encrypt_counter
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -292,9 +293,9 @@ impl Cipher {
         Ok((value, data))
     }
 
-    pub fn decrypt(&self, nonce: u64, mut ciphertext: Vec<u8>) -> Result<Vec<u8>, Unspecified> {
+    pub fn decrypt(&self, nonce: u64, mut ciphertext: Vec<u8>) -> Result<Vec<u8>> {
         if nonce == 0 {
-            return Err(Unspecified);
+            return Err(Error::Crypto(Unspecified));
         }
         let len = self
             .key
@@ -308,7 +309,7 @@ impl Cipher {
         // repeats within the allowed lag are whatever
         let highest = self.decrypt_counter.fetch_max(nonce, Ordering::Relaxed);
         if highest.saturating_sub(nonce) > MAX_NONCE_LAG {
-            return Err(Unspecified);
+            return Err(Error::Crypto(Unspecified));
         }
         Ok(ciphertext)
     }

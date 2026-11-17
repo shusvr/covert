@@ -10,10 +10,10 @@ free_handle!(covert_cipher_free, Cipher);
 pub unsafe extern "C" fn covert_crypto_keypair(secret: *mut u8, public: *mut u8) -> i32 {
     guard(|| {
         if secret.is_null() || public.is_null() {
-            return Err(INVALID);
+            return Err(Error::InvalidArgument("invalid FFI argument"));
         }
-        let sk = crypto::random_sk().map_err(|_| FAILED)?;
-        let pk = sk.compute_public_key().map_err(|_| FAILED)?;
+        let sk = crypto::random_sk()?;
+        let pk = sk.compute_public_key()?;
         unsafe {
             ptr::copy_nonoverlapping(crypto::sk_to_bytes(&sk).as_ptr(), secret, 32);
             ptr::copy_nonoverlapping(pk.as_ref().as_ptr(), public, 32);
@@ -25,10 +25,10 @@ pub unsafe extern "C" fn covert_crypto_keypair(secret: *mut u8, public: *mut u8)
 pub unsafe extern "C" fn covert_crypto_public_key(secret: *const u8, public: *mut u8) -> i32 {
     guard(|| {
         if public.is_null() {
-            return Err(INVALID);
+            return Err(Error::InvalidArgument("invalid FFI argument"));
         }
         let sk = crypto::to_sk(&unsafe { key(secret)? });
-        let pk = sk.compute_public_key().map_err(|_| FAILED)?;
+        let pk = sk.compute_public_key()?;
         unsafe {
             ptr::copy_nonoverlapping(pk.as_ref().as_ptr(), public, 32);
         }
@@ -51,8 +51,7 @@ pub unsafe extern "C" fn covert_crypto_initiate(
             &unsafe { key(public)? },
             timestamp,
             index,
-        )
-        .map_err(|_| FAILED)?;
+        )?;
         *out = Box::into_raw(Box::new(Packet::Initiating(p)));
         Ok(())
     })
@@ -67,12 +66,12 @@ pub unsafe extern "C" fn covert_crypto_pre_reply(
     guard(|| {
         let timestamp = unsafe { get_mut(timestamp)? };
         if public.is_null() {
-            return Err(INVALID);
+            return Err(Error::InvalidArgument("invalid FFI argument"));
         }
         let Packet::Initiating(p) = (unsafe { get(initiation)? }) else {
-            return Err(INVALID);
+            return Err(Error::InvalidArgument("invalid FFI argument"));
         };
-        let (pk, ts) = crypto::pre_reply(&unsafe { key(secret)? }, p).map_err(|_| FAILED)?;
+        let (pk, ts) = crypto::pre_reply(&unsafe { key(secret)? }, p)?;
         unsafe {
             ptr::copy_nonoverlapping(pk.as_ptr(), public, 32);
         }
@@ -95,15 +94,14 @@ pub unsafe extern "C" fn covert_crypto_post_reply(
         *reply = ptr::null_mut();
         *cipher = ptr::null_mut();
         let Packet::Initiating(p) = (unsafe { get(initiation)? }) else {
-            return Err(INVALID);
+            return Err(Error::InvalidArgument("invalid FFI argument"));
         };
         let (r, c) = crypto::post_reply(
             &unsafe { key(public)? },
             unsafe { psk(shared)? }.as_ref(),
             index,
             p,
-        )
-        .map_err(|_| FAILED)?;
+        )?;
         let r = Box::new(Packet::Reply(r));
         let c = Box::new(c);
         *reply = Box::into_raw(r);
@@ -123,18 +121,17 @@ pub unsafe extern "C" fn covert_crypto_finish(
         let out = unsafe { get_mut(out)? };
         *out = ptr::null_mut();
         let Packet::Initiating(i) = (unsafe { get(initiation)? }) else {
-            return Err(INVALID);
+            return Err(Error::InvalidArgument("invalid FFI argument"));
         };
         let Packet::Reply(r) = (unsafe { get(reply)? }) else {
-            return Err(INVALID);
+            return Err(Error::InvalidArgument("invalid FFI argument"));
         };
         let c = crypto::finish(
             &unsafe { key(secret)? },
             unsafe { psk(shared)? }.as_ref(),
             i,
             r,
-        )
-        .map_err(|_| FAILED)?;
+        )?;
         *out = Box::into_raw(Box::new(c));
         Ok(())
     })
@@ -150,9 +147,7 @@ pub unsafe extern "C" fn covert_crypto_encrypt(
     guard(|| {
         let out = unsafe { get_mut(out)? };
         let counter = unsafe { get_mut(counter)? };
-        let (n, v) = unsafe { get(cipher)? }
-            .encrypt(unsafe { bytes(data, len)? }.to_vec())
-            .map_err(|_| FAILED)?;
+        let (n, v) = unsafe { get(cipher)? }.encrypt(unsafe { bytes(data, len)? }.to_vec())?;
         *counter = n;
         output(out, v);
         Ok(())
@@ -168,9 +163,7 @@ pub unsafe extern "C" fn covert_crypto_decrypt(
 ) -> i32 {
     guard(|| {
         let out = unsafe { get_mut(out)? };
-        let v = unsafe { get(cipher)? }
-            .decrypt(counter, unsafe { bytes(data, len)? }.to_vec())
-            .map_err(|_| FAILED)?;
+        let v = unsafe { get(cipher)? }.decrypt(counter, unsafe { bytes(data, len)? }.to_vec())?;
         output(out, v);
         Ok(())
     })

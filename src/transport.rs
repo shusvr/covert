@@ -1,3 +1,4 @@
+use crate::{Error, Result};
 use crate::{
     codec::{self, Packet},
     config::{Config, Peer},
@@ -12,8 +13,6 @@ use uuid::Uuid;
 mod config;
 pub use crate::state::{PeerStatus, StatusSnapshot};
 pub use config::*;
-
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync + 'static>>;
 
 pub trait Adapter {
     type Route: Clone;
@@ -143,7 +142,7 @@ impl<A: Adapter> Endpoint<A> {
             Some(Ok((packet, consumed))) if consumed == buf.len() => {
                 self.process_incoming(route, packet)
             }
-            _ => Err("Malformed datagram".into()),
+            _ => Err(Error::MalformedDatagram),
         }
     }
 

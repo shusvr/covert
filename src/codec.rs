@@ -1,9 +1,9 @@
 use crate::crypto::{Initiating, Replying};
 
+use crate::{Error, Result};
 use bitflags::bitflags;
 use bytes::{Buf, Bytes, BytesMut};
-use std::{io, str::FromStr};
-use thiserror::Error;
+use std::str::FromStr;
 use tokio_util::codec::{Decoder, Encoder};
 
 const DEFAULT_LAYOUT: PacketLayout = PacketLayout {
@@ -86,7 +86,7 @@ impl PacketLayout {
 impl FromStr for PacketLayout {
     type Err = Error;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn from_str(s: &str) -> Result<Self> {
         let patch = serde_urlencoded::from_str(s).map_err(Error::LayoutParseErr)?;
         let layout = DEFAULT_LAYOUT.apply(patch);
         layout.check()?;
@@ -142,7 +142,7 @@ impl PacketLayout {
         }
     }
 
-    pub fn check(&self) -> Result<(), Error> {
+    pub fn check(&self) -> Result<()> {
         let r = |s: &'static str, x: usize, o: usize| (s, x..x + o);
         #[rustfmt::skip]
         let ranges = [
@@ -264,34 +264,15 @@ pub enum Packet {
 }
 
 impl Packet {
-    pub fn to_bytes(self, layout: &PacketLayout) -> Result<Bytes, Error> {
+    pub fn to_bytes(self, layout: &PacketLayout) -> Result<Bytes> {
         let mut buf = BytesMut::new();
         append(&mut buf, self, layout)?;
         Ok(buf.freeze())
     }
 }
 
-#[derive(Debug, Error)]
-pub enum Error {
-    #[error("Received unexpected packet type {0}")]
-    UnexpectedTy(u8),
-    #[error("Tried encoding a packet that is too large")]
-    PacketOverflow,
-    #[error("Invalid packet layout({0})")]
-    InvalidLayout(&'static str),
-    #[error("Failed to parse layout: {0}")]
-    LayoutParseErr(serde_urlencoded::de::Error),
-    #[error("Layout param `{0}` doesn't exist")]
-    UnkownLayoutParam(String),
-    #[error("Layout params `{0}` and `{1}` will cause overlap")]
-    LayoutFieldsOverlap(String, String),
-
-    #[error("Io: {0}")]
-    Io(#[from] io::Error),
-}
-
 /// Consumes one complete packet, leaving incomplete or invalid input untouched.
-pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet, Error>> {
+pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet>> {
     match parse_slice(buf, layout)? {
         Ok((packet, consumed)) => {
             buf.advance(consumed);
@@ -302,7 +283,7 @@ pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet,
 }
 
 /// Parses a borrowed packet without copying the encoded header or advancing a buffer.
-pub fn parse_slice(buf: &[u8], layout: &PacketLayout) -> Option<Result<(Packet, usize), Error>> {
+pub fn parse_slice(buf: &[u8], layout: &PacketLayout) -> Option<Result<(Packet, usize)>> {
     if buf.len() < usize::from(layout.oty) + 1 {
         return None;
     }
@@ -391,7 +372,7 @@ pub fn parse_slice(buf: &[u8], layout: &PacketLayout) -> Option<Result<(Packet, 
 /// Pads to the corresponding `oip`, `orp`, or `odp` minimum total length;
 /// packets already at or above that length are never truncated.
 /// The layout must have passed `PacketLayout::check`.
-pub fn append(buf: &mut BytesMut, packet: Packet, layout: &PacketLayout) -> Result<(), Error> {
+pub fn append(buf: &mut BytesMut, packet: Packet, layout: &PacketLayout) -> Result<()> {
     let ty_end = usize::from(layout.oty)
         .checked_add(1)
         .ok_or(Error::PacketOverflow)?;
@@ -539,7 +520,7 @@ impl Decoder for Codec {
     type Item = Packet;
     type Error = Error;
 
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
         parse(src, &self.layout).transpose()
     }
 }
@@ -547,7 +528,7 @@ impl Decoder for Codec {
 impl Encoder<Packet> for Codec {
     type Error = Error;
 
-    fn encode(&mut self, item: Packet, dst: &mut BytesMut) -> Result<(), Self::Error> {
+    fn encode(&mut self, item: Packet, dst: &mut BytesMut) -> Result<()> {
         append(dst, item, &self.layout)
     }
 }
