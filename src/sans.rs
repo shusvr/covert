@@ -431,6 +431,10 @@ impl Tunnel {
         self.outbound.pop_front()
     }
 
+    pub fn has_outbound(&self) -> bool {
+        !self.outbound.is_empty()
+    }
+
     pub fn read_packet(&mut self) -> Option<Vec<u8>> {
         self.decrypted.pop_front()
     }
