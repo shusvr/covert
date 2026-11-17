@@ -1,8 +1,8 @@
 use crate::{
     codec::{self, Packet},
     config::{Config, Peer},
-    sans::{DecodedInitiation, Tunnel},
     state::State,
+    tunnel::{DecodedInitiation, Tunnel},
 };
 use etherparse::IpSlice;
 use std::{collections::HashMap, time::Instant};
@@ -30,6 +30,10 @@ pub struct Endpoint<A: Adapter> {
 
 impl<A: Adapter> Endpoint<A> {
     pub fn new(adapter: A, config: Config) -> Result<Self> {
+        let mut state = State::new();
+        for peer in &config.peers {
+            state.peer_statistics.entry(peer.id).or_default();
+        }
         Ok(Self {
             peers: config
                 .peers
@@ -38,7 +42,7 @@ impl<A: Adapter> Endpoint<A> {
                 .collect::<Result<HashMap<_, _>>>()?,
             config,
             adapter,
-            state: State::new(),
+            state,
         })
     }
 
@@ -111,12 +115,14 @@ impl<A: Adapter> Endpoint<A> {
     fn process_incoming(&mut self, route: A::Route, packet: Packet) -> Result<()> {
         if let Some((peer_id, inv)) = self.identify(&packet)? {
             let pt = self.peers.get_mut(&peer_id).unwrap();
-            if let Some(decoded) = inv {
-                pt.tunnel.accept_initiation(decoded)?;
+            let accepted = if let Some(decoded) = inv {
+                pt.tunnel.accept_initiation(decoded)?
             } else {
-                pt.tunnel.process_incoming_packet(packet)?;
+                pt.tunnel.process_incoming_packet_accepted(packet)?
+            };
+            if accepted {
+                pt.address = Some(route);
             }
-            pt.address = Some(route);
 
             pt.advance(&mut self.state)?;
 
@@ -213,3 +219,6 @@ impl<R> PeerTunnel<R> {
         self.tunnel.push_packet(packet);
     }
 }
+
+#[cfg(test)]
+mod tests;

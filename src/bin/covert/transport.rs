@@ -1,6 +1,6 @@
 use crate::{
     codec::{DataFlags, Packet},
-    sans::{DecodedInitiation, Tunnel},
+    tunnel::{DecodedInitiation, Tunnel},
 };
 use anyhow::{Context, Result};
 use covert::config::{Config, Peer};
@@ -172,7 +172,7 @@ impl<R> PeerTunnel<R> {
     }
 
     fn advance(&mut self, id: Uuid, state: &State) -> Result<()> {
-        self.tunnel.process_new_packets()?;
+        self.tunnel.process_new_packets(true)?;
         let established = self.tunnel.established_at();
         if established.is_some() && established != self.established {
             state.record_established(id);

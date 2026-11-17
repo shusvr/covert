@@ -158,10 +158,15 @@ impl Tunnel {
     /// Process an already decoded packet without buffering or parsing its bytes.
     /// Call `process_new_packets` afterward to handle outgoing work.
     pub fn process_incoming_packet(&mut self, packet: Packet) -> Result<()> {
+        self.process_incoming_packet_accepted(packet).map(|_| ())
+    }
+
+    /// True only when this packet was authenticated and accepted by the session.
+    pub(crate) fn process_incoming_packet_accepted(&mut self, packet: Packet) -> Result<bool> {
         match packet {
             Packet::Initiating(initiating) => {
                 let decoded = DecodedInitiation::decode(&self.local_sk, initiating)?;
-                self.accept_initiation(decoded)?;
+                return self.accept_initiation(decoded);
             }
             Packet::Reply(replying) => {
                 if let State::Initiated { initiated, .. } = &self.state
@@ -172,6 +177,7 @@ impl Tunnel {
                             sender_idx = replying.sender_idx, %err, "Rejected reply: authentication failed"))?;
                     let local_idx = initiated.sender_idx;
                     self.establish(cipher, local_idx, replying.sender_idx, 0);
+                    return Ok(true);
                 } else {
                     debug!(receiver_idx = replying.receiver_idx, sender_idx = replying.sender_idx,
                         local_idx = ?self.local_index(), "Ignored reply: no matching initiation");
@@ -198,7 +204,7 @@ impl Tunnel {
                             local_idx = *local_idx,
                             "Ignored data: receiver index mismatch"
                         );
-                        return Ok(());
+                        return Ok(false);
                     }
                     if self.liveness.has_expired(now - *established, now - *seen) {
                         debug!(
@@ -227,6 +233,7 @@ impl Tunnel {
                             self.decrypted.push_back(plaintext);
                         }
                         *seen = now;
+                        return Ok(true);
                     }
                 } else {
                     trace!(
@@ -236,17 +243,18 @@ impl Tunnel {
                 }
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Apply a decoded initiation without repeating its cryptographic decoding.
-    pub fn accept_initiation(&mut self, decoded: DecodedInitiation) -> Result<()> {
+    /// Returns true when accepted, or false when ignored.
+    pub fn accept_initiation(&mut self, decoded: DecodedInitiation) -> Result<bool> {
         if decoded.public_key != self.remote_pk {
             debug!(
                 sender_idx = decoded.initiation.sender_idx,
                 "Ignored initiation: peer identity mismatch"
             );
-            return Ok(());
+            return Ok(false);
         }
         if matches!(self.state, State::Initiated { .. }) {
             let local_public_key =
@@ -257,7 +265,7 @@ impl Tunnel {
                     sender_idx = decoded.initiation.sender_idx,
                     "Ignored competing initiation: retaining initiator role"
                 );
-                return Ok(());
+                return Ok(false);
             }
         }
         if matches!(
@@ -268,7 +276,7 @@ impl Tunnel {
                 sender_idx = decoded.initiation.sender_idx,
                 "Ignored initiation: stale or replayed timestamp"
             );
-            return Ok(());
+            return Ok(false);
         }
         debug!(
             sender_idx = decoded.initiation.sender_idx,
@@ -292,7 +300,7 @@ impl Tunnel {
         );
         self.outbound.push_back(Packet::Reply(reply));
         debug!(local_idx, "Queued handshake reply");
-        Ok(())
+        Ok(true)
     }
 
     fn establish(&mut self, cipher: Cipher, local_idx: u32, receiver_idx: u32, timestamp: u64) {
@@ -416,7 +424,7 @@ impl Tunnel {
             }
         };
 
-        Ok(())
+        result
     }
 
     pub fn read_outbound(&mut self) -> Result<Option<Bytes>> {

@@ -6,7 +6,7 @@ use covert::{
     codec::{self, PacketLayout},
     config::{Config, ListenerConfig},
     crypto::{self, pk_to_bytes, random_sk, sk_to_bytes, to_sk},
-    sans,
+    tunnel,
 };
 use etherparse::IpSlice;
 use std::{
