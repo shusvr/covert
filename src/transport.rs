@@ -132,13 +132,18 @@ impl<A: Adapter> Endpoint<A> {
     /// Process exactly one complete datagram; reject truncation, trailing bytes,
     /// and concatenated frames before touching any tunnel state.
     pub fn out_write_datagram(&mut self, route: A::Route, buf: &[u8]) {
+        if let Err(err) = self.process_datagram(route, buf) {
+            tracing::trace!(%err, "Discarding invalid datagram");
+        }
+    }
+
+    /// Process one datagram, reporting whether it was authenticated and accepted.
+    pub fn process_datagram(&mut self, route: A::Route, buf: &[u8]) -> Result<bool> {
         match codec::parse_slice(buf, &self.config.layout) {
             Some(Ok((packet, consumed))) if consumed == buf.len() => {
-                if let Err(err) = self.process_incoming(route, packet) {
-                    error!(%err, "Failed to process incoming datagram");
-                }
+                self.process_incoming(route, packet)
             }
-            _ => tracing::trace!("Discarding malformed datagram"),
+            _ => Err("Malformed datagram".into()),
         }
     }
 
@@ -165,11 +170,11 @@ impl<A: Adapter> Endpoint<A> {
         self.state.status(&self.config)
     }
 
-    fn process_incoming(&mut self, route: A::Route, packet: Packet) -> Result<()> {
+    fn process_incoming(&mut self, route: A::Route, packet: Packet) -> Result<bool> {
         if let Some((peer_id, inv)) = self.identify(&packet)? {
             let pt = self.peers.get_mut(&peer_id).unwrap();
             if !self.adapter.accepts(pt.address.as_ref(), &route, &packet) {
-                return Ok(());
+                return Ok(false);
             }
             let accepted = if let Some(decoded) = inv {
                 pt.tunnel.accept_initiation(decoded)?
@@ -195,9 +200,10 @@ impl<A: Adapter> Endpoint<A> {
             {
                 self.adapter.deliver(route.clone(), packet);
             }
+            return Ok(accepted);
         }
 
-        Ok(())
+        Ok(false)
     }
 
     fn identify(&self, packet: &Packet) -> Result<Option<(Uuid, Option<DecodedInitiation>)>> {

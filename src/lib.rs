@@ -6,3 +6,5 @@ pub mod tunnel;
 
 mod state;
 pub mod transport;
+
+mod android_logging;

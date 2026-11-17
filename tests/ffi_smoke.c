@@ -16,7 +16,7 @@ static void transfer(CovertTunnel *from, CovertTunnel *to) {
         OK(covert_buffer_free(&wire));
     }
     assert(status == COVERT_EMPTY);
-    OK(covert_tunnel_process(to));
+    OK(covert_tunnel_process(to, 1));
 }
 
 int main(void) {
@@ -84,7 +84,7 @@ int main(void) {
     assert(covert_tunnel_local_index(ta, &index) == COVERT_EMPTY);
     OK(covert_tunnel_push(ta, message, sizeof(message)));
     OK(covert_tunnel_initiate(ta));
-    OK(covert_tunnel_process(ta));
+    OK(covert_tunnel_process(ta, 1));
     transfer(ta, tb);
     transfer(tb, ta);
     transfer(ta, tb);

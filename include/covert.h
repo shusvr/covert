@@ -17,6 +17,12 @@ typedef struct CovertLayout CovertLayout;
 typedef struct CovertPacket CovertPacket;
 typedef struct CovertCipher CovertCipher;
 typedef struct CovertTunnel CovertTunnel;
+typedef struct CovertEndpoint CovertEndpoint;
+typedef struct CovertConfig CovertConfig;
+#define COVERT_ABI_VERSION 2u
+uint32_t covert_abi_version(void);
+/* Installs Android logcat tracing; no-op on other platforms. */
+void covert_android_init_logging(void);
 typedef struct { uint8_t *data; size_t len; } CovertBuffer;
 /* timeout/max_age are seconds (0 disables); keepalive delay/jitter are seconds. */
 typedef struct {
@@ -83,7 +89,8 @@ int32_t covert_tunnel_new(const CovertLayout *layout, const uint8_t *secret,
     const uint8_t *public_key, const uint8_t *shared, const CovertLiveness *liveness,
     CovertTunnel **out);
 int32_t covert_tunnel_initiate(CovertTunnel *tunnel);
-int32_t covert_tunnel_process(CovertTunnel *tunnel);
+/* flush_on_error is 0 or 1; errors are reported even when input is cleared. */
+int32_t covert_tunnel_process(CovertTunnel *tunnel, uint8_t flush_on_error);
 int32_t covert_tunnel_push(CovertTunnel *tunnel, const uint8_t *data, size_t len);
 /* Buffered byte-stream input; use process_packet for already decoded packets. */
 int32_t covert_tunnel_write_incoming(CovertTunnel *tunnel, const uint8_t *data, size_t len);
@@ -93,6 +100,81 @@ int32_t covert_tunnel_read_outbound_packet(CovertTunnel *tunnel, CovertPacket **
 int32_t covert_tunnel_read_packet(CovertTunnel *tunnel, CovertBuffer *out);
 int32_t covert_tunnel_is_live(const CovertTunnel *tunnel, uint8_t *out);
 int32_t covert_tunnel_local_index(const CovertTunnel *tunnel, uint32_t *out);
+/* Opaque handle to the library's main Config, not an Android/client DTO.
+ * New configs have no peers, default layout, MTU 1450 and UDP listener 40676.
+ * COVERT_CONFIG_INTERFACE selects interface fields; other scopes are peer
+ * indices. Removing a peer shifts subsequent indices. Getters copy their output.
+ * Strings are UTF-8. Keys use Base64; IP ranges use comma/whitespace-separated
+ * numeric CIDRs (bare IPs imply /32 or /128). Empty PSK clears it; empty endpoint
+ * selects passive/unspecified transport. Endpoints must already be resolved:
+ * UDP uses IP:port ([IPv6]:port), ICMP uses IPv4. Unknown scope/field combinations
+ * return INVALID. Invalid setters leave the config unchanged.
+ * TRANSPORT is UDP=0/ICMP=1; peers also support unspecified=2. ICMP_MODE is
+ * EchoReply=0/OnlyEcho=1. Changing transport initializes its transport defaults;
+ * configure its port/mode/endpoint afterward. Interface changes do not rewrite
+ * peer transports. Optional PSK/endpoint/liveness getters return EMPTY if unset.
+ * Liveness u32 fields are optional; clear restores the normal fallback rules.
+ * Key getters return secret material when requested; never log it.
+ * The optional error buffer must start at {0}; INVALID may populate it with a
+ * diagnostic, which must be freed even when the operation fails.
+ */
+#define COVERT_CONFIG_INTERFACE SIZE_MAX
+enum { COVERT_CONFIG_LAYOUT = 0, COVERT_CONFIG_DEV_NAME = 1,
+    COVERT_CONFIG_PRIVATE_KEY = 2, COVERT_CONFIG_ADDRESSES = 3,
+    COVERT_CONFIG_PUBLIC_KEY = 4, COVERT_CONFIG_PSK = 5,
+    COVERT_CONFIG_ALLOWED_IPS = 6, COVERT_CONFIG_ENDPOINT = 7,
+    COVERT_CONFIG_PEER_ID = 8, COVERT_CONFIG_MTU = 16,
+    COVERT_CONFIG_TRANSPORT = 17, COVERT_CONFIG_LISTEN_PORT = 18,
+    COVERT_CONFIG_ICMP_MODE = 19, COVERT_CONFIG_TIMEOUT = 20,
+    COVERT_CONFIG_MAX_AGE = 21, COVERT_CONFIG_KEEPALIVE = 22,
+    COVERT_CONFIG_KEEPALIVE_JITTER = 23 };
+int32_t covert_config_new(CovertConfig **out);
+int32_t covert_config_free(CovertConfig *config);
+int32_t covert_config_add_peer(CovertConfig *config, size_t *index);
+int32_t covert_config_remove_peer(CovertConfig *config, size_t index);
+int32_t covert_config_peer_count(const CovertConfig *config, size_t *count);
+int32_t covert_config_set_string(CovertConfig *config, size_t scope, uint32_t field, const uint8_t *data, size_t len);
+int32_t covert_config_get_string(const CovertConfig *config, size_t scope, uint32_t field, CovertBuffer *out);
+int32_t covert_config_set_u32(CovertConfig *config, size_t scope, uint32_t field, uint32_t value);
+int32_t covert_config_get_u32(const CovertConfig *config, size_t scope, uint32_t field, uint32_t *out);
+int32_t covert_config_clear_u32(CovertConfig *config, size_t scope, uint32_t field);
+int32_t covert_config_validate(const CovertConfig *config, CovertBuffer *error);
+/* Derives the interface public key as Base64 text, without a trailing NUL. */
+int32_t covert_config_public_key(const CovertConfig *config, CovertBuffer *out);
+/* Copies the main Config into a fixed-remote client endpoint. Exactly one peer
+ * and UDP or ICMP EchoReply are required. Config can then be edited/freed. */
+int32_t covert_endpoint_from_config(const CovertConfig *config, CovertEndpoint **out, CovertBuffer *error);
+
+/* Fixed-remote single-peer client API, backed by the shared Endpoint engine.
+ * The host owns/protects/binds the socket and handles UDP or ICMP framing.
+ * Both IPv4 and IPv6 IP packets are accepted; select routes in the host VPN.
+ * mode: UDP supports either handshake role; ICMP_ECHO_REPLY only initiates and
+ * rejects reflected initiations. ICMP inputs must already be unwrapped replies.
+ * Advance once after creation and periodically (e.g. every 100ms). Writes drive
+ * immediate work too. Drain both output queues until COVERT_EMPTY each tick.
+ * out_write requires exactly one complete encoded datagram; OK means accepted,
+ * EMPTY means ignored, FAILED means malformed or unauthenticated. Neither EMPTY
+ * nor FAILED from network input is fatal. PANIC requires discarding the handle.
+ * Layout and keys are copied. Liveness timeout/max_age must fit uint32_t.
+ * Statistics count accepted plaintext, including queued pre-handshake traffic;
+ * receive bytes are counted when drained by tun_read. Timestamps are Unix ms,
+ * with zero meaning never established. connected is 0 or 1.
+ */
+enum { COVERT_CLIENT_UDP = 0, COVERT_CLIENT_ICMP_ECHO_REPLY = 1 };
+typedef struct {
+    uint64_t sent, received, first_established_at, last_established_at;
+    uint8_t connected;
+} CovertEndpointStatus;
+int32_t covert_endpoint_client_new(const CovertLayout *layout,
+    const uint8_t *secret, const uint8_t *public_key, const uint8_t *shared,
+    const CovertLiveness *liveness, uint32_t mode, CovertEndpoint **out);
+int32_t covert_endpoint_free(CovertEndpoint *endpoint);
+int32_t covert_endpoint_advance(CovertEndpoint *endpoint);
+int32_t covert_endpoint_tun_write(CovertEndpoint *endpoint, const uint8_t *data, size_t len);
+int32_t covert_endpoint_out_write(CovertEndpoint *endpoint, const uint8_t *data, size_t len);
+int32_t covert_endpoint_read_outbound(CovertEndpoint *endpoint, CovertBuffer *out);
+int32_t covert_endpoint_tun_read(CovertEndpoint *endpoint, CovertBuffer *out);
+int32_t covert_endpoint_status(const CovertEndpoint *endpoint, CovertEndpointStatus *out);
 #ifdef __cplusplus
 }
 #endif
