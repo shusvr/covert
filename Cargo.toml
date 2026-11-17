@@ -3,6 +3,9 @@ name = "covert"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 anyhow = "1.0.104"
 aws-lc-rs = "1.18.2"
