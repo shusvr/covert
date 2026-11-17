@@ -19,13 +19,13 @@ pub struct PeerStatistics {
     pub last_established_at: AtomicU64,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct StatusSnapshot {
     pub session: Uuid,
     pub peers: Vec<PeerStatus>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct PeerStatus {
     pub id: Uuid,
     pub psk: bool,

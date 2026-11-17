@@ -698,3 +698,126 @@ fn peer_liveness_override_expires_idle_session_despite_disabled_interface_timeou
     relay(&a, &mut b, 2);
     assert_eq!(b.tun_read().collect::<Vec<_>>(), vec![ipv4(1)]);
 }
+
+#[test]
+fn datagram_api_rejects_truncated_trailing_and_concatenated_frames_atomically() {
+    let (mut a, mut b) = (endpoint(1, 2, true), endpoint(2, 1, false));
+    a.advance();
+    let initiation = take_wire(&a).remove(0).1;
+    for end in 0..initiation.len() {
+        b.out_write_datagram(9, &initiation[..end]);
+    }
+    let mut trailing = initiation.clone();
+    trailing.push(0);
+    b.out_write_datagram(9, &trailing);
+    let mut concatenated = initiation.clone();
+    concatenated.extend_from_slice(&initiation);
+    b.out_write_datagram(9, &concatenated);
+    assert_eq!(route(&b), None);
+    assert!(take_wire(&b).is_empty());
+    b.out_write_datagram(2, &initiation);
+    assert_eq!(route(&b), Some(2));
+    relay(&b, &mut a, 3);
+    assert_eq!(a.status().peers[0].status, "connected");
+}
+
+struct Hooks {
+    capture: Capture,
+    calls: RefCell<Vec<(Option<u8>, u8, Vec<u8>)>>,
+}
+impl Adapter for Hooks {
+    type Route = u8;
+    fn peer_route(&self, peer: &Peer) -> Option<u8> {
+        self.capture.peer_route(peer)
+    }
+    fn deliver(&self, route: u8, packet: Packet) {
+        self.capture.deliver(route, packet);
+    }
+    fn accepts(&self, _: Option<&u8>, incoming: &u8, _: &Packet) -> bool {
+        *incoming != 9
+    }
+    fn route_changed<'a>(
+        &self,
+        previous: Option<&u8>,
+        next: &u8,
+        others: impl Iterator<Item = &'a u8>,
+    ) -> Result<()> {
+        self.calls
+            .borrow_mut()
+            .push((previous.copied(), *next, others.copied().collect()));
+        if *next == 8 {
+            return Err("route side effect failed".into());
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn adapter_validation_prevents_processing_and_route_hook_precedes_commit() {
+    let mut a = endpoint(1, 2, true);
+    let mut config = endpoint(2, 1, false).config;
+    let other = endpoint(2, 3, true).config.peers.remove(0);
+    config.peers.push(other);
+    let peer_id = config.peers[0].id;
+    let mut b = Endpoint::new(
+        Hooks {
+            capture: Capture::default(),
+            calls: RefCell::new(Vec::new()),
+        },
+        config,
+    )
+    .unwrap();
+    a.advance();
+    let initiation = take_wire(&a).remove(0).1;
+    b.out_write_datagram(9, &initiation);
+    assert!(b.adapter().calls.borrow().is_empty());
+    assert!(!b.peers[&peer_id].tunnel.is_live());
+    b.out_write_datagram(2, &initiation);
+    assert_eq!(*b.adapter().calls.borrow(), vec![(None, 2, vec![1])]);
+    assert_eq!(b.peers[&peer_id].address, Some(2));
+    let reply = b
+        .adapter()
+        .capture
+        .0
+        .take()
+        .remove(0)
+        .1
+        .to_bytes(&b.config.layout)
+        .unwrap();
+    a.out_write_datagram(3, &reply);
+    a.tun_write(&ipv4(1)).unwrap();
+    b.out_write_datagram(8, &take_wire(&a).remove(0).1);
+    assert_eq!(b.peers[&peer_id].address, Some(2));
+    a.tun_write(&ipv4(2)).unwrap();
+    b.out_write_datagram(4, &take_wire(&a).remove(0).1);
+    assert_eq!(b.peers[&peer_id].address, Some(4));
+    let calls = b.adapter().calls.borrow();
+    assert_eq!(calls[1], (Some(2), 8, vec![1]));
+    assert_eq!(calls[2], (Some(2), 4, vec![1]));
+}
+
+#[test]
+fn unsupported_peers_cannot_handshake_or_receive_tun_traffic() {
+    struct Reject;
+    impl Adapter for Reject {
+        type Route = u8;
+        fn supports_peer(&self, _: &Peer) -> bool {
+            false
+        }
+        fn peer_route(&self, _: &Peer) -> Option<u8> {
+            panic!("unsupported peer should not be initialized")
+        }
+        fn deliver(&self, _: u8, _: Packet) {
+            panic!("unsupported peer should not receive traffic")
+        }
+    }
+    let mut a = endpoint(1, 2, true);
+    let mut b = Endpoint::new(Reject, endpoint(2, 1, false).config).unwrap();
+    a.advance();
+    b.out_write_datagram(2, &take_wire(&a).remove(0).1);
+    b.tun_write(&ipv4(1)).unwrap();
+    b.advance();
+    assert!(b.peers.is_empty());
+    assert_eq!(b.status().peers[0].status, "disconnected");
+    assert_eq!(b.status().peers[0].sent, 0);
+}

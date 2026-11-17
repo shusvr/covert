@@ -1,26 +1,26 @@
-use crate::transport::{State, TransportEndpoint};
 use anyhow::{Context, Result, bail};
 use base64::prelude::*;
 use clap::{Parser, Subcommand};
 use covert::{
-    codec::{self, PacketLayout},
+    codec::PacketLayout,
     config::{Config, ListenerConfig},
     crypto::{self, pk_to_bytes, random_sk, sk_to_bytes, to_sk},
-    tunnel,
+    transport::Endpoint,
 };
-use etherparse::IpSlice;
 use std::{
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{Level, error, info, trace, warn};
 
+mod icmp;
+mod network;
 mod rpc;
-mod transport;
 mod tun_io;
+mod udp;
 
 #[derive(Parser)]
 #[command(version = env!("COVERT_VERSION"), about)]
@@ -316,117 +316,89 @@ async fn serve(
     chanlen: Option<u16>,
     rpc: Option<&rpc::Server>,
 ) -> Result<()> {
-    let chanlen = chanlen.unwrap_or(512) as usize;
-    let (tun_in_tx, tun_in_rx) = mpsc::channel::<Vec<u8>>(chanlen);
-
-    let state = Arc::new(State::new(tun_in_tx));
-    let rpc_state = state.clone();
-    let endpoint = async {
-        match &config.interface.listener {
-            ListenerConfig::Udp { udp } => {
-                let endpoint = transport::udp::create_udp_endpoint(&state, &config, udp).await?;
-                run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
-            }
-            ListenerConfig::Icmp { icmp } => {
-                let endpoint = transport::icmp::create_icmp_endpoint(&state, &config, icmp).await?;
-                run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
-            }
+    let capacity = usize::from(chanlen.unwrap_or(512)).max(1);
+    match &config.interface.listener {
+        ListenerConfig::Udp { udp } => {
+            let (socket, endpoint) = udp::Udp::bind(config, udp).await?;
+            run_endpoint(tun, config, socket, endpoint, capacity, rpc).await
         }
-    };
-    if let Some(server) = rpc {
-        tokio::select! {
-            result = endpoint => result,
-            result = server.serve(rpc_state, config.clone()) => {
-                result.context("RPC listener failed")
-            }
+        ListenerConfig::Icmp { icmp } => {
+            let (socket, endpoint) = icmp::Icmp::bind(config, icmp)?;
+            run_endpoint(tun, config, socket, endpoint, capacity, rpc).await
         }
-    } else {
-        endpoint.await
     }
 }
 
-async fn run_endpoint(
+async fn run_endpoint<S: network::Socket>(
     tun: &tun::AsyncDevice,
-    state: Arc<State>,
-    config: Arc<Config>,
-    mut listener: impl TransportEndpoint,
-    mut tun_in_rx: mpsc::Receiver<Vec<u8>>,
+    config: &Config,
+    socket: S,
+    endpoint: Endpoint<S::Adapter>,
+    capacity: usize,
+    rpc: Option<&rpc::Server>,
 ) -> Result<()> {
+    let (out_tx, out_rx) = mpsc::channel(capacity);
+    let (in_tx, mut in_rx) = mpsc::channel(capacity);
+    let (status_tx, status_rx) = watch::channel(endpoint.status());
     let mut reader = tun_io::Reader::new(config.interface.mtu);
     let mut writer = tun_io::Writer::default();
-    loop {
-        tokio::select! {
-            result = reader.recv(tun) => match result {
-                Ok(count) => {
-                    trace!(packets = count, "Received TUN batch");
-                    for index in 0..count {
-                        let packet = reader.packet(index);
-                        if let Err(err) = process_tun_packet(&state, &config, &mut listener, packet).await {
-                            error!("Failed to process tun packet: {err}");
-                        }
-                    }
-                }
-                Err(err) => error!("Failed to receive on tun: {err}"),
-            },
-            opt = tun_in_rx.recv() => if let Some(packet) = opt {
-                trace!(len=packet.len(), "Received packet to tun");
-
-                writer.send(tun, packet, &mut tun_in_rx).await?;
-            } else {
-                break Ok(())
+    // Read and write independently: a full queue in one direction must not
+    // prevent the opposite direction from draining its queue.
+    let read = async {
+        loop {
+            let count = reader.recv(tun).await?;
+            trace!(packets = count, "Received TUN batch");
+            for index in 0..count {
+                out_tx
+                    .send(reader.packet(index).to_vec())
+                    .await
+                    .context("Socket worker stopped")?;
             }
         }
-    }
-}
-
-async fn process_tun_packet(
-    state: &State,
-    config: &Config,
-    listener: &mut impl TransportEndpoint,
-    packet: &[u8],
-) -> Result<()> {
-    let dst = IpSlice::from_slice(packet)?.destination_addr();
-
-    for p in config.peers.iter() {
-        if p.allowed_ips.iter().any(|x| x.contains(&dst)) {
-            if let Err(err) = listener.trasmit(state, config, p.id, packet).await {
-                error!("Failed to transmit: {err}");
-            }
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    };
+    let write = async {
+        while let Some(packet) = in_rx.recv().await {
+            writer.send(tun, packet, &mut in_rx).await?;
         }
+        Ok::<(), anyhow::Error>(())
+    };
+    let rpc = async {
+        match rpc {
+            Some(server) => server.serve(status_rx).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        result = network::run(socket, endpoint, out_rx, in_tx, status_tx) => result,
+        result = read => result,
+        result = write => result,
+        result = rpc => result.context("RPC listener failed"),
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn tun_routing_only_requires_valid_ip_headers() {
-        struct Capture(Vec<(uuid::Uuid, Vec<u8>)>);
-        impl TransportEndpoint for Capture {
-            async fn trasmit(
-                &mut self,
-                _state: &State,
-                _config: &Config,
-                peer_id: uuid::Uuid,
-                packet: &[u8],
-            ) -> Result<()> {
-                self.0.push((peer_id, packet.to_vec()));
-                Ok(())
+    #[test]
+    fn tun_routing_only_requires_valid_ip_headers() {
+        use covert::{codec::Packet, config::Peer, transport::Adapter};
+        struct Capture;
+        impl Adapter for Capture {
+            type Route = ();
+            fn peer_route(&self, _: &Peer) -> Option<()> {
+                None
             }
+            fn deliver(&self, _: (), _: Packet) {}
         }
         let mut config: Config = toml::from_str(include_str!("../../../config.toml")).unwrap();
         config.peers[0].allowed_ips = vec![
             "192.0.2.2/32".parse().unwrap(),
             "2001:db8::2/128".parse().unwrap(),
         ];
-        let (tx, _rx) = mpsc::channel(1);
-        let state = State::new(tx);
-        let mut capture = Capture(Vec::new());
-        // Both packets claim UDP but contain no UDP header. Routing must only
-        // inspect the IP destination and leave the transport payload untouched.
+        let mut endpoint = Endpoint::new(Capture, config).unwrap();
         let ipv4 = etherparse::Ipv4Header::new(
             0,
             64,
@@ -453,27 +425,22 @@ mod tests {
         .to_bytes()
         .to_vec();
         for packet in [&ipv4, &ipv6] {
-            process_tun_packet(&state, &config, &mut capture, packet)
-                .await
-                .unwrap();
-            assert_eq!(
-                capture.0.last().unwrap(),
-                &(config.peers[0].id, packet.clone())
-            );
+            endpoint.tun_write(packet).unwrap();
         }
+        assert_eq!(
+            endpoint.status().peers[0].sent,
+            (ipv4.len() + ipv6.len()) as u64
+        );
         let mut unmatched = ipv4.clone();
         unmatched[19] = 3;
-        process_tun_packet(&state, &config, &mut capture, &unmatched)
-            .await
-            .unwrap();
+        endpoint.tun_write(&unmatched).unwrap();
+        assert_eq!(
+            endpoint.status().peers[0].sent,
+            (ipv4.len() + ipv6.len()) as u64
+        );
         for packet in [&[][..], &[0xf0][..], &ipv4[..19], &ipv6[..39]] {
-            assert!(
-                process_tun_packet(&state, &config, &mut capture, packet)
-                    .await
-                    .is_err()
-            );
+            assert!(endpoint.tun_write(packet).is_err());
         }
-        assert_eq!(capture.0.len(), 2);
     }
 
     #[test]

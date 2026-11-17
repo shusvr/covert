@@ -10,15 +10,44 @@ use tracing::error;
 use uuid::Uuid;
 
 mod config;
+pub use crate::state::{PeerStatus, StatusSnapshot};
 pub use config::*;
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync + 'static>>;
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync + 'static>>;
 
 pub trait Adapter {
     type Route: Clone;
     fn peer_route(&self, peer: &Peer) -> Option<Self::Route>;
 
+    fn supports_peer(&self, _peer: &Peer) -> bool {
+        true
+    }
+
     fn deliver(&self, route: Self::Route, packet: Packet);
+
+    /// Reject transport-specific route/type combinations before processing.
+    fn accepts(
+        &self,
+        _previous: Option<&Self::Route>,
+        _incoming: &Self::Route,
+        _packet: &Packet,
+    ) -> bool {
+        true
+    }
+
+    /// Apply transport side effects before committing an authenticated route.
+    /// Other routes exclude the peer being updated, so shared resources can be retained.
+    fn route_changed<'a>(
+        &self,
+        _previous: Option<&Self::Route>,
+        _next: &Self::Route,
+        _other_routes: impl Iterator<Item = &'a Self::Route>,
+    ) -> Result<()>
+    where
+        Self::Route: 'a,
+    {
+        Ok(())
+    }
 }
 
 pub struct Endpoint<A: Adapter> {
@@ -38,6 +67,7 @@ impl<A: Adapter> Endpoint<A> {
             peers: config
                 .peers
                 .iter()
+                .filter(|peer| adapter.supports_peer(peer))
                 .map(|p| PeerTunnel::new(&config, p, adapter.peer_route(p)).map(|x| (p.id, x)))
                 .collect::<Result<HashMap<_, _>>>()?,
             config,
@@ -52,7 +82,9 @@ impl<A: Adapter> Endpoint<A> {
 
         for p in self.config.peers.iter() {
             if p.allowed_ips.iter().any(|n| n.contains(&dst)) {
-                let pt = self.peers.get_mut(&p.id).unwrap();
+                let Some(pt) = self.peers.get_mut(&p.id) else {
+                    continue;
+                };
                 pt.transmit(&mut self.state, packet);
 
                 if let Err(err) = pt.advance(&mut self.state) {
@@ -97,6 +129,19 @@ impl<A: Adapter> Endpoint<A> {
         }
     }
 
+    /// Process exactly one complete datagram; reject truncation, trailing bytes,
+    /// and concatenated frames before touching any tunnel state.
+    pub fn out_write_datagram(&mut self, route: A::Route, buf: &[u8]) {
+        match codec::parse_slice(buf, &self.config.layout) {
+            Some(Ok((packet, consumed))) if consumed == buf.len() => {
+                if let Err(err) = self.process_incoming(route, packet) {
+                    error!(%err, "Failed to process incoming datagram");
+                }
+            }
+            _ => tracing::trace!("Discarding malformed datagram"),
+        }
+    }
+
     pub fn advance(&mut self) {
         for pt in self.peers.values_mut() {
             if let Err(err) = pt.advance(&mut self.state) {
@@ -112,18 +157,37 @@ impl<A: Adapter> Endpoint<A> {
         }
     }
 
+    pub fn adapter(&self) -> &A {
+        &self.adapter
+    }
+
+    pub fn status(&self) -> StatusSnapshot {
+        self.state.status(&self.config)
+    }
+
     fn process_incoming(&mut self, route: A::Route, packet: Packet) -> Result<()> {
         if let Some((peer_id, inv)) = self.identify(&packet)? {
             let pt = self.peers.get_mut(&peer_id).unwrap();
+            if !self.adapter.accepts(pt.address.as_ref(), &route, &packet) {
+                return Ok(());
+            }
             let accepted = if let Some(decoded) = inv {
                 pt.tunnel.accept_initiation(decoded)?
             } else {
                 pt.tunnel.process_incoming_packet_accepted(packet)?
             };
             if accepted {
-                pt.address = Some(route);
+                self.adapter.route_changed(
+                    self.peers[&peer_id].address.as_ref(),
+                    &route,
+                    self.peers
+                        .iter()
+                        .filter(|(id, _)| **id != peer_id)
+                        .filter_map(|(_, peer)| peer.address.as_ref()),
+                )?;
+                self.peers.get_mut(&peer_id).unwrap().address = Some(route);
             }
-
+            let pt = self.peers.get_mut(&peer_id).unwrap();
             pt.advance(&mut self.state)?;
 
             while let Some((route, packet)) =

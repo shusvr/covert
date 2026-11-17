@@ -1,17 +1,16 @@
 //! Read-only Unix-socket status stream. Each line is one complete JSON snapshot.
-use crate::transport::State;
 use anyhow::{Context, Result};
-use covert::config::Config;
+use covert::transport::StatusSnapshot;
 use std::{
     fs,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::Arc,
     time::Duration,
 };
 use tokio::{
     io::AsyncWriteExt,
     net::{UnixListener, UnixStream},
+    sync::watch,
     task::JoinSet,
     time::{MissedTickBehavior, interval, timeout},
 };
@@ -65,15 +64,15 @@ impl Server {
         })
     }
 
-    pub async fn serve(&self, state: Arc<State>, config: Arc<Config>) -> Result<()> {
+    pub async fn serve(&self, status: watch::Receiver<StatusSnapshot>) -> Result<()> {
         let mut clients = JoinSet::new();
         loop {
             tokio::select! {
                 accepted = self.listener.accept() => {
                     let (stream, _) = accepted?;
-                    let (state, config) = (state.clone(), config.clone());
+                    let status = status.clone();
                     clients.spawn(async move {
-                        if let Err(err) = stream_status(stream, state, config).await {
+                        if let Err(err) = stream_status(stream, status).await {
                             tracing::trace!(%err, "RPC client disconnected");
                         }
                     });
@@ -88,15 +87,14 @@ impl Server {
 
 async fn stream_status(
     mut stream: UnixStream,
-    state: Arc<State>,
-    config: Arc<Config>,
+    status: watch::Receiver<StatusSnapshot>,
 ) -> Result<()> {
     let mut ticks = interval(Duration::from_secs(1));
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         ticks.tick().await;
         let mut line =
-            serde_json::to_vec(&state.status(&config)).context("Failed to serialize RPC status")?;
+            serde_json::to_vec(&*status.borrow()).context("Failed to serialize RPC status")?;
         line.push(b'\n');
         timeout(Duration::from_secs(5), stream.write_all(&line))
             .await
@@ -108,6 +106,13 @@ async fn stream_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use covert::{
+        codec::Packet,
+        config::Config,
+        config::Peer,
+        transport::{Adapter, Endpoint},
+    };
+    use std::sync::Arc;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     struct Directory(PathBuf);
@@ -156,12 +161,19 @@ mod tests {
         let dir = Directory::new();
         let path = dir.0.join("status.sock");
         let config: Config = toml::from_str(include_str!("../../../config.toml")).unwrap();
-        let config = Arc::new(config);
-        let (tx, _rx) = tokio::sync::mpsc::channel(4);
-        let state = Arc::new(State::new(tx));
+        struct Capture;
+        impl Adapter for Capture {
+            type Route = ();
+            fn peer_route(&self, _: &Peer) -> Option<()> {
+                None
+            }
+            fn deliver(&self, _: (), _: Packet) {}
+        }
+        let endpoint = Endpoint::new(Capture, config).unwrap();
+        let (status_tx, status) = watch::channel(endpoint.status());
         let server = Arc::new(Server::bind(&path).unwrap());
         let task_server = server.clone();
-        let task = tokio::spawn(async move { task_server.serve(state, config).await });
+        let task = tokio::spawn(async move { task_server.serve(status).await });
         let mut a = BufReader::new(UnixStream::connect(&path).await.unwrap()).lines();
         let mut b = BufReader::new(UnixStream::connect(&path).await.unwrap()).lines();
         let first = timeout(Duration::from_secs(2), a.next_line())
@@ -185,6 +197,23 @@ mod tests {
                 .unwrap();
             let next: serde_json::Value = serde_json::from_str(&line).unwrap();
             assert_eq!(next, first);
+        }
+        let mut updated = endpoint.status();
+        updated.peers[0].sent = 123;
+        status_tx.send_replace(updated);
+        for client in [&mut a, &mut b] {
+            timeout(Duration::from_secs(3), async {
+                loop {
+                    let line = client.next_line().await.unwrap().unwrap();
+                    let next: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    if next["peers"][0]["sent"] == 123 {
+                        assert_eq!(next["session"], first["session"]);
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
         }
         task.abort();
         let _ = task.await;
