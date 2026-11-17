@@ -5,13 +5,12 @@ use covert::{
     codec::PacketLayout,
     config::{Config, ListenerConfig},
     crypto::{pk_to_bytes, random_sk, sk_to_bytes, to_sk},
-    transport::{Endpoint, PacketSender, State},
+    transport::{State, TransportEndpoint},
 };
-use etherparse::{NetHeaders, PacketHeaders};
+use etherparse::IpSlice;
 use std::{
     fs,
     io::{self, Read},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -327,22 +326,6 @@ async fn serve(
                     covert::transport::udp::create_udp_endpoint(&state, &config, udp).await?;
                 run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
             }
-            ListenerConfig::Webrtc { webrtc } => {
-                let endpoint =
-                    covert::transport::webrtc::create_webrtc_endpoint(&state, config, webrtc)
-                        .await?;
-                run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
-            }
-            ListenerConfig::Dns { dns } => {
-                let endpoint =
-                    covert::transport::dns::create_dns_endpoint(&state, config, dns).await?;
-                run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
-            }
-            ListenerConfig::Ntp { ntp } => {
-                let endpoint =
-                    covert::transport::ntp::create_ntp_endpoint(&state, config, ntp).await?;
-                run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
-            }
             ListenerConfig::Icmp { icmp } => {
                 let endpoint =
                     covert::transport::icmp::create_icmp_endpoint(&state, &config, icmp).await?;
@@ -362,11 +345,11 @@ async fn serve(
     }
 }
 
-async fn run_endpoint<S: PacketSender<R>, R: Clone>(
+async fn run_endpoint(
     tun: &tun::AsyncDevice,
     state: Arc<State>,
     config: Arc<Config>,
-    mut listener: Endpoint<S, R>,
+    mut listener: impl TransportEndpoint,
     mut tun_in_rx: mpsc::Receiver<Vec<u8>>,
 ) -> Result<()> {
     let mut reader = tun_io::Reader::new(config.interface.mtu);
@@ -396,19 +379,13 @@ async fn run_endpoint<S: PacketSender<R>, R: Clone>(
     }
 }
 
-async fn process_tun_packet<S: PacketSender<R>, R: Clone>(
+async fn process_tun_packet(
     state: &State,
     config: &Config,
-    listener: &mut Endpoint<S, R>,
+    listener: &mut impl TransportEndpoint,
     packet: &[u8],
 ) -> Result<()> {
-    let parsed = PacketHeaders::from_ip_slice(&packet)?;
-    let net = parsed.net.unwrap();
-    let dst = match net {
-        NetHeaders::Ipv4(ipv4, _) => IpAddr::V4(Ipv4Addr::from_octets(ipv4.destination)),
-        NetHeaders::Ipv6(ipv6, _) => IpAddr::V6(Ipv6Addr::from_octets(ipv6.destination)),
-        _ => unreachable!(),
-    };
+    let dst = IpSlice::from_slice(packet)?.destination_addr();
 
     for p in config.peers.iter() {
         if p.allowed_ips.iter().any(|x| x.contains(&dst)) {
@@ -424,6 +401,80 @@ async fn process_tun_packet<S: PacketSender<R>, R: Clone>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tun_routing_only_requires_valid_ip_headers() {
+        struct Capture(Vec<(uuid::Uuid, Vec<u8>)>);
+        impl TransportEndpoint for Capture {
+            async fn trasmit(
+                &mut self,
+                _state: &State,
+                _config: &Config,
+                peer_id: uuid::Uuid,
+                packet: &[u8],
+            ) -> std::result::Result<(), covert::Error> {
+                self.0.push((peer_id, packet.to_vec()));
+                Ok(())
+            }
+        }
+        let mut config: Config = toml::from_str(include_str!("../config.toml")).unwrap();
+        config.peers[0].allowed_ips = vec![
+            "192.0.2.2/32".parse().unwrap(),
+            "2001:db8::2/128".parse().unwrap(),
+        ];
+        let (tx, _rx) = mpsc::channel(1);
+        let state = State::new(tx);
+        let mut capture = Capture(Vec::new());
+        // Both packets claim UDP but contain no UDP header. Routing must only
+        // inspect the IP destination and leave the transport payload untouched.
+        let ipv4 = etherparse::Ipv4Header::new(
+            0,
+            64,
+            etherparse::IpNumber::UDP,
+            [192, 0, 2, 1],
+            [192, 0, 2, 2],
+        )
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+        let ipv6 = etherparse::Ipv6Header {
+            next_header: etherparse::IpNumber::UDP,
+            hop_limit: 64,
+            source: "2001:db8::1"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets(),
+            destination: "2001:db8::2"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets(),
+            ..Default::default()
+        }
+        .to_bytes()
+        .to_vec();
+        for packet in [&ipv4, &ipv6] {
+            process_tun_packet(&state, &config, &mut capture, packet)
+                .await
+                .unwrap();
+            assert_eq!(
+                capture.0.last().unwrap(),
+                &(config.peers[0].id, packet.clone())
+            );
+        }
+        let mut unmatched = ipv4.clone();
+        unmatched[19] = 3;
+        process_tun_packet(&state, &config, &mut capture, &unmatched)
+            .await
+            .unwrap();
+        for packet in [&[][..], &[0xf0][..], &ipv4[..19], &ipv6[..39]] {
+            assert!(
+                process_tun_packet(&state, &config, &mut capture, packet)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(capture.0.len(), 2);
+    }
 
     #[test]
     fn rpc_flag_accepts_missing_or_explicit_path() {
@@ -455,8 +506,6 @@ mod tests {
             ("Udp = { udp = {} }", Some(1438)),
             ("Icmp = { icmp = {} }", Some(1438)),
             ("Icmp = { icmp = { Mode = \"OnlyEcho\" } }", Some(1438)),
-            ("Ntp = { ntp = {} }", Some(1382)),
-            ("Dns = { dns = {} }", None),
         ] {
             let listener: ListenerConfig = toml::from_str(listener).unwrap();
             let mut layout = PacketLayout::default();

@@ -1,23 +1,25 @@
 use crate::{
     Result,
-    codec::{self, Packet, PacketLayout},
-    config::Config,
-    transport::{Endpoint, PacketSender, State, maintain_peers, process_packet},
+    codec::{self, DataFlags, Packet},
+    config::{Config, PeerTransport},
+    crypto,
+    sans::Tunnel,
+    transport::{State, TransportEndpoint},
 };
-use bytes::BytesMut;
-use dashmap::DashMap;
-use futures::{SinkExt, StreamExt, channel::mpsc};
 use serde::Deserialize;
 use std::{
-    io,
+    collections::HashMap,
     net::{Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
+    time::{Duration, Instant},
 };
-use tokio::{net::UdpSocket, task::JoinSet};
+use tokio::{
+    net::UdpSocket,
+    sync::mpsc,
+    time::{MissedTickBehavior, interval},
+};
 use tracing::{error, trace};
 use uuid::Uuid;
-#[cfg(test)]
-use {crate::codec::Codec, tokio_util::udp::UdpFramed};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -36,353 +38,239 @@ pub struct UdpTransportPeerConfig {
     endpoint: Option<SocketAddr>,
 }
 
-#[cfg(test)]
-type UdpPacketSender = UdpFramed<Codec, Arc<UdpSocket>>;
-type UdpRoute = SocketAddr;
+/// Sends plaintext to the task owning the socket and all UDP tunnels.
+pub struct UdpEndpoint {
+    sender: mpsc::Sender<(Uuid, Vec<u8>)>,
+    local_addr: SocketAddr,
+}
+
+impl UdpEndpoint {
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+}
+
+impl TransportEndpoint for UdpEndpoint {
+    async fn trasmit(
+        &mut self,
+        _state: &State,
+        _config: &Config,
+        peer_id: Uuid,
+        packet: &[u8],
+    ) -> Result<()> {
+        self.sender
+            .send((peer_id, packet.to_vec()))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "UDP endpoint stopped")
+            })?;
+        Ok(())
+    }
+}
+
+struct PeerTunnel {
+    tunnel: Tunnel,
+    address: Option<SocketAddr>,
+    established: Option<Instant>,
+}
 
 pub async fn create_udp_endpoint(
     state: &Arc<State>,
     config: &Arc<Config>,
     listener: &UdpListenerConfig,
-) -> Result<Endpoint<impl PacketSender<UdpRoute> + use<>, UdpRoute>> {
-    let addr = (Ipv4Addr::UNSPECIFIED, listener.port);
-    let socket = Arc::new(UdpSocket::bind(addr).await?);
-
-    let routing = Arc::new(
-        config
-            .peers
-            .iter()
-            .filter_map(|p| p.transport.udp()?.endpoint.map(|e| (p.id, e)))
-            .collect::<DashMap<_, _>>(),
-    );
-    let (sender, recv) = mpsc::channel(512);
-    tokio::spawn(socket_listener_task(
-        state.clone(),
-        socket.clone(),
-        config.clone(),
-        routing.clone(),
-        recv,
-        sender.clone().sink_map_err(Into::into),
-    ));
-
-    Ok(Endpoint {
-        routing,
-        sender: sender.sink_map_err(Into::into),
-    })
-}
-
-async fn socket_listener_task<S: PacketSender<UdpRoute> + Clone + Send + 'static>(
-    state: Arc<State>,
-    socket: Arc<UdpSocket>,
-    config: Arc<Config>,
-    routing: Arc<DashMap<Uuid, SocketAddr>>,
-    recv: mpsc::Receiver<(Packet, UdpRoute)>,
-    mut sender: S,
-) {
-    let mut incoming: Vec<_> = (0..BATCH_SIZE).map(|_| ReceivedDatagram::new()).collect();
-
-    // Dropping the receive task also stops its independent maintenance task.
-    let mut maintenance = JoinSet::new();
-    maintenance.spawn(sender_task(socket.clone(), config.layout, recv));
-    maintenance.spawn(maintain_peers(
-        state.clone(),
-        config.clone(),
-        routing.clone(),
-        sender.clone(),
-    ));
-    'receive: loop {
-        tokio::select! {
-            _ = state.tun_in_tx.closed() => break,
-            result = maintenance.join_next() => {
-                error!(?result, "UDP worker exited; stopping endpoint");
-                break;
-            }
-            result = socket.async_io(tokio::io::Interest::READABLE, || try_receive_batch(&socket, &mut incoming)) => {
-                let count = match result {
-                    Ok(count) => count,
-                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(err) => { error!("Failed to receive UDP batch: {err}"); break; }
-                };
-                trace!(packets = count, "Received UDP batch");
-                for datagram in &incoming[..count] {
-                    let addr = datagram.address;
-                    if datagram.truncated {
-                        trace!(%addr, "Discarding truncated UDP datagram");
-                        continue;
-                    }
-                    let packet = match codec::parse_slice(&datagram.bytes[..datagram.len], &config.layout) {
-                        Some(Ok((packet, consumed))) if consumed == datagram.len => packet,
-                        Some(Err(err)) => { trace!(%addr, %err, "Discarding malformed UDP datagram"); continue; }
-                        _ => { trace!(%addr, "Discarding incomplete UDP datagram or trailing data"); continue; }
-                    };
-                    match process_packet(&state, &config, packet, addr, &routing, &mut sender).await {
-                        Ok(true) => {},
-                        Ok(false) => break 'receive,
-                        Err(err) => error!("Failed to process incoming packet: {err}"),
-                    }
-                }
-            }
-        }
-    }
-}
-
-const BATCH_SIZE: usize = 64;
-
-const MAX_DATAGRAM_SIZE: usize = 65535;
-
-struct ReceivedDatagram {
-    bytes: BytesMut,
-    len: usize,
-    address: SocketAddr,
-    truncated: bool,
-}
-impl ReceivedDatagram {
-    fn new() -> Self {
-        Self {
-            bytes: BytesMut::zeroed(MAX_DATAGRAM_SIZE),
-            len: 0,
-            address: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
-            truncated: false,
-        }
-    }
-}
-
-fn try_receive_batch(socket: &UdpSocket, batch: &mut [ReceivedDatagram]) -> io::Result<usize> {
-    use std::os::fd::AsRawFd;
-    if batch.is_empty() {
-        return Ok(0);
-    }
-    debug_assert!(batch.len() <= BATCH_SIZE);
-    // The syscall fills storage and packet bytes. All allocations are fully
-    // initialized, stationary, and exclusively borrowed until it returns.
-    let mut addresses: Vec<libc::sockaddr_storage> = batch
-        .iter()
-        .map(|_| unsafe { std::mem::zeroed() })
-        .collect();
-    let mut vectors: Vec<_> = batch
-        .iter_mut()
-        .map(|datagram| libc::iovec {
-            iov_base: datagram.bytes.as_mut_ptr().cast(),
-            iov_len: datagram.bytes.len(),
-        })
-        .collect();
-    let mut messages: Vec<libc::msghdr> = batch
-        .iter()
-        .enumerate()
-        .map(|(index, _)| {
-            let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
-            header.msg_name = (&mut addresses[index] as *mut libc::sockaddr_storage).cast();
-            header.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as _;
-            header.msg_iov = &mut vectors[index];
-            header.msg_iovlen = 1;
-            header
-        })
-        .collect();
-    #[cfg(target_os = "linux")]
-    let (count, lengths) = {
-        let mut multi: Vec<_> = messages
-            .iter()
-            .map(|header| libc::mmsghdr {
-                msg_hdr: *header,
-                msg_len: 0,
-            })
-            .collect();
-        // MSG_DONTWAIT drains only available datagrams; no timeout or fill delay.
-        let count = unsafe {
-            libc::recvmmsg(
-                socket.as_raw_fd(),
-                multi.as_mut_ptr(),
-                multi.len() as _,
-                libc::MSG_DONTWAIT,
-                std::ptr::null_mut(),
-            )
+) -> Result<UdpEndpoint> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, listener.port)).await?;
+    let local_addr = socket.local_addr()?;
+    let mut peers = HashMap::new();
+    for peer in &config.peers {
+        let address = match &peer.transport {
+            PeerTransport::Udp { udp } => udp.endpoint,
+            PeerTransport::None => None,
+            _ => continue,
         };
-        if count < 0 {
-            return Err(io::Error::last_os_error());
+        let liveness = peer
+            .liveness
+            .unpack_with_fallback(&config.interface.liveness);
+        let tunnel = Tunnel::new(
+            config.layout,
+            *config.interface.private_key.0,
+            liveness,
+            address.map(|_| *peer.public_key.0),
+            peer.pre_shared_key.as_ref().map(|key| *key.0),
+        )?;
+        peers.insert(
+            peer.id,
+            PeerTunnel {
+                tunnel,
+                address,
+                established: None,
+            },
+        );
+    }
+    let (sender, receiver) = mpsc::channel(512);
+    let state = state.clone();
+    let config = config.clone();
+    tokio::spawn(async move {
+        for id in peers.keys() {
+            state.sans_connected.insert(*id, false);
         }
-        let count = count as usize;
-        let lengths: Vec<_> = multi[..count]
-            .iter()
-            .enumerate()
-            .map(|(index, message)| {
-                messages[index] = message.msg_hdr;
-                message.msg_len as usize
-            })
-            .collect();
-        (count, lengths)
-    };
-    #[cfg(not(target_os = "linux"))]
-    let (count, lengths) = {
-        let len =
-            unsafe { libc::recvmsg(socket.as_raw_fd(), &mut messages[0], libc::MSG_DONTWAIT) };
-        if len < 0 {
-            return Err(io::Error::last_os_error());
+        if let Err(err) = run_udp(&socket, &state, &config, &mut peers, receiver).await {
+            error!(%err, "UDP endpoint stopped");
         }
-        (1, vec![len as usize])
-    };
-    for index in 0..count {
-        let header = &messages[index];
-        let size = header.msg_namelen as usize;
-        if size > std::mem::size_of::<libc::sockaddr_storage>() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid UDP source address length",
-            ));
+        for id in peers.keys() {
+            state.sans_connected.insert(*id, false);
         }
-        // The kernel initialized msg_namelen bytes as a socket address in storage.
-        let mut storage = socket2::SockAddrStorage::zeroed();
-        // The platform sockaddr_storage layout is supported by SockAddrStorage.
-        unsafe {
-            *storage.view_as::<libc::sockaddr_storage>() = addresses[index];
+    });
+    Ok(UdpEndpoint { sender, local_addr })
+}
+
+async fn run_udp(
+    socket: &UdpSocket,
+    state: &State,
+    config: &Config,
+    peers: &mut HashMap<Uuid, PeerTunnel>,
+    mut receiver: mpsc::Receiver<(Uuid, Vec<u8>)>,
+) -> Result<()> {
+    let mut buffer = vec![0; 65535];
+    let mut timer = interval(Duration::from_millis(100));
+    timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = state.tun_in_tx.closed() => return Ok(()),
+            request = receiver.recv() => {
+                let Some((id, packet)) = request else { return Ok(()) };
+                if let Some(peer) = peers.get_mut(&id) {
+                    peer.tunnel.push_packet(&packet);
+                    if let Err(err) = advance(peer, id, config, state) {
+                        trace!(%id, %err, "Failed to process UDP tunnel");
+                    }
+                    flush(socket, peer, id, state, config).await?;
+                }
+            }
+            _ = timer.tick() => {
+                for (&id, peer) in peers.iter_mut() {
+                    if let Err(err) = advance(peer, id, config, state) {
+                        trace!(%id, %err, "Failed to maintain UDP tunnel");
+                    }
+                    flush(socket, peer, id, state, config).await?;
+                }
+            }
+            incoming = socket.recv_from(&mut buffer) => {
+                let (len, address) = incoming?;
+                let bytes = &buffer[..len];
+                // A UDP datagram must contain exactly one complete frame. Never
+                // let partial or trailing bytes pollute a tunnel's stream buffer.
+                let packet = match codec::parse_slice(bytes, &config.layout) {
+                    Some(Ok((packet, consumed))) if consumed == len => packet,
+                    _ => { trace!(%address, "Discarding malformed UDP datagram"); continue; }
+                };
+                let id = match &packet {
+                    Packet::Initiating(initiation) => {
+                        // Identify the configured peer before selecting its tunnel.
+                        // Acceptance, replay checks and key establishment stay in Tunnel.
+                        let Ok((key, _)) = crypto::pre_reply(&config.interface.private_key.0, initiation) else {
+                            continue;
+                        };
+                        config.peers.iter().find(|peer| *peer.public_key.0 == key).map(|peer| peer.id)
+                    }
+                    Packet::Reply(reply) => peers.iter().find(|(_, peer)| {
+                        peer.tunnel.local_index() == Some(reply.receiver_idx)
+                    }).map(|(&id, _)| id),
+                    Packet::Data(data) => peers.iter().find(|(_, peer)| {
+                        peer.tunnel.local_index() == Some(data.receiver_idx)
+                    }).map(|(&id, _)| id),
+                };
+                let Some(id) = id else { continue };
+                let Some(peer) = peers.get_mut(&id) else { continue };
+                let before = peer.tunnel.established_at();
+                let is_data = matches!(packet, Packet::Data(_));
+                match peer.tunnel.process_incoming_packet(packet)
+                    .and_then(|()| advance(peer, id, config, state))
+                {
+                    Ok(()) => {
+                        // Learn/migrate routes only after accepted handshakes or
+                        // successfully authenticated data, never from invalid packets.
+                        if peer.tunnel.is_live() && (is_data || peer.tunnel.established_at() != before) {
+                            peer.address = Some(address);
+                        }
+                    }
+                    Err(err) => trace!(%id, %address, %err, "Discarding invalid UDP packet"),
+                }
+                flush(socket, peer, id, state, config).await?;
+            }
         }
-        let address = unsafe { socket2::SockAddr::new(storage, header.msg_namelen) };
-        batch[index].address = address.as_socket().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "invalid UDP source address")
+    }
+}
+
+fn advance(peer: &mut PeerTunnel, id: Uuid, config: &Config, state: &State) -> Result<()> {
+    if let Some(pending) = peer.tunnel.process_new_packets()? {
+        let configured = config.peers.iter().find(|p| p.id == id).unwrap();
+        if pending.public_key == *configured.public_key.0 {
+            peer.tunnel.approve_pending(
+                configured.pre_shared_key.as_ref().map(|key| *key.0),
+                configured
+                    .liveness
+                    .unpack_with_fallback(&config.interface.liveness),
+            )?;
+            // Emit the reply before any queued data.
+            peer.tunnel.process_new_packets()?;
+        } else {
+            peer.tunnel.reject_pending();
+        }
+    }
+    let established = peer.tunnel.established_at();
+    if established.is_some() && established != peer.established {
+        state.record_established(id);
+    }
+    peer.established = established;
+    state.sans_connected.insert(id, peer.tunnel.is_live());
+    Ok(())
+}
+
+async fn flush(
+    socket: &UdpSocket,
+    peer: &mut PeerTunnel,
+    id: Uuid,
+    state: &State,
+    config: &Config,
+) -> Result<()> {
+    if let Some(address) = peer.address {
+        while let Some(packet) = peer.tunnel.read_outbound_packet() {
+            let plaintext_len = match &packet {
+                Packet::Data(data) if !data.flags.contains(DataFlags::JUNK) => {
+                    data.ciphertext.len().saturating_sub(16)
+                }
+                _ => 0,
+            };
+            let bytes = packet.to_bytes(&config.layout)?;
+            match socket.send_to(&bytes, address).await {
+                Ok(_) => {
+                    state
+                        .peer_statistics
+                        .entry(id)
+                        .or_default()
+                        .sent
+                        .fetch_add(plaintext_len as u64, Ordering::Relaxed);
+                }
+                Err(err) => trace!(%id, %address, %err, "Failed to send UDP datagram"),
+            }
+        }
+    }
+    while let Some(packet) = peer.tunnel.read_packet() {
+        if packet.is_empty() {
+            continue;
+        }
+        state
+            .peer_statistics
+            .entry(id)
+            .or_default()
+            .received
+            .fetch_add(packet.len() as u64, Ordering::Relaxed);
+        state.tun_in_tx.send(packet).await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "TUN receiver closed")
         })?;
-        batch[index].len = lengths[index].min(batch[index].bytes.len());
-        batch[index].truncated =
-            header.msg_flags & libc::MSG_TRUNC != 0 || lengths[index] > batch[index].bytes.len();
     }
-    Ok(count)
-}
-
-struct Datagram {
-    bytes: BytesMut,
-    address: SocketAddr,
-}
-
-async fn sender_task(
-    socket: Arc<UdpSocket>,
-    layout: PacketLayout,
-    mut recv: mpsc::Receiver<(Packet, UdpRoute)>,
-) {
-    // Keep the encoding buffers across batches to avoid reallocating per packet.
-    let mut batch: Vec<_> = (0..BATCH_SIZE)
-        .map(|_| Datagram {
-            bytes: BytesMut::new(),
-            address: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
-        })
-        .collect();
-    while let Some(first) = recv.next().await {
-        let mut item = Some(first);
-        let mut count = 0;
-        while let Some((packet, address)) = item {
-            let datagram = &mut batch[count];
-            datagram.bytes.clear();
-            match codec::append(&mut datagram.bytes, packet, &layout) {
-                Ok(()) => {
-                    datagram.address = address;
-                    count += 1;
-                }
-                Err(err) => error!(%address, "Failed to encode UDP packet: {err}"),
-            }
-            if count == BATCH_SIZE {
-                break;
-            }
-            // Drain only ready packets: a single datagram never waits for a batch timer.
-            item = recv.try_recv().ok();
-        }
-        let mut sent = 0;
-        while sent < count {
-            let result = socket
-                .async_io(tokio::io::Interest::WRITABLE, || {
-                    try_send_batch(&socket, &batch[sent..count])
-                })
-                .await;
-            match result {
-                Ok(0) => {
-                    error!("UDP batch send made no progress; stopping sender");
-                    return;
-                }
-                Ok(n) => {
-                    sent += n;
-                    trace!(packets = n, "Sent UDP batch");
-                }
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                Err(err) => {
-                    // sendmmsg reports an error only when no datagram was sent.
-                    // Discard the failing head so one invalid destination/oversized
-                    // datagram cannot block unrelated peers behind it.
-                    error!(address = %batch[sent].address, "Failed to send UDP datagram: {err}");
-                    sent += 1;
-                }
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn try_send_batch(socket: &UdpSocket, batch: &[Datagram]) -> io::Result<usize> {
-    use std::os::fd::AsRawFd;
-    if batch.is_empty() {
-        return Ok(0);
-    }
-    debug_assert!(batch.len() <= BATCH_SIZE);
-    let addresses: Vec<_> = batch
-        .iter()
-        .map(|datagram| socket2::SockAddr::from(datagram.address))
-        .collect();
-    let mut vectors: Vec<_> = batch
-        .iter()
-        .map(|datagram| libc::iovec {
-            // sendmmsg reads these buffers; its C API uses a mutable void pointer.
-            iov_base: datagram.bytes.as_ptr().cast_mut().cast(),
-            iov_len: datagram.bytes.len(),
-        })
-        .collect();
-    let mut messages: Vec<libc::mmsghdr> = batch
-        .iter()
-        .enumerate()
-        .map(|(index, _)| {
-            // An all-zero msghdr has no control data and is fully initialized below.
-            let mut message: libc::mmsghdr = unsafe { std::mem::zeroed() };
-            message.msg_hdr.msg_name = addresses[index].as_ptr().cast_mut().cast();
-            message.msg_hdr.msg_namelen = addresses[index].len();
-            message.msg_hdr.msg_iov = &mut vectors[index];
-            message.msg_hdr.msg_iovlen = 1;
-            message
-        })
-        .collect();
-    // All address, iovec, and payload allocations remain alive and stationary
-    // until this nonblocking syscall returns. The kernel only writes messages.
-    let sent = unsafe {
-        libc::sendmmsg(
-            socket.as_raw_fd(),
-            messages.as_mut_ptr(),
-            messages.len() as _,
-            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-        )
-    };
-    if sent < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(sent as usize)
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn try_send_batch(socket: &UdpSocket, batch: &[Datagram]) -> io::Result<usize> {
-    use std::os::fd::AsRawFd;
-    let Some(datagram) = batch.first() else {
-        return Ok(0);
-    };
-    let address = socket2::SockAddr::from(datagram.address);
-    // Match the Linux readiness/error behavior with a single nonblocking datagram.
-    let sent = unsafe {
-        libc::sendto(
-            socket.as_raw_fd(),
-            datagram.bytes.as_ptr().cast(),
-            datagram.bytes.len(),
-            libc::MSG_DONTWAIT,
-            address.as_ptr(),
-            address.len(),
-        )
-    };
-    if sent < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(1)
-    }
+    Ok(())
 }
 
 #[cfg(test)]

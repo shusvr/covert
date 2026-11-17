@@ -103,48 +103,6 @@ Port = 40676
 # Alternative: "OnlyEcho" sends requests both ways.
 # Both ends must select the same mode.
 
-# NTP alternative: replace the listener table with:
-# [Interface.Listener.Ntp.ntp]
-# Port = 123          # Default 123; use 0 for an ephemeral client port.
-# PollInterval = 1    # Seconds between idle client polls; default 1, must be > 0.
-# A configured Endpoint initiates NTPv4 client requests (mode 3). An authenticated
-# incoming initiation establishes the server role (mode 4). Replies echo the
-# request transmit timestamp as their origin timestamp, with one reply/request.
-# Server traffic waits in a bounded 16-packet queue for client requests. Polls
-# retrieve queued traffic; replies carrying traffic trigger another client poll.
-# Clients/server use the same socket for both directions; no raw sockets or nft.
-# The tunnel uses custom extension type 0xf501 with 4-byte aligned fields, not
-# ordinary time synchronization or NTS. This does not adjust the system clock.
-# Larger packets/traffic rates remain distinguishable from ordinary NTP.
-# Port 123 may require privileges and must not be occupied by a time daemon.
-# Allow up to 87 bytes for IPv4/UDP/NTP/extension framing and alignment.
-# Configured packet-layout padding applies inside the NTP extension.
-
-# WebRTC alternative: genuine unordered ICE/DTLS/SCTP data channel.
-# [Interface.Listener.Webrtc.webrtc]
-# Port = 40676           # TCP SDP signaling port, default 40676.
-# IceServers = []        # Optional STUN URLs; default no external servers.
-# ICE negotiates separate UDP ports: allow those through the firewall too.
-# Larger padded messages are fragmented by SCTP. See docs/webrtc.md.
-
-# DNS alternative: replace the listener table with:
-# [Interface.Listener.Dns.dns]
-# Port = 53               # Default 53; use 0 for an ephemeral client source port.
-# Domain = "tunnel.example" # Same suffix on both ends, default tunnel.example.
-# PollInterval = 1        # Seconds between idle client polls; must be > 0.
-# Known endpoints initiate TXT IN queries. Responders echo the question and DNS
-# ID in authoritative TXT answers (TTL 0), one response per query. Both advertise
-# standard EDNS(0) UDP size 1232. Query data uses base32 labels; answers use base64
-# TXT strings. Domain names and labels obey the DNS size limits. Large encrypted
-# packets (including layout padding) are fragmented and reassembled, with bounded
-# queues and a 10-second reassembly lifetime. Clients poll to retrieve server data.
-# Lost queries/replies are retried up to five times; responders cache answers so
-# retries receive the same fragment. Idle polls carry encrypted keepalives.
-# Direct IPv4 UDP only: point Endpoint at another Covert instance, not a recursive
-# resolver. Domain is a framing suffix, not a request to resolve or register it.
-# This is a custom DNS tunnel: high query rates/encoded names remain recognizable.
-# Port 53 may require privileges and must not be occupied by another DNS service.
-
 # Optional peer list; omit all [[Peer]] sections for an empty list.
 # Repeat this section for additional peers. Every peer's transport must match
 # the interface listener, and its tunnel address must be distinct from ours.
@@ -182,15 +140,3 @@ Endpoint = "192.0.2.2:40676"
 # The initiator sends Echo Requests; the responder sends Echo Replies.
 # [Peer.Transport.Icmp.icmp]
 # Endpoint = "192.0.2.2"
-
-# NTP peer alternative (numeric IPv4:port; omit Endpoint on the responder):
-# [Peer.Transport.Ntp.ntp]
-# Endpoint = "192.0.2.2:123"
-
-# DNS peer alternative (omit Endpoint on the responder):
-# [Peer.Transport.Dns.dns]
-# Endpoint = "192.0.2.2:53"
-
-# WebRTC peer alternative (Endpoint is the remote TCP signaling address):
-# [Peer.Transport.Webrtc.webrtc]
-# Endpoint = "192.0.2.1:40676" # Optional; omit on the answering peer.

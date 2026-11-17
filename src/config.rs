@@ -1,11 +1,8 @@
 use crate::{
     codec::PacketLayout,
     transport::{
-        dns::{DnsListenerConfig, DnsTransportPeerConfig},
         icmp::{IcmpListenerConfig, IcmpTransportPeerConfig},
-        ntp::{NtpListenerConfig, NtpTransportPeerConfig},
         udp::{UdpListenerConfig, UdpTransportPeerConfig},
-        webrtc::{WebrtcListenerConfig, WebrtcTransportPeerConfig},
     },
 };
 use base64::prelude::*;
@@ -192,22 +189,15 @@ macro_rules! make_listen_peer_cfgs {
 make_listen_peer_cfgs!(
     Udp, udp, UdpListenerConfig, UdpTransportPeerConfig;
     Icmp, icmp, IcmpListenerConfig, IcmpTransportPeerConfig;
-    Ntp, ntp, NtpListenerConfig, NtpTransportPeerConfig;
-    Dns, dns, DnsListenerConfig, DnsTransportPeerConfig;
-    Webrtc, webrtc, WebrtcListenerConfig, WebrtcTransportPeerConfig;
 );
 
 impl ListenerConfig {
     /// Largest inner IP packet fitting a 1500-byte IPv4 path with this layout.
-    /// None means the transport fragments packets; zero means even minimum
+    /// Zero means even minimum
     /// data framing/padding cannot fit, regardless of the configured TUN MTU.
     pub fn suggested_mtu(&self, layout: &PacketLayout) -> Option<usize> {
         let budget = match self {
             Self::Udp { .. } | Self::Icmp { .. } => 1500 - 28,
-            // IPv4/UDP + NTP header, then a four-byte-aligned extension
-            // containing its header and the Covert payload length (8 bytes).
-            Self::Ntp { .. } => ((1500 - 28 - 48) & !3usize) - 8,
-            Self::Dns { .. } | Self::Webrtc { .. } => return None,
         };
         if layout.odp > budget {
             return Some(0);

@@ -132,6 +132,7 @@ pub struct PeerStatus {
 pub struct State {
     session_id: Uuid,
     peer_statistics: DashMap<Uuid, Arc<PeerStatistics>>,
+    sans_connected: DashMap<Uuid, bool>,
     established: DashMap<u32, PeerHandle>,
     initiated: DashMap<u32, Initiated>,
     peering: DashMap<Uuid, u32>,
@@ -144,6 +145,7 @@ impl State {
         Self {
             session_id: Uuid::new_v4(),
             peer_statistics: Default::default(),
+            sans_connected: Default::default(),
             tun_in_tx,
             established: Default::default(),
             initiated: Default::default(),
@@ -153,11 +155,11 @@ impl State {
     }
 
     fn register_statistics(&self, handle: &mut PeerHandle) {
-        let statistics = self
-            .peer_statistics
-            .entry(handle.peer_id)
-            .or_insert_with(|| handle.statistics.clone())
-            .clone();
+        handle.statistics = self.record_established(handle.peer_id);
+    }
+
+    fn record_established(&self, peer_id: Uuid) -> Arc<PeerStatistics> {
+        let statistics = self.peer_statistics.entry(peer_id).or_default().clone();
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -169,7 +171,7 @@ impl State {
             Ordering::Relaxed,
         );
         statistics.last_established_at.store(now, Ordering::Relaxed);
-        handle.statistics = statistics;
+        statistics
     }
 
     pub fn status(&self, config: &Config) -> StatusSnapshot {
@@ -225,6 +227,9 @@ impl State {
     }
 
     fn has_live_connection(&self, peer_id: Uuid) -> bool {
+        if let Some(connected) = self.sans_connected.get(&peer_id) {
+            return *connected;
+        }
         let index = self.peering.get(&peer_id).map(|entry| *entry.value());
         index
             .and_then(|index| self.established.get(&index))
@@ -232,15 +237,35 @@ impl State {
     }
 }
 
-pub mod dns;
 pub mod icmp;
-pub mod ntp;
 pub mod udp;
-pub mod webrtc;
 
 pub struct Endpoint<S, R> {
     pub sender: S,
     pub routing: Arc<DashMap<Uuid, R>>,
+}
+
+/// Plaintext interface shared by socket adapters and the legacy transports.
+pub trait TransportEndpoint {
+    fn trasmit(
+        &mut self,
+        state: &State,
+        config: &Config,
+        peer_id: Uuid,
+        packet: &[u8],
+    ) -> impl std::future::Future<Output = Result<()>>;
+}
+
+impl<S: PacketSender<R>, R: Clone> TransportEndpoint for Endpoint<S, R> {
+    async fn trasmit(
+        &mut self,
+        state: &State,
+        config: &Config,
+        peer_id: Uuid,
+        packet: &[u8],
+    ) -> Result<()> {
+        Endpoint::trasmit(self, state, config, peer_id, packet).await
+    }
 }
 
 impl<S: PacketSender<R>, R: Clone> Endpoint<S, R> {

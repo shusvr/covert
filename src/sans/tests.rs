@@ -289,3 +289,78 @@ fn simultaneous_initiation_exchanges_data() {
         assert_eq!(initiator.read_packet().unwrap(), b"to initiator");
     }
 }
+
+#[test]
+fn parsed_packets_establish_and_deliver_without_stream_buffering() {
+    let (mut initiator, mut responder) = pair(PacketLayout::default());
+    initiator.process_new_packets().unwrap();
+    responder
+        .process_incoming_packet(initiator.read_outbound_packet().unwrap())
+        .unwrap();
+    let pending = responder.process_new_packets().unwrap().unwrap();
+    assert_eq!(pending.public_key, public_key(&initiator.local_sk));
+    assert!(matches!(responder.state, State::Idle));
+    responder.approve_pending(PSK, liveness()).unwrap();
+    initiator
+        .process_incoming_packet(responder.read_outbound_packet().unwrap())
+        .unwrap();
+    assert!(initiator.is_live());
+    assert!(responder.is_live());
+    for reverse in [false, true] {
+        let (sender, receiver) = if reverse {
+            (&mut responder, &mut initiator)
+        } else {
+            (&mut initiator, &mut responder)
+        };
+        sender.push_packet(b"parsed payload");
+        sender.process_new_packets().unwrap();
+        receiver
+            .process_incoming_packet(sender.read_outbound_packet().unwrap())
+            .unwrap();
+        assert_eq!(receiver.read_packet().unwrap(), b"parsed payload");
+        assert!(receiver.received.is_empty());
+    }
+}
+
+#[test]
+fn parsed_data_checks_index_and_authentication_before_delivery() {
+    let (mut initiator, mut responder) = pair(PacketLayout::default());
+    establish(&mut initiator, &mut responder);
+    initiator.push_packet(b"authenticated payload");
+    initiator.process_new_packets().unwrap();
+    let Packet::Data(mut data) = initiator.read_outbound_packet().unwrap() else {
+        panic!("expected data");
+    };
+    let seen = match responder.state {
+        State::Established { last_seen, .. } => last_seen,
+        _ => unreachable!(),
+    };
+    let wrong_index = Data {
+        receiver_idx: data.receiver_idx ^ 1,
+        flags: DataFlags::empty(),
+        counter: data.counter,
+        ciphertext: data.ciphertext.clone(),
+    };
+    responder
+        .process_incoming_packet(Packet::Data(wrong_index))
+        .unwrap();
+    assert!(responder.read_packet().is_none());
+    let ciphertext = data.ciphertext.clone();
+    data.ciphertext[0] ^= 1;
+    assert!(
+        responder
+            .process_incoming_packet(Packet::Data(data))
+            .is_err()
+    );
+    assert!(responder.read_packet().is_none());
+    assert!(matches!(responder.state, State::Established { last_seen, .. } if last_seen == seen));
+    responder
+        .process_incoming_packet(Packet::Data(Data {
+            receiver_idx: responder.local_index().unwrap(),
+            flags: DataFlags::empty(),
+            counter: 1,
+            ciphertext,
+        }))
+        .unwrap();
+    assert_eq!(responder.read_packet().unwrap(), b"authenticated payload");
+}
