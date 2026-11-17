@@ -1,8 +1,11 @@
 use super::*;
 use crate::{
     codec::{Data, DataFlags, PacketLayout},
-    config::{Interface, ListenerConfig, Peer},
     crypto,
+};
+use covert::{
+    config::{Interface, ListenerConfig, Peer},
+    transport::UdpTransportPeerConfig,
 };
 use tokio::time::timeout;
 
