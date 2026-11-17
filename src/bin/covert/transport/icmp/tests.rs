@@ -356,6 +356,7 @@ impl Node {
             &self.state,
             wire,
             &self.listener,
+            None,
         )?;
         if let Some(id) = id {
             self.peers
@@ -615,23 +616,40 @@ async fn echo_reply_authenticates_nat_rewritten_ids_and_preserves_wire_id() {
 #[test]
 #[ignore = "requires an isolated network namespace with CAP_NET_ADMIN and nft"]
 fn nat_reply_filter_migrates_and_keeps_shared_pairs() {
-    let mut filter = ReplyFilter::install(43396).unwrap();
+    let filter = ReplyFilter::install(43396).unwrap();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     let address = Ipv4Addr::new(192, 0, 2, 1);
-    filter.suppress_peer(a, address, 14655).unwrap();
-    filter.suppress_peer(a, address, 14655).unwrap(); // Idempotent hot path.
-    filter.suppress_peer(b, address, 14655).unwrap(); // Shared element, no duplicate add.
-    filter.suppress_peer(a, address, 14656).unwrap();
+    let listener = IcmpListenerConfig {
+        id: 43396,
+        mode: IcmpMode::EchoReply,
+    };
+    let cfg = config([1; 32], public_key(&[2; 32]), None, &listener);
+    let mut peers = HashMap::new();
+    for id in [a, b] {
+        peers.insert(id, PeerTunnel::new(&cfg, &cfg.peers[0], None).unwrap());
+    }
+    let move_route = |peers: &mut HashMap<Uuid, PeerTunnel<IcmpRoute>>, id, echo_id| {
+        let previous = peers[&id].address.as_ref().and_then(IcmpRoute::reply_key);
+        let route = IcmpRoute::response(address, echo_id, 7);
+        filter
+            .update_route(id, previous, route.reply_key(), peers)
+            .unwrap();
+        peers.get_mut(&id).unwrap().address = Some(route);
+    };
+    move_route(&mut peers, a, 14655);
+    move_route(&mut peers, a, 14655); // Idempotent hot path.
+    move_route(&mut peers, b, 14655); // Shared element, no duplicate add.
+    move_route(&mut peers, a, 14656);
     let dump = Command::new("nft")
-        .args(["list", "set", "ip", &filter.table, "nat_peers"])
+        .args(["list", "set", "ip", &filter.table, "reply_peers"])
         .output()
         .unwrap();
     let dump = String::from_utf8_lossy(&dump.stdout);
     assert!(dump.contains("14655") && dump.contains("14656"));
-    filter.suppress_peer(b, address, 14656).unwrap();
+    move_route(&mut peers, b, 14656);
     let dump = Command::new("nft")
-        .args(["list", "set", "ip", &filter.table, "nat_peers"])
+        .args(["list", "set", "ip", &filter.table, "reply_peers"])
         .output()
         .unwrap();
     let dump = String::from_utf8_lossy(&dump.stdout);

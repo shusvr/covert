@@ -69,6 +69,9 @@ impl IcmpRoute {
             reply: Some(etherparse::IcmpEchoHeader { id, seq }),
         }
     }
+    fn reply_key(&self) -> Option<(Ipv4Addr, u16)> {
+        self.reply.map(|echo| (self.address, echo.id))
+    }
     fn echo_type(&self, initiating: bool, id: u16, sequence: &mut u16) -> etherparse::Icmpv4Type {
         if !initiating && let Some(reply) = self.reply {
             return etherparse::Icmpv4Type::EchoReply(reply);
@@ -158,18 +161,11 @@ pub async fn create_icmp_endpoint(
     let config = config.clone();
     let listener = listener.clone();
     tokio::spawn(async move {
-        let mut firewall = firewall;
         for id in peers.keys() {
             state.connected.insert(*id, false);
         }
         if let Err(err) = run_icmp(
-            &socket,
-            &state,
-            &config,
-            &listener,
-            &mut firewall,
-            &mut peers,
-            receiver,
+            &socket, &state, &config, &listener, &firewall, &mut peers, receiver,
         )
         .await
         {
@@ -187,7 +183,7 @@ async fn run_icmp(
     state: &State,
     config: &Config,
     listener: &IcmpListenerConfig,
-    firewall: &mut ReplyFilter,
+    firewall: &ReplyFilter,
     peers: &mut HashMap<Uuid, PeerTunnel<IcmpRoute>>,
     mut receiver: mpsc::Receiver<(Uuid, Vec<u8>)>,
 ) -> Result<()> {
@@ -220,13 +216,9 @@ async fn run_icmp(
                 let len = incoming?;
                 // recv initialized exactly the returned number of bytes.
                 let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), len) };
-                match process_echo(config, peers, state, bytes, listener) {
+                match process_echo(config, peers, state, bytes, listener, Some(firewall)) {
                     Ok(Some(id)) => {
                         let peer = peers.get_mut(&id).unwrap();
-                        // process_echo learns this route only from authenticated traffic.
-                        if let Some(route) = &peer.address && let Some(reply) = route.reply {
-                            firewall.suppress_peer(id, route.address, reply.id)?;
-                        }
                         flush(socket, peer, id, state, &mut encoder).await?;
                     },
                     Ok(None) => {},
@@ -243,6 +235,7 @@ fn process_echo(
     state: &State,
     bytes: &[u8],
     listener: &IcmpListenerConfig,
+    firewall: Option<&ReplyFilter>,
 ) -> Result<Option<Uuid>> {
     let Some((address, payload)) = echo_payload(bytes, listener.id, listener.mode) else {
         return Ok(None);
@@ -283,11 +276,20 @@ fn process_echo(
     }
     peer.advance(id, state)?;
     if peer.tunnel.is_live() && (is_data || peer.tunnel.established_at() != before) {
-        peer.address = Some(if listener.mode == IcmpMode::EchoReply && is_request {
+        let route = if listener.mode == IcmpMode::EchoReply && is_request {
             IcmpRoute::response(address, echo_id, sequence)
         } else {
             IcmpRoute::request(address)
-        });
+        };
+        let previous = peer.address.as_ref().and_then(IcmpRoute::reply_key);
+        let next = route.reply_key();
+        if let Some(firewall) = firewall {
+            firewall.update_route(id, previous, next, peers)?;
+        }
+        peers.get_mut(&id).unwrap().address = Some(route);
+        if previous != next {
+            tracing::debug!(%id, %address, echo_id, "Updated authenticated ICMP reply route");
+        }
     }
     Ok(Some(id))
 }
@@ -330,7 +332,6 @@ async fn flush(
 // A private table keeps cleanup from modifying any existing firewall rules.
 struct ReplyFilter {
     table: String,
-    learned: HashMap<Uuid, (Ipv4Addr, u16)>,
 }
 impl ReplyFilter {
     fn apply(rules: &str) -> Result<()> {
@@ -357,47 +358,52 @@ impl ReplyFilter {
         // authentication. Unrelated ping replies retain their normal behavior.
         Self::apply(&format!(
             "add table ip {table}\n\
-             add set ip {table} nat_peers {{ typeof ip daddr . icmp id; }}\n\
+             add set ip {table} reply_peers {{ typeof ip daddr . icmp id; }}\n\
              add chain ip {table} output {{ type filter hook output priority 0; policy accept; }}\n\
              add rule ip {table} output icmp type echo-reply icmp id {id} meta mark != {SOCKET_MARK} drop\n\
-             add rule ip {table} output icmp type echo-reply ip daddr . icmp id @nat_peers meta mark != {SOCKET_MARK} drop\n"
+             add rule ip {table} output icmp type echo-reply ip daddr . icmp id @reply_peers meta mark != {SOCKET_MARK} drop\n"
         ))?;
-        Ok(Self {
-            table,
-            learned: HashMap::new(),
-        })
+        Ok(Self { table })
     }
 
-    fn suppress_peer(&mut self, peer: Uuid, address: Ipv4Addr, id: u16) -> Result<()> {
-        let pair = (address, id);
-        let previous = self.learned.get(&peer).copied();
-        if previous == Some(pair) {
+    fn update_route(
+        &self,
+        peer: Uuid,
+        previous: Option<(Ipv4Addr, u16)>,
+        next: Option<(Ipv4Addr, u16)>,
+        peers: &HashMap<Uuid, PeerTunnel<IcmpRoute>>,
+    ) -> Result<()> {
+        if previous == next {
             return Ok(());
         }
+        // Peer routes are the sole source of ID state. Inspect other peers only
+        // on route changes, to preserve firewall elements shared by a pair.
+        let shared = |pair| {
+            peers.iter().any(|(other, tunnel)| {
+                *other != peer
+                    && tunnel.address.as_ref().and_then(IcmpRoute::reply_key) == Some(pair)
+            })
+        };
         let mut rules = String::new();
-        if !self.learned.values().any(|entry| *entry == pair) {
+        if let Some((address, id)) = next
+            && !shared((address, id))
+        {
             rules.push_str(&format!(
-                "add element ip {} nat_peers {{ {address} . {id} }}\n",
+                "add element ip {} reply_peers {{ {address} . {id} }}\n",
                 self.table
             ));
         }
-        if let Some((old_address, old_id)) = previous {
-            let shared = self
-                .learned
-                .iter()
-                .any(|(other, value)| *other != peer && *value == (old_address, old_id));
-            if !shared {
-                rules.push_str(&format!(
-                    "delete element ip {} nat_peers {{ {old_address} . {old_id} }}\n",
-                    self.table
-                ));
-            }
+        if let Some((address, id)) = previous
+            && !shared((address, id))
+        {
+            rules.push_str(&format!(
+                "delete element ip {} reply_peers {{ {address} . {id} }}\n",
+                self.table
+            ));
         }
         if !rules.is_empty() {
             Self::apply(&rules)?;
         }
-        self.learned.insert(peer, pair);
-        tracing::debug!(%peer, %address, echo_id = id, "Learned authenticated ICMP reply route");
         Ok(())
     }
 }
