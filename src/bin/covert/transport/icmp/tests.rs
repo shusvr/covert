@@ -95,7 +95,11 @@ fn filters_echo_identifier_checksum_and_ipv4_options() {
             echo_payload(&bytes, 1339, IcmpMode::EchoReply),
             Some((Ipv4Addr::new(192, 0, 2, 1), &payload[..]))
         );
-        assert!(echo_payload(&bytes, 1340, IcmpMode::EchoReply).is_none());
+        assert_eq!(
+            echo_payload(&bytes, 1340, IcmpMode::EchoReply).is_some(),
+            !ty
+        );
+        assert!(echo_payload(&bytes, 1340, IcmpMode::OnlyEcho).is_none());
         for end in 0..bytes.len() {
             assert!(echo_payload(&bytes[..end], 1339, IcmpMode::EchoReply).is_none());
         }
@@ -441,8 +445,13 @@ async fn invalid_data_does_not_change_session_route_or_reply_metadata() {
         assert!(b.receive(&wrong_source).await.unwrap().is_none());
         let mut wrong_id = valid.clone();
         wrong_id[24] ^= 1;
+        *wrong_id.last_mut().unwrap() ^= 1;
         recalculate_checksum(&mut wrong_id);
-        assert!(b.receive(&wrong_id).await.unwrap().is_none());
+        if mode == IcmpMode::EchoReply {
+            assert!(b.receive(&wrong_id).await.is_err()); // New IDs still require valid AEAD.
+        } else {
+            assert!(b.receive(&wrong_id).await.unwrap().is_none());
+        }
         let mut trailing = valid.clone();
         trailing.push(0);
         let len = trailing.len() as u16;
@@ -538,5 +547,103 @@ async fn closed_channels_report_context() {
     assert_eq!(
         b.receive(&a.outgoing()).await.unwrap_err().to_string(),
         "TUN receiver closed"
+    );
+}
+
+fn rewrite_echo_id(wire: &mut [u8], id: u16) {
+    let offset = usize::from(wire[0] & 15) * 4;
+    let seq = u16::from_be_bytes([wire[offset + 6], wire[offset + 7]]);
+    let echo = etherparse::IcmpEchoHeader { id, seq };
+    let kind = if wire[offset] == 8 {
+        etherparse::Icmpv4Type::EchoRequest(echo)
+    } else {
+        etherparse::Icmpv4Type::EchoReply(echo)
+    };
+    let header = etherparse::Icmpv4Header::with_checksum(kind, &wire[offset + 8..]);
+    wire[offset..offset + 8].copy_from_slice(&header.to_bytes());
+}
+
+#[tokio::test]
+async fn echo_reply_authenticates_nat_rewritten_ids_and_preserves_wire_id() {
+    let a_ip = Ipv4Addr::new(192, 0, 2, 1);
+    let b_ip = Ipv4Addr::new(192, 0, 2, 2);
+    let mut a = Node::new(
+        [1; 32],
+        public_key(&[2; 32]),
+        a_ip,
+        Some(b_ip),
+        IcmpMode::EchoReply,
+    );
+    let mut b = Node::new(
+        [2; 32],
+        public_key(&[1; 32]),
+        b_ip,
+        None,
+        IcmpMode::EchoReply,
+    );
+    a.advance();
+    let mut initiation = a.outgoing();
+    rewrite_echo_id(&mut initiation, 14655);
+    let mut tampered = initiation.clone();
+    *tampered.last_mut().unwrap() ^= 1;
+    rewrite_echo_id(&mut tampered, 14655); // Valid outer checksum, invalid authentication.
+    assert!(b.receive(&tampered).await.is_err());
+    assert!(b.peer().address.is_none());
+    assert!(!b.peer().tunnel.is_live());
+    assert!(b.receive(&initiation).await.unwrap().is_some());
+    assert_eq!(b.peer().address.as_ref().unwrap().reply.unwrap().id, 14655);
+    let mut reply = b.outgoing();
+    assert_eq!(u16::from_be_bytes([reply[24], reply[25]]), 14655);
+    rewrite_echo_id(&mut reply, 5555); // NAT restores the client's local ID.
+    assert!(a.receive(&reply).await.unwrap().is_some());
+    assert!(a.peer().tunnel.is_live());
+    a.peer().tunnel.push_packet(b"NAT request");
+    a.advance();
+    let mut data = a.outgoing();
+    rewrite_echo_id(&mut data, 14656); // NAT migration.
+    assert!(b.receive(&data).await.unwrap().is_some());
+    assert_eq!(b.rx.recv().await.unwrap(), b"NAT request");
+    b.peer().tunnel.push_packet(b"NAT reply");
+    b.advance();
+    let mut data = b.outgoing();
+    assert_eq!(u16::from_be_bytes([data[24], data[25]]), 14656);
+    rewrite_echo_id(&mut data, 5555);
+    assert!(a.receive(&data).await.unwrap().is_some());
+    assert_eq!(a.rx.recv().await.unwrap(), b"NAT reply");
+}
+
+#[test]
+#[ignore = "requires an isolated network namespace with CAP_NET_ADMIN and nft"]
+fn nat_reply_filter_migrates_and_keeps_shared_pairs() {
+    let mut filter = ReplyFilter::install(43396).unwrap();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let address = Ipv4Addr::new(192, 0, 2, 1);
+    filter.suppress_peer(a, address, 14655).unwrap();
+    filter.suppress_peer(a, address, 14655).unwrap(); // Idempotent hot path.
+    filter.suppress_peer(b, address, 14655).unwrap(); // Shared element, no duplicate add.
+    filter.suppress_peer(a, address, 14656).unwrap();
+    let dump = Command::new("nft")
+        .args(["list", "set", "ip", &filter.table, "nat_peers"])
+        .output()
+        .unwrap();
+    let dump = String::from_utf8_lossy(&dump.stdout);
+    assert!(dump.contains("14655") && dump.contains("14656"));
+    filter.suppress_peer(b, address, 14656).unwrap();
+    let dump = Command::new("nft")
+        .args(["list", "set", "ip", &filter.table, "nat_peers"])
+        .output()
+        .unwrap();
+    let dump = String::from_utf8_lossy(&dump.stdout);
+    assert!(!dump.contains("14655") && dump.contains("14656"));
+    let table = filter.table.clone();
+    drop(filter);
+    assert!(
+        !Command::new("nft")
+            .args(["list", "table", "ip", &table])
+            .output()
+            .unwrap()
+            .status
+            .success()
     );
 }
