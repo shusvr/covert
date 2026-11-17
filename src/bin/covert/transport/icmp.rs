@@ -1,11 +1,13 @@
 use crate::{
     codec::{self, Packet, PacketLayout},
-    config::{Config, PeerTransport},
     transport::{PeerTunnel, State, TransportEndpoint, identify, plaintext_len},
 };
 use anyhow::{Context, Result};
 use bytes::BytesMut;
-use serde::Deserialize;
+use covert::{
+    config::{Config, PeerTransport},
+    transport::{IcmpListenerConfig, IcmpMode},
+};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     collections::HashMap,
@@ -23,32 +25,6 @@ use tokio::{
 };
 use tracing::{error, trace};
 use uuid::Uuid;
-
-#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
-pub enum IcmpMode {
-    #[default]
-    EchoReply,
-    OnlyEcho,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct IcmpListenerConfig {
-    #[serde(default = "default_icmp_id")]
-    id: u16,
-    #[serde(default)]
-    mode: IcmpMode,
-}
-
-fn default_icmp_id() -> u16 {
-    1339
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct IcmpTransportPeerConfig {
-    endpoint: Option<Ipv4Addr>,
-}
 
 #[derive(Debug, Clone)]
 struct IcmpRoute {

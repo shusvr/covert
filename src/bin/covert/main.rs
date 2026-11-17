@@ -1,12 +1,10 @@
-use crate::{
-    config::{Config, ListenerConfig},
-    transport::{State, TransportEndpoint},
-};
+use crate::transport::{State, TransportEndpoint};
 use anyhow::{Context, Result, bail};
 use base64::prelude::*;
 use clap::{Parser, Subcommand};
 use covert::{
     codec::{self, PacketLayout},
+    config::{Config, ListenerConfig},
     crypto::{self, pk_to_bytes, random_sk, sk_to_bytes, to_sk},
     sans,
 };
@@ -20,7 +18,6 @@ use std::{
 use tokio::sync::mpsc;
 use tracing::{Level, error, info, trace, warn};
 
-mod config;
 mod rpc;
 mod transport;
 mod tun_io;

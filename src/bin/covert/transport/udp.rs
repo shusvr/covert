@@ -1,10 +1,12 @@
 use crate::{
     codec::{self, Packet},
-    config::{Config, PeerTransport},
     transport::{PeerTunnel, State, TransportEndpoint, identify, plaintext_len},
 };
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use covert::{
+    config::{Config, PeerTransport},
+    transport::UdpListenerConfig,
+};
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddr},
@@ -18,23 +20,6 @@ use tokio::{
 };
 use tracing::{error, trace};
 use uuid::Uuid;
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct UdpListenerConfig {
-    #[serde(default = "default_listen_port")]
-    port: u16,
-}
-
-fn default_listen_port() -> u16 {
-    40676
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct UdpTransportPeerConfig {
-    endpoint: Option<SocketAddr>,
-}
 
 /// Sends plaintext to the task owning the socket and all UDP tunnels.
 pub struct UdpEndpoint {

@@ -12,8 +12,9 @@
 
 use crate::{
     codec::{self, Data, DataFlags, Packet, PacketLayout},
+    config::Liveness,
     crypto::{self, Cipher, Key},
-    sans::{Liveness, Tunnel},
+    sans::Tunnel,
 };
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},

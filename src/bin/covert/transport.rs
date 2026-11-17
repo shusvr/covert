@@ -1,11 +1,12 @@
 use crate::{
     codec::{DataFlags, Packet},
-    config::{Config, Peer},
     sans::{DecodedInitiation, Tunnel},
 };
 use anyhow::{Context, Result};
+use covert::config::{Config, Peer};
 use dashmap::DashMap;
 use serde::Serialize;
+
 use std::{
     collections::HashMap,
     sync::{

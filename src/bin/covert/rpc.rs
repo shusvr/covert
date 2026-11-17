@@ -1,6 +1,7 @@
 //! Read-only Unix-socket status stream. Each line is one complete JSON snapshot.
-use crate::{config::Config, transport::State};
+use crate::transport::State;
 use anyhow::{Context, Result};
+use covert::config::Config;
 use std::{
     fs,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},

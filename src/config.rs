@@ -1,18 +1,17 @@
 use crate::{
     codec::PacketLayout,
     transport::{
-        icmp::{IcmpListenerConfig, IcmpTransportPeerConfig},
-        udp::{UdpListenerConfig, UdpTransportPeerConfig},
+        IcmpListenerConfig, IcmpTransportPeerConfig, UdpListenerConfig, UdpTransportPeerConfig,
     },
 };
 use base64::prelude::*;
-use covert::sans::Liveness;
 use ipnet::IpNet;
 use serde::{Deserialize, Deserializer};
 use std::{
     fmt::{Debug, Display},
     net::IpAddr,
     str::FromStr,
+    time::Duration,
 };
 use uuid::Uuid;
 
@@ -37,6 +36,26 @@ const DEFAULT_TIMEOUT: u32 = 28;
 const DEFAULT_MAX_AGE: u32 = 300;
 const DEFAULT_KEEPALIVE_DELAY: u32 = 10;
 const DEFAULT_KEEPALIVE_JITTER: u32 = 3;
+
+#[derive(Debug, Clone, Copy)]
+pub struct Liveness {
+    pub timeout: u64,
+    pub max_age: u64,
+    pub ka_delay: u32,
+    pub ka_jitter: u32,
+}
+
+impl Liveness {
+    pub fn has_expired(&self, since_established: Duration, since_last_seen: Duration) -> bool {
+        (since_established > Duration::from_secs(self.max_age) && self.max_age != 0)
+            || (since_last_seen > Duration::from_secs(self.timeout) && self.timeout != 0)
+    }
+
+    pub fn next_ka(&self) -> u64 {
+        ((self.ka_delay as f64 + (self.ka_jitter as f64 * (fastrand::f64() * 2.0 - 1.0))) * 1000.0)
+            .max(1000.0) as u64
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
