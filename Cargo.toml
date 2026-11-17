@@ -9,7 +9,6 @@ aws-lc-rs = "1.18.2"
 base64 = "0.23.1"
 bitflags = "2.13.2"
 bytes = "1.12.1"
-circular-buffer = "2.0.1"
 clap = { version = "4", features = ["derive"] }
 dashmap = "6.2.1"
 dirs = "7.0.0"

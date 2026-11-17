@@ -1,16 +1,15 @@
 use crate::{
     Result,
-    codec::{self, DataFlags, Packet},
+    codec::{self, Packet},
     config::{Config, PeerTransport},
-    sans::{DecodedInitiation, Tunnel},
-    transport::{State, TransportEndpoint},
+    transport::{PeerTunnel, State, TransportEndpoint, identify, plaintext_len},
 };
 use serde::Deserialize;
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddr},
     sync::{Arc, atomic::Ordering},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::{
     net::UdpSocket,
@@ -60,17 +59,9 @@ impl TransportEndpoint for UdpEndpoint {
         self.sender
             .send((peer_id, packet.to_vec()))
             .await
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "UDP endpoint stopped")
-            })?;
+            .map_err(|_| crate::Error::EndpointStopped { transport: "UDP" })?;
         Ok(())
     }
-}
-
-struct PeerTunnel {
-    tunnel: Tunnel,
-    address: Option<SocketAddr>,
-    established: Option<Instant>,
 }
 
 pub async fn create_udp_endpoint(
@@ -87,40 +78,20 @@ pub async fn create_udp_endpoint(
             PeerTransport::None => None,
             _ => continue,
         };
-        let liveness = peer
-            .liveness
-            .unpack_with_fallback(&config.interface.liveness);
-        let mut tunnel = Tunnel::new(
-            config.layout,
-            *config.interface.private_key.0,
-            liveness,
-            *peer.public_key.0,
-            peer.pre_shared_key.as_ref().map(|key| *key.0),
-        );
-        if address.is_some() {
-            tunnel.initiate()?;
-        }
-        peers.insert(
-            peer.id,
-            PeerTunnel {
-                tunnel,
-                address,
-                established: None,
-            },
-        );
+        peers.insert(peer.id, PeerTunnel::new(config, peer, address)?);
     }
     let (sender, receiver) = mpsc::channel(512);
     let state = state.clone();
     let config = config.clone();
     tokio::spawn(async move {
         for id in peers.keys() {
-            state.sans_connected.insert(*id, false);
+            state.connected.insert(*id, false);
         }
         if let Err(err) = run_udp(&socket, &state, &config, &mut peers, receiver).await {
             error!(%err, "UDP endpoint stopped");
         }
         for id in peers.keys() {
-            state.sans_connected.insert(*id, false);
+            state.connected.insert(*id, false);
         }
     });
     Ok(UdpEndpoint { sender, local_addr })
@@ -130,7 +101,7 @@ async fn run_udp(
     socket: &UdpSocket,
     state: &State,
     config: &Config,
-    peers: &mut HashMap<Uuid, PeerTunnel>,
+    peers: &mut HashMap<Uuid, PeerTunnel<SocketAddr>>,
     mut receiver: mpsc::Receiver<(Uuid, Vec<u8>)>,
 ) -> Result<()> {
     let mut buffer = vec![0; 65535];
@@ -143,7 +114,7 @@ async fn run_udp(
                 let Some((id, packet)) = request else { return Ok(()) };
                 if let Some(peer) = peers.get_mut(&id) {
                     peer.tunnel.push_packet(&packet);
-                    if let Err(err) = advance(peer, id, state) {
+                    if let Err(err) = peer.advance(id, state) {
                         trace!(%id, %err, "Failed to process UDP tunnel");
                     }
                     flush(socket, peer, id, state, config).await?;
@@ -151,7 +122,7 @@ async fn run_udp(
             }
             _ = timer.tick() => {
                 for (&id, peer) in peers.iter_mut() {
-                    if let Err(err) = advance(peer, id, state) {
+                    if let Err(err) = peer.advance(id, state) {
                         trace!(%id, %err, "Failed to maintain UDP tunnel");
                     }
                     flush(socket, peer, id, state, config).await?;
@@ -166,26 +137,11 @@ async fn run_udp(
                     Some(Ok((packet, consumed))) if consumed == len => packet,
                     _ => { trace!(%address, "Discarding malformed UDP datagram"); continue; }
                 };
-                let mut decoded_initiation = None;
-                let id = match &packet {
-                    Packet::Initiating(initiation) => {
-                        let Ok(decoded) = DecodedInitiation::decode(
-                            &config.interface.private_key.0, initiation.clone(),
-                        ) else { continue };
-                        let id = config.peers.iter()
-                            .find(|peer| *peer.public_key.0 == decoded.public_key)
-                            .map(|peer| peer.id);
-                        decoded_initiation = Some(decoded);
-                        id
-                    }
-                    Packet::Reply(reply) => peers.iter().find(|(_, peer)| {
-                        peer.tunnel.local_index() == Some(reply.receiver_idx)
-                    }).map(|(&id, _)| id),
-                    Packet::Data(data) => peers.iter().find(|(_, peer)| {
-                        peer.tunnel.local_index() == Some(data.receiver_idx)
-                    }).map(|(&id, _)| id),
+                let (id, decoded_initiation) = match identify(config, peers, &packet) {
+                    Ok(Some(incoming)) => incoming,
+                    Ok(None) => continue,
+                    Err(err) => { trace!(%address, %err, "Discarding invalid UDP handshake"); continue; }
                 };
-                let Some(id) = id else { continue };
                 let Some(peer) = peers.get_mut(&id) else { continue };
                 let before = peer.tunnel.established_at();
                 let is_data = matches!(packet, Packet::Data(_));
@@ -193,7 +149,7 @@ async fn run_udp(
                     Some(decoded) => peer.tunnel.process_initiation(decoded),
                     None => peer.tunnel.process_incoming_packet(packet),
                 };
-                match result.and_then(|()| advance(peer, id, state))
+                match result.and_then(|()| peer.advance(id, state))
                 {
                     Ok(()) => {
                         // Learn/migrate routes only after accepted handshakes or
@@ -210,32 +166,16 @@ async fn run_udp(
     }
 }
 
-fn advance(peer: &mut PeerTunnel, id: Uuid, state: &State) -> Result<()> {
-    peer.tunnel.process_new_packets()?;
-    let established = peer.tunnel.established_at();
-    if established.is_some() && established != peer.established {
-        state.record_established(id);
-    }
-    peer.established = established;
-    state.sans_connected.insert(id, peer.tunnel.is_live());
-    Ok(())
-}
-
 async fn flush(
     socket: &UdpSocket,
-    peer: &mut PeerTunnel,
+    peer: &mut PeerTunnel<SocketAddr>,
     id: Uuid,
     state: &State,
     config: &Config,
 ) -> Result<()> {
     if let Some(address) = peer.address {
         while let Some(packet) = peer.tunnel.read_outbound_packet() {
-            let plaintext_len = match &packet {
-                Packet::Data(data) if !data.flags.contains(DataFlags::JUNK) => {
-                    data.ciphertext.len().saturating_sub(16)
-                }
-                _ => 0,
-            };
+            let plaintext_len = plaintext_len(&packet);
             let bytes = packet.to_bytes(&config.layout)?;
             match socket.send_to(&bytes, address).await {
                 Ok(_) => {
@@ -250,21 +190,7 @@ async fn flush(
             }
         }
     }
-    while let Some(packet) = peer.tunnel.read_packet() {
-        if packet.is_empty() {
-            continue;
-        }
-        state
-            .peer_statistics
-            .entry(id)
-            .or_default()
-            .received
-            .fetch_add(packet.len() as u64, Ordering::Relaxed);
-        state.tun_in_tx.send(packet).await.map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "TUN receiver closed")
-        })?;
-    }
-    Ok(())
+    peer.deliver(id, state).await
 }
 
 #[cfg(test)]

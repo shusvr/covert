@@ -63,7 +63,7 @@ impl Writer {
         device: &AsyncDevice,
         packet: Vec<u8>,
         receiver: &mut mpsc::Receiver<Vec<u8>>,
-    ) -> io::Result<()> {
+    ) -> Result<(), covert::Error> {
         #[cfg(target_os = "linux")]
         {
             self.packets.clear();
@@ -85,11 +85,12 @@ impl Writer {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = receiver;
-            if device.send(&packet).await? != packet.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "incomplete TUN write",
-                ));
+            let written = device.send(&packet).await?;
+            if written != packet.len() {
+                return Err(covert::Error::IncompleteTunWrite {
+                    written,
+                    expected: packet.len(),
+                });
             }
         }
         Ok(())

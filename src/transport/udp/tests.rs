@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    codec::{Data, PacketLayout},
+    codec::{Data, DataFlags, PacketLayout},
     config::{Interface, ListenerConfig, Peer},
     crypto,
 };
@@ -267,12 +267,12 @@ async fn closing_tun_stops_udp_worker_and_plaintext_sender() {
     timeout(Duration::from_secs(3), endpoint.sender.closed())
         .await
         .unwrap();
-    assert!(
+    assert!(matches!(
         endpoint
             .trasmit(&state, &config, config.peers[0].id, b"closed")
-            .await
-            .is_err()
-    );
+            .await,
+        Err(crate::Error::EndpointStopped { transport: "UDP" })
+    ));
     assert_eq!(state.status(&config).peers[0].status, "disconnected");
 }
 

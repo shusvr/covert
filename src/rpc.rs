@@ -14,6 +14,18 @@ use tokio::{
     time::{MissedTickBehavior, interval, timeout},
 };
 
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("runtime directory is unavailable; specify --rpc PATH")]
+    RuntimeDirectoryUnavailable,
+    #[error("RPC I/O: {0}")]
+    Io(#[from] io::Error),
+    #[error("Failed to serialize RPC status: {0}")]
+    Serialize(#[from] serde_json::Error),
+    #[error("RPC client is not reading")]
+    ClientTimeout(#[from] tokio::time::error::Elapsed),
+}
+
 pub struct Server {
     listener: UnixListener,
     _path: SocketPath,
@@ -39,13 +51,8 @@ impl Drop for SocketPath {
     }
 }
 
-pub fn default_path(device: &str) -> io::Result<PathBuf> {
-    let directory = dirs::runtime_dir().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "runtime directory is unavailable; specify --rpc PATH",
-        )
-    })?;
+pub fn default_path(device: &str) -> Result<PathBuf, Error> {
+    let directory = dirs::runtime_dir().ok_or(Error::RuntimeDirectoryUnavailable)?;
     Ok(directory.join(format!("covert.{device}.sock")))
 }
 
@@ -92,16 +99,14 @@ async fn stream_status(
     mut stream: UnixStream,
     state: Arc<State>,
     config: Arc<Config>,
-) -> io::Result<()> {
+) -> Result<(), Error> {
     let mut ticks = interval(Duration::from_secs(1));
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         ticks.tick().await;
-        let mut line = serde_json::to_vec(&state.status(&config)).map_err(io::Error::other)?;
+        let mut line = serde_json::to_vec(&state.status(&config))?;
         line.push(b'\n');
-        timeout(Duration::from_secs(5), stream.write_all(&line))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "RPC client is not reading"))??;
+        timeout(Duration::from_secs(5), stream.write_all(&line)).await??;
     }
 }
 
@@ -196,10 +201,10 @@ mod tests {
     fn default_socket_uses_runtime_directory_directly() {
         match dirs::runtime_dir() {
             Some(dir) => assert_eq!(default_path("co1").unwrap(), dir.join("covert.co1.sock")),
-            None => assert_eq!(
-                default_path("co1").unwrap_err().kind(),
-                io::ErrorKind::NotFound
-            ),
+            None => assert!(matches!(
+                default_path("co1"),
+                Err(Error::RuntimeDirectoryUnavailable)
+            )),
         }
     }
 }

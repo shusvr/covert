@@ -21,8 +21,17 @@ pub enum Error {
     Codec(#[from] codec::Error),
     #[error("Unspecified crypto error")]
     Crypto,
-    #[error("Connection unavailable for peer {peer_id} at local index {local_idx}")]
-    ConnectionUnavailable { peer_id: uuid::Uuid, local_idx: u32 },
+    #[error("{transport} endpoint stopped")]
+    EndpointStopped { transport: &'static str },
+    #[error("TUN receiver closed")]
+    TunReceiverClosed,
+    #[error("Incomplete TUN write: wrote {written} of {expected} bytes")]
+    IncompleteTunWrite { written: usize, expected: usize },
+    #[error("Failed to install ICMP firewall rule ({status}): {stderr}")]
+    IcmpFirewallSetup {
+        status: std::process::ExitStatus,
+        stderr: String,
+    },
     #[error("System clock is before the Unix epoch: {0}")]
     SystemTime(#[from] std::time::SystemTimeError),
 }

@@ -1,29 +1,28 @@
+use crate::{
+    Result,
+    codec::{self, Packet, PacketLayout},
+    config::{Config, PeerTransport},
+    transport::{PeerTunnel, State, TransportEndpoint, identify, plaintext_len},
+};
 use bytes::BytesMut;
-use dashmap::DashMap;
-use futures::{SinkExt, StreamExt, channel::mpsc};
 use serde::Deserialize;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
-    io,
+    collections::HashMap,
     io::Write,
     mem::MaybeUninit,
     net::{Ipv4Addr, SocketAddrV4},
     process::{Command, Stdio},
-    sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
+    time::Duration,
 };
-use tokio::{io::unix::AsyncFd, task::JoinSet};
-use tokio_util::codec::Encoder;
-use tracing::error;
-
-use crate::{
-    Result,
-    codec::{self, Codec, Packet},
-    config::Config,
-    transport::{Endpoint, PacketSender, State, maintain_peers, process_packet},
+use tokio::{
+    io::unix::AsyncFd,
+    sync::mpsc,
+    time::{MissedTickBehavior, interval},
 };
+use tracing::{error, trace};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
 pub enum IcmpMode {
@@ -52,10 +51,9 @@ pub struct IcmpTransportPeerConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct IcmpRoute {
+struct IcmpRoute {
     address: Ipv4Addr,
-    // Shared by queued packets and the route map so responder data uses the latest query.
-    reply: Option<Arc<AtomicU32>>,
+    reply: Option<etherparse::IcmpEchoHeader>,
 }
 
 impl IcmpRoute {
@@ -68,133 +66,254 @@ impl IcmpRoute {
     fn response(address: Ipv4Addr, id: u16, seq: u16) -> Self {
         Self {
             address,
-            reply: Some(Arc::new(AtomicU32::new(
-                (u32::from(id) << 16) | u32::from(seq),
-            ))),
+            reply: Some(etherparse::IcmpEchoHeader { id, seq }),
         }
     }
     fn echo_type(&self, initiating: bool, id: u16, sequence: &mut u16) -> etherparse::Icmpv4Type {
-        if !initiating {
-            if let Some(reply) = &self.reply {
-                let value = reply.load(Ordering::Relaxed);
-                return etherparse::Icmpv4Type::EchoReply(etherparse::IcmpEchoHeader {
-                    id: (value >> 16) as u16,
-                    seq: value as u16,
-                });
-            }
+        if !initiating && let Some(reply) = self.reply {
+            return etherparse::Icmpv4Type::EchoReply(reply);
         }
         let echo = etherparse::IcmpEchoHeader { id, seq: *sequence };
         *sequence = sequence.wrapping_add(1);
         etherparse::Icmpv4Type::EchoRequest(echo)
     }
 }
+
 const SOCKET_MARK: u32 = 0x434f5654;
+
+pub struct IcmpEndpoint {
+    sender: mpsc::Sender<(Uuid, Vec<u8>)>,
+}
+
+impl TransportEndpoint for IcmpEndpoint {
+    async fn trasmit(
+        &mut self,
+        _state: &State,
+        _config: &Config,
+        peer_id: Uuid,
+        packet: &[u8],
+    ) -> Result<()> {
+        self.sender
+            .send((peer_id, packet.to_vec()))
+            .await
+            .map_err(|_| crate::Error::EndpointStopped { transport: "ICMP" })?;
+        Ok(())
+    }
+}
+
+struct EchoEncoder {
+    layout: PacketLayout,
+    id: u16,
+    mode: IcmpMode,
+    sequence: u16,
+    buffer: BytesMut,
+}
+
+impl EchoEncoder {
+    fn new(layout: PacketLayout, listener: &IcmpListenerConfig) -> Self {
+        Self {
+            layout,
+            id: listener.id,
+            mode: listener.mode,
+            sequence: 0,
+            buffer: BytesMut::new(),
+        }
+    }
+
+    fn encode(&mut self, packet: Packet, route: &IcmpRoute) -> Result<&[u8]> {
+        let initiating = self.mode == IcmpMode::OnlyEcho || matches!(packet, Packet::Initiating(_));
+        let kind = route.echo_type(initiating, self.id, &mut self.sequence);
+        self.buffer.clear();
+        self.buffer.resize(8, 0);
+        codec::append(&mut self.buffer, packet, &self.layout)?;
+        let header = etherparse::Icmpv4Header::with_checksum(kind, &self.buffer[8..]);
+        self.buffer[..8].copy_from_slice(&header.to_bytes());
+        Ok(&self.buffer)
+    }
+}
 
 pub async fn create_icmp_endpoint(
     state: &Arc<State>,
     config: &Arc<Config>,
     listener: &IcmpListenerConfig,
-) -> Result<Endpoint<impl PacketSender<IcmpRoute> + use<>, IcmpRoute>> {
-    let routing = Arc::new(
-        config
-            .peers
-            .iter()
-            .filter_map(|p| {
-                p.transport
-                    .icmp()?
-                    .endpoint
-                    .map(|e| (p.id, IcmpRoute::request(e)))
-            })
-            .collect::<DashMap<_, _>>(),
-    );
-
+) -> Result<IcmpEndpoint> {
+    let mut peers = HashMap::new();
+    for peer in &config.peers {
+        let address = match &peer.transport {
+            PeerTransport::Icmp { icmp } => icmp.endpoint.map(IcmpRoute::request),
+            PeerTransport::None => None,
+            _ => continue,
+        };
+        peers.insert(peer.id, PeerTunnel::new(config, peer, address)?);
+    }
     let icmp = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?;
-    let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, listener.id);
-    icmp.bind(&addr.into())?;
+    icmp.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, listener.id).into())?;
     icmp.set_mark(SOCKET_MARK)?;
     icmp.set_nonblocking(true)?;
-
-    // The descriptor remains owned exclusively by this AsyncFd until it is dropped.
-    let sock = Arc::new(unsafe { AsyncFd::register(icmp).map_err(|err| err.into_parts().1)? });
+    // The AsyncFd owns the descriptor until the worker exits.
+    let socket = unsafe { AsyncFd::register(icmp).map_err(|err| err.into_parts().1)? };
     let firewall = ReplyFilter::install(listener.id)?;
-
-    let (sender, recv) = mpsc::channel::<(Packet, IcmpRoute)>(512);
-    let outgoing = sender.clone().sink_map_err(Into::into);
-    let maintenance_sender = sender.clone().sink_map_err(Into::into);
+    let (sender, receiver) = mpsc::channel(512);
     let state = state.clone();
     let config = config.clone();
-    let task_routing = routing.clone();
-    let id = listener.id;
-    let mode = listener.mode;
+    let listener = listener.clone();
     tokio::spawn(async move {
         let _firewall = firewall;
-        let mut tasks = JoinSet::new();
-        tasks.spawn(sender_task(config.clone(), recv, sock.clone(), id, mode));
-        tasks.spawn(maintain_peers(
-            state.clone(),
-            config.clone(),
-            task_routing.clone(),
-            maintenance_sender,
-        ));
-        tokio::select! {
-            _ = receiver_task(state, config, task_routing, outgoing, sock, id, mode) => {},
-            _ = tasks.join_next() => {},
+        for id in peers.keys() {
+            state.connected.insert(*id, false);
+        }
+        if let Err(err) = run_icmp(&socket, &state, &config, &listener, &mut peers, receiver).await
+        {
+            error!(%err, "ICMP endpoint stopped");
+        }
+        for id in peers.keys() {
+            state.connected.insert(*id, false);
         }
     });
-
-    Ok(Endpoint {
-        sender: sender.sink_map_err(Into::into),
-        routing,
-    })
+    Ok(IcmpEndpoint { sender })
 }
 
-async fn sender_task(
-    config: Arc<Config>,
-    mut recv: mpsc::Receiver<(Packet, IcmpRoute)>,
-    sock: Arc<AsyncFd<Socket>>,
-    id: u16,
-    mode: IcmpMode,
-) {
-    let mut codec = Codec::new(config.layout);
-    let mut sequence = 0_u16;
-    let mut buf = BytesMut::new();
-    while let Some((packet, dst)) = recv.next().await {
-        let addr = SocketAddrV4::new(dst.address, 0);
-        let echo_type = match mode {
-            IcmpMode::EchoReply => {
-                dst.echo_type(matches!(&packet, Packet::Initiating(_)), id, &mut sequence)
+async fn run_icmp(
+    socket: &AsyncFd<Socket>,
+    state: &State,
+    config: &Config,
+    listener: &IcmpListenerConfig,
+    peers: &mut HashMap<Uuid, PeerTunnel<IcmpRoute>>,
+    mut receiver: mpsc::Receiver<(Uuid, Vec<u8>)>,
+) -> Result<()> {
+    let mut buffer = vec![MaybeUninit::<u8>::uninit(); 65535];
+    let mut encoder = EchoEncoder::new(config.layout, listener);
+    let mut timer = interval(Duration::from_millis(100));
+    timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = state.tun_in_tx.closed() => return Ok(()),
+            request = receiver.recv() => {
+                let Some((id, packet)) = request else { return Ok(()) };
+                if let Some(peer) = peers.get_mut(&id) {
+                    peer.tunnel.push_packet(&packet);
+                    if let Err(err) = peer.advance(id, state) {
+                        trace!(%id, %err, "Failed to process ICMP tunnel");
+                    }
+                    flush(socket, peer, id, state, &mut encoder).await?;
+                }
             }
-            IcmpMode::OnlyEcho => dst.echo_type(true, id, &mut sequence),
-        };
-
-        buf.clear();
-        buf.resize(8, 0);
-        if let Err(err) = codec.encode(packet, &mut buf) {
-            error!("Failed to encode a packet: {err}");
-            continue;
-        }
-        let header = etherparse::Icmpv4Header::with_checksum(echo_type, &buf[8..]);
-        buf[..8].copy_from_slice(&header.to_bytes());
-        let addr = addr.into();
-        let result = sock
-            .async_io(tokio::io::Interest::WRITABLE, |socket| {
-                socket.send_to(&buf, &addr)
-            })
-            .await;
-        match result {
-            Ok(sent) if sent == buf.len() => {}
-            Ok(sent) => {
-                error!(dst = %dst.address, sent, expected = buf.len(), "Incomplete ICMP datagram send")
+            _ = timer.tick() => {
+                for (&id, peer) in peers.iter_mut() {
+                    if let Err(err) = peer.advance(id, state) {
+                        trace!(%id, %err, "Failed to maintain ICMP tunnel");
+                    }
+                    flush(socket, peer, id, state, &mut encoder).await?;
+                }
             }
-            Err(err) => error!(dst = %dst.address, "Failed to send ICMP datagram: {err}"),
+            incoming = socket.async_io(tokio::io::Interest::READABLE, |socket| socket.recv(&mut buffer)) => {
+                let len = incoming?;
+                // recv initialized exactly the returned number of bytes.
+                let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), len) };
+                match process_echo(config, peers, state, bytes, listener) {
+                    Ok(Some(id)) => flush(socket, peers.get_mut(&id).unwrap(), id, state, &mut encoder).await?,
+                    Ok(None) => {},
+                    Err(err) => trace!(%err, "Discarding invalid ICMP packet"),
+                }
+            }
         }
     }
+}
+
+fn process_echo(
+    config: &Config,
+    peers: &mut HashMap<Uuid, PeerTunnel<IcmpRoute>>,
+    state: &State,
+    bytes: &[u8],
+    listener: &IcmpListenerConfig,
+) -> Result<Option<Uuid>> {
+    let Some((address, payload)) = echo_payload(bytes, listener.id, listener.mode) else {
+        return Ok(None);
+    };
+    let packet = match codec::parse_slice(payload, &config.layout) {
+        Some(Ok((packet, consumed))) if consumed == payload.len() => packet,
+        _ => return Ok(None),
+    };
+    let offset = (bytes[0] as usize & 15) * 4;
+    let is_request = bytes[offset] == 8;
+    let echo_id = u16::from_be_bytes([bytes[offset + 4], bytes[offset + 5]]);
+    let sequence = u16::from_be_bytes([bytes[offset + 6], bytes[offset + 7]]);
+    if listener.mode == IcmpMode::EchoReply
+        && matches!(
+            (&packet, is_request),
+            (Packet::Initiating(_), false) | (Packet::Reply(_), true)
+        )
+    {
+        return Ok(None);
+    }
+    let Some((id, decoded)) = identify(config, peers, &packet)? else {
+        return Ok(None);
+    };
+    let peer = peers.get_mut(&id).unwrap();
+    let is_data = matches!(packet, Packet::Data(_));
+    if is_data
+        && !peer.address.as_ref().is_some_and(|route| {
+            route.address == address
+                && (listener.mode == IcmpMode::OnlyEcho || route.reply.is_some() == is_request)
+        })
+    {
+        return Ok(None);
+    }
+    let before = peer.tunnel.established_at();
+    match decoded {
+        Some(decoded) => peer.tunnel.process_initiation(decoded)?,
+        None => peer.tunnel.process_incoming_packet(packet)?,
+    }
+    peer.advance(id, state)?;
+    if peer.tunnel.is_live() && (is_data || peer.tunnel.established_at() != before) {
+        peer.address = Some(if listener.mode == IcmpMode::EchoReply && is_request {
+            IcmpRoute::response(address, echo_id, sequence)
+        } else {
+            IcmpRoute::request(address)
+        });
+    }
+    Ok(Some(id))
+}
+
+async fn flush(
+    socket: &AsyncFd<Socket>,
+    peer: &mut PeerTunnel<IcmpRoute>,
+    id: Uuid,
+    state: &State,
+    encoder: &mut EchoEncoder,
+) -> Result<()> {
+    if let Some(route) = &peer.address {
+        while let Some(packet) = peer.tunnel.read_outbound_packet() {
+            let size = plaintext_len(&packet);
+            let bytes = encoder.encode(packet, route)?;
+            let address = SocketAddrV4::new(route.address, 0).into();
+            match socket
+                .async_io(tokio::io::Interest::WRITABLE, |socket| {
+                    socket.send_to(bytes, &address)
+                })
+                .await
+            {
+                Ok(sent) if sent == bytes.len() => {
+                    state
+                        .peer_statistics
+                        .entry(id)
+                        .or_default()
+                        .sent
+                        .fetch_add(size as u64, Ordering::Relaxed);
+                }
+                result => {
+                    trace!(%id, address = %route.address, ?result, "Failed to send complete ICMP datagram")
+                }
+            }
+        }
+    }
+    peer.deliver(id, state).await
 }
 
 // A private table keeps cleanup from modifying any existing firewall rules.
 struct ReplyFilter(String);
 impl ReplyFilter {
-    fn install(id: u16) -> io::Result<Self> {
+    fn install(id: u16) -> Result<Self> {
         let table = format!("covert_icmp_{}_{}", std::process::id(), fastrand::u32(..));
         let rules = format!(
             "add table ip {table}\nadd chain ip {table} output {{ type filter hook output priority 0; policy accept; }}\nadd rule ip {table} output icmp type echo-reply icmp id {id} meta mark != {SOCKET_MARK} drop\n"
@@ -207,10 +326,10 @@ impl ReplyFilter {
         child.stdin.take().unwrap().write_all(rules.as_bytes())?;
         let output = child.wait_with_output()?;
         if !output.status.success() {
-            return Err(io::Error::other(format!(
-                "Failed to install ICMP rule: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
+            return Err(crate::Error::IcmpFirewallSetup {
+                status: output.status,
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
         }
         Ok(Self(table))
     }
@@ -257,91 +376,6 @@ fn echo_payload(bytes: &[u8], id: u16, mode: IcmpMode) -> Option<(Ipv4Addr, &[u8
         Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15]),
         payload,
     ))
-}
-
-async fn receiver_task<S: PacketSender<IcmpRoute>>(
-    state: Arc<State>,
-    config: Arc<Config>,
-    routing: Arc<DashMap<uuid::Uuid, IcmpRoute>>,
-    mut sender: S,
-    sock: Arc<AsyncFd<Socket>>,
-    id: u16,
-    mode: IcmpMode,
-) {
-    let mut bytes = vec![MaybeUninit::<u8>::uninit(); 65535];
-    loop {
-        let result = tokio::select! {
-            _ = state.tun_in_tx.closed() => break,
-            result = sock.async_io(tokio::io::Interest::READABLE, |socket| socket.recv(&mut bytes)) => result,
-        };
-        let len = match result {
-            Ok(len) => len,
-            Err(err) => {
-                error!("ICMP receive failed: {err}");
-                break;
-            }
-        };
-        // recv initialized exactly the returned number of bytes.
-        let received = unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<u8>(), len) };
-        let Some((route, payload)) = echo_payload(received, id, mode) else {
-            continue;
-        };
-        let mut payload = BytesMut::from(payload);
-        let Some(Ok(packet)) = codec::parse(&mut payload, &config.layout) else {
-            continue;
-        };
-        if !payload.is_empty() {
-            continue;
-        }
-        let offset = (received[0] as usize & 15) * 4;
-        let is_request = received[offset] == 8;
-        let metadata = offset + 4;
-        let echo_id = u16::from_be_bytes([received[metadata], received[metadata + 1]]);
-        let seq = u16::from_be_bytes([received[metadata + 2], received[metadata + 3]]);
-        let data_index = match &packet {
-            Packet::Initiating(_) if mode == IcmpMode::EchoReply && !is_request => continue,
-            Packet::Reply(_) if mode == IcmpMode::EchoReply && is_request => continue,
-            Packet::Data(data) => {
-                let Some(handle) = state.established.get(&data.receiver_idx) else {
-                    continue;
-                };
-                let Some(existing) = routing.get(&handle.peer_id) else {
-                    continue;
-                };
-                if existing.address != route
-                    || (mode == IcmpMode::EchoReply && existing.reply.is_some() != is_request)
-                {
-                    continue;
-                }
-                Some(data.receiver_idx)
-            }
-            _ => None,
-        };
-        let route = if mode == IcmpMode::EchoReply && is_request {
-            IcmpRoute::response(route, echo_id, seq)
-        } else {
-            IcmpRoute::request(route)
-        };
-        match process_packet(&state, &config, packet, route, &routing, &mut sender).await {
-            Ok(true) => {
-                // Only authenticated data/keepalives may update the reply metadata.
-                if let Some(index) = data_index {
-                    if let Some(handle) = state.established.get(&index) {
-                        if let Some(route) = routing.get(&handle.peer_id) {
-                            if let Some(reply) = &route.reply {
-                                reply.store(
-                                    (u32::from(echo_id) << 16) | u32::from(seq),
-                                    Ordering::Relaxed,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(false) => break,
-            Err(err) => error!("Failed to process ICMP packet: {err}"),
-        }
-    }
 }
 
 #[cfg(test)]
