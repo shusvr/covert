@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_variables)]
-
 use std::{
     collections::VecDeque,
     time::{Duration, Instant, SystemTime},
@@ -33,22 +31,33 @@ enum State {
 
 pub struct Tunnel {
     local_sk: Key,
-    remote_pk: Option<Key>,
+    remote_pk: Key,
     psk: Option<Key>,
     queue: VecDeque<Vec<u8>>,
     received: BytesMut,
     state: State,
     outbound: VecDeque<Packet>,
     decrypted: VecDeque<Vec<u8>>,
-    pending: Option<PendingInitiation>,
     liveness: Liveness,
     layout: PacketLayout,
 }
 
-pub struct PendingInitiation {
+pub struct DecodedInitiation {
     pub initiation: Initiating,
     pub public_key: Key,
     pub timestamp: u64,
+}
+
+impl DecodedInitiation {
+    /// Decode the peer identity before choosing which tunnel should handle it.
+    pub fn decode(local_sk: &Key, initiation: Initiating) -> Result<Self> {
+        let (public_key, timestamp) = crypto::pre_reply(local_sk, &initiation)?;
+        Ok(Self {
+            initiation,
+            public_key,
+            timestamp,
+        })
+    }
 }
 
 impl Tunnel {
@@ -56,32 +65,21 @@ impl Tunnel {
         layout: PacketLayout,
         local_sk: Key,
         liveness: Liveness,
-        remote_pk: Option<Key>,
+        remote_pk: Key,
         psk: Option<Key>,
-    ) -> Result<Self> {
-        let state = if let Some(remote_pk) = remote_pk {
-            let initiated = crypto::initiate(&local_sk, &remote_pk, timestamp(), index())?;
-            State::Initiated {
-                initiated: initiated,
-                last_initiated: None,
-            }
-        } else {
-            State::Idle
-        };
-
-        Ok(Self {
+    ) -> Self {
+        Self {
             layout,
             local_sk,
             remote_pk,
-            state,
+            state: State::Idle,
             psk,
             liveness,
             queue: Default::default(),
             decrypted: Default::default(),
             outbound: Default::default(),
             received: BytesMut::new(),
-            pending: None,
-        })
+        }
     }
 
     pub fn push_packet(&mut self, packet: &[u8]) {
@@ -94,92 +92,31 @@ impl Tunnel {
         self.received.extend_from_slice(packet);
     }
 
-    fn initiate_expired(&mut self) -> Result<()> {
-        let initiated = crypto::initiate(
-            &self.local_sk,
-            // if the state has been established we for sure know the remote pk
-            &self.remote_pk.unwrap(),
-            timestamp(),
-            index(),
-        )?;
+    /// Start a handshake, retaining queued plaintext for the new session.
+    pub fn initiate(&mut self) -> Result<()> {
+        let initiated = crypto::initiate(&self.local_sk, &self.remote_pk, timestamp(), index())?;
         self.state = State::Initiated {
-            initiated: initiated,
+            initiated,
             last_initiated: None,
         };
 
         Ok(())
     }
 
-    pub fn approve_pending(&mut self, psk: Option<Key>, liveness: Liveness) -> Result<()> {
-        let Some(PendingInitiation {
-            initiation,
-            public_key,
-            timestamp,
-        }) = self.pending.take()
-        else {
-            return Ok(());
-        };
-
-        self.remote_pk = Some(public_key);
-        self.psk = psk;
-        self.liveness = liveness;
-
-        let local_idx = index();
-        let (reply, cipher) =
-            crypto::post_reply(&public_key, psk.as_ref(), local_idx, &initiation)?;
-        // Abandon any unsent initiation when accepting the peer's handshake.
-        self.outbound
-            .retain(|packet| !matches!(packet, Packet::Initiating(_)));
-        self.establish(cipher, local_idx, initiation.sender_idx, timestamp);
-        self.outbound.push_back(Packet::Reply(reply));
-
+    fn process_received(&mut self) -> Result<()> {
+        while let Some(packet) = codec::parse(&mut self.received, &self.layout).transpose()? {
+            self.process_incoming_packet(packet)?;
+        }
         Ok(())
     }
 
-    pub fn reject_pending(&mut self) {
-        self.pending = None;
-    }
-
-    fn process_received(&mut self) -> Result<Option<&PendingInitiation>> {
-        while self.pending.is_none() {
-            let Some(packet) = codec::parse(&mut self.received, &self.layout).transpose()? else {
-                break;
-            };
-            self.process_incoming_packet(packet)?;
-        }
-        Ok(self.pending.as_ref())
-    }
-
     /// Process an already decoded packet without buffering or parsing its bytes.
-    /// Call `process_new_packets` afterward to handle approval and outgoing work.
+    /// Call `process_new_packets` afterward to handle outgoing work.
     pub fn process_incoming_packet(&mut self, packet: Packet) -> Result<()> {
         match packet {
             Packet::Initiating(initiating) => {
-                let (public_key, timestamp) = crypto::pre_reply(&self.local_sk, &initiating)?;
-
-                if matches!(self.state, State::Initiated { .. })
-                    && self.remote_pk == Some(public_key)
-                {
-                    let local_public_key =
-                        crypto::pk_to_bytes(&crypto::to_sk(&self.local_sk).compute_public_key()?);
-                    // For competing handshakes, the smaller static public
-                    // key remains the initiator; the other peer responds.
-                    if local_public_key < public_key {
-                        return Ok(());
-                    }
-                }
-
-                if !matches!(
-                    self.state,
-                    State::Established { timestamp: old, .. } if old >= timestamp
-                ) {
-                    self.pending = Some(PendingInitiation {
-                        initiation: initiating,
-                        public_key,
-                        timestamp,
-                    });
-                    return Ok(());
-                }
+                let decoded = DecodedInitiation::decode(&self.local_sk, initiating)?;
+                self.process_initiation(decoded)?;
             }
             Packet::Reply(replying) => {
                 if let State::Initiated { initiated, .. } = &self.state
@@ -201,11 +138,9 @@ impl Tunnel {
                 if let State::Established {
                     cipher,
                     local_idx,
-                    receiver_idx,
                     established,
                     last_seen: seen,
-                    next_ka,
-                    timestamp: _,
+                    ..
                 } = &mut self.state
                 {
                     if incoming_idx != *local_idx {
@@ -213,7 +148,7 @@ impl Tunnel {
                     }
                     if self.liveness.has_expired(now - *established, now - *seen) {
                         // connection has expired
-                        self.initiate_expired()?;
+                        self.initiate()?;
                     } else {
                         // conn is live, decrypt
 
@@ -226,6 +161,44 @@ impl Tunnel {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Apply a decoded initiation without repeating its cryptographic decoding.
+    pub fn process_initiation(&mut self, decoded: DecodedInitiation) -> Result<()> {
+        if decoded.public_key != self.remote_pk {
+            return Ok(());
+        }
+        if matches!(self.state, State::Initiated { .. }) {
+            let local_public_key =
+                crypto::pk_to_bytes(&crypto::to_sk(&self.local_sk).compute_public_key()?);
+            // For competing handshakes, the smaller static public key initiates.
+            if local_public_key < self.remote_pk {
+                return Ok(());
+            }
+        }
+        if matches!(
+            self.state,
+            State::Established { timestamp: old, .. } if old >= decoded.timestamp
+        ) {
+            return Ok(());
+        }
+        let local_idx = index();
+        let (reply, cipher) = crypto::post_reply(
+            &self.remote_pk,
+            self.psk.as_ref(),
+            local_idx,
+            &decoded.initiation,
+        )?;
+        self.outbound
+            .retain(|packet| !matches!(packet, Packet::Initiating(_)));
+        self.establish(
+            cipher,
+            local_idx,
+            decoded.initiation.sender_idx,
+            decoded.timestamp,
+        );
+        self.outbound.push_back(Packet::Reply(reply));
         Ok(())
     }
 
@@ -242,10 +215,8 @@ impl Tunnel {
         };
     }
 
-    pub fn process_new_packets(&mut self) -> Result<Option<&PendingInitiation>> {
-        while let Some(x) = self.process_received()? {
-            return Ok(Some(x));
-        }
+    pub fn process_new_packets(&mut self) -> Result<()> {
+        self.process_received()?;
 
         match &mut self.state {
             State::Idle => {}
@@ -255,14 +226,13 @@ impl Tunnel {
                 established,
                 last_seen: seen,
                 next_ka,
-                timestamp: _,
-                local_idx: _,
+                ..
             } => {
                 let now = Instant::now();
 
                 if self.liveness.has_expired(now - *established, now - *seen) {
                     // conn has expired
-                    self.initiate_expired()?;
+                    self.initiate()?;
                 } else {
                     // conn is live, encrypt
 
@@ -306,7 +276,7 @@ impl Tunnel {
 
                         let initiating = crypto::initiate(
                             &self.local_sk,
-                            &self.remote_pk.unwrap(),
+                            &self.remote_pk,
                             timestamp(),
                             index(),
                         )?;
@@ -323,11 +293,10 @@ impl Tunnel {
                         *last_initiated = Some(now);
                     }
                 }
-                if last_initiated.is_none_or(|x| (now - x) > Duration::from_secs(10)) {}
             }
         };
 
-        Ok(None)
+        Ok(())
     }
 
     pub fn read_outbound(&mut self) -> Result<Option<Bytes>> {

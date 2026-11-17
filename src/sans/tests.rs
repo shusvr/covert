@@ -16,41 +16,38 @@ fn liveness() -> Liveness {
 }
 
 fn pair(layout: PacketLayout) -> (Tunnel, Tunnel) {
+    let mut initiator = Tunnel::new(layout, [1; 32], liveness(), public_key(&[2; 32]), PSK);
+    initiator.initiate().unwrap();
     (
-        Tunnel::new(layout, [1; 32], liveness(), Some(public_key(&[2; 32])), PSK).unwrap(),
-        Tunnel::new(layout, [2; 32], liveness(), None, None).unwrap(),
+        initiator,
+        Tunnel::new(layout, [2; 32], liveness(), public_key(&[1; 32]), PSK),
     )
 }
 
 fn establish(initiator: &mut Tunnel, responder: &mut Tunnel) {
-    assert!(initiator.process_new_packets().unwrap().is_none());
+    initiator.process_new_packets().unwrap();
     let initiation = initiator.read_outbound().unwrap().unwrap();
     responder.write_incoming(&initiation);
-    let pending = responder.process_new_packets().unwrap().unwrap();
-    assert_eq!(pending.public_key, public_key(&initiator.local_sk));
-    // Approval must precede both the reply and the responder session.
-    assert!(responder.read_outbound().unwrap().is_none());
-    assert!(matches!(responder.state, State::Idle));
-    responder.approve_pending(PSK, liveness()).unwrap();
+    responder.process_new_packets().unwrap();
     let reply = responder.read_outbound().unwrap().unwrap();
     initiator.write_incoming(&reply);
-    assert!(initiator.process_new_packets().unwrap().is_none());
-    assert!(matches!(initiator.state, State::Established { .. }));
-    assert!(matches!(responder.state, State::Established { .. }));
+    initiator.process_new_packets().unwrap();
+    assert!(initiator.is_live());
+    assert!(responder.is_live());
 }
 
 fn transfer(sender: &mut Tunnel, receiver: &mut Tunnel, payload: &[u8]) {
     sender.push_packet(payload);
-    assert!(sender.process_new_packets().unwrap().is_none());
+    sender.process_new_packets().unwrap();
     let wire = sender.read_outbound().unwrap().unwrap();
     receiver.write_incoming(&wire);
-    assert!(receiver.process_new_packets().unwrap().is_none());
+    receiver.process_new_packets().unwrap();
     assert_eq!(receiver.read_packet().unwrap(), payload);
     assert!(receiver.read_packet().is_none());
 }
 
 #[test]
-fn approved_handshake_delivers_queued_packets_in_order() {
+fn handshake_delivers_queued_packets_in_order() {
     for layout in [PacketLayout::default(), PacketLayout::random()] {
         let (mut initiator, mut responder) = pair(layout);
         initiator.push_packet(b"first");
@@ -72,7 +69,7 @@ fn approved_handshake_delivers_queued_packets_in_order() {
 }
 
 #[test]
-fn rejecting_initiation_preserves_existing_session() {
+fn unknown_identity_preserves_existing_session() {
     let (mut initiator, mut responder) = pair(PacketLayout::default());
     establish(&mut initiator, &mut responder);
     let timestamp = match responder.state {
@@ -85,10 +82,10 @@ fn rejecting_initiation_preserves_existing_session() {
         .to_bytes(&responder.layout)
         .unwrap();
     responder.write_incoming(&wire);
-    let pending = responder.process_new_packets().unwrap().unwrap();
-    assert_eq!(pending.public_key, public_key(&[4; 32]));
-    responder.reject_pending();
-    assert!(responder.pending.is_none());
+    let established = responder.established_at();
+    responder.process_new_packets().unwrap();
+    assert_eq!(responder.established_at(), established);
+    assert_eq!(responder.remote_pk, public_key(&[1; 32]));
     assert!(responder.read_outbound().unwrap().is_none());
     transfer(&mut initiator, &mut responder, b"original session");
     transfer(&mut responder, &mut initiator, b"still works");
@@ -101,12 +98,11 @@ fn fragmented_handshake_and_data_wait_for_complete_frames() {
     let initiation = initiator.read_outbound().unwrap().unwrap();
     for byte in &initiation[..initiation.len() - 1] {
         responder.write_incoming(&[*byte]);
-        assert!(responder.process_new_packets().unwrap().is_none());
+        responder.process_new_packets().unwrap();
         assert!(responder.read_outbound().unwrap().is_none());
     }
     responder.write_incoming(&initiation[initiation.len() - 1..]);
-    assert!(responder.process_new_packets().unwrap().is_some());
-    responder.approve_pending(PSK, liveness()).unwrap();
+    responder.process_new_packets().unwrap();
     let reply = responder.read_outbound().unwrap().unwrap();
     initiator.write_incoming(&reply);
     initiator.process_new_packets().unwrap();
@@ -130,7 +126,6 @@ fn retry_refreshes_handshake_and_ignores_superseded_reply() {
     let original = initiator.read_outbound().unwrap().unwrap();
     responder.write_incoming(&original);
     responder.process_new_packets().unwrap();
-    responder.approve_pending(PSK, liveness()).unwrap();
     let delayed_reply = responder.read_outbound().unwrap().unwrap();
     initiator.process_new_packets().unwrap();
     assert!(initiator.read_outbound().unwrap().is_none());
@@ -145,11 +140,10 @@ fn retry_refreshes_handshake_and_ignores_superseded_reply() {
     let retry = initiator.read_outbound().unwrap().unwrap();
     assert_ne!(retry, original);
     initiator.write_incoming(&delayed_reply);
-    assert!(initiator.process_new_packets().unwrap().is_none());
+    initiator.process_new_packets().unwrap();
     assert!(matches!(initiator.state, State::Initiated { .. }));
     responder.write_incoming(&retry);
-    assert!(responder.process_new_packets().unwrap().is_some());
-    responder.approve_pending(PSK, liveness()).unwrap();
+    responder.process_new_packets().unwrap();
     let reply = responder.read_outbound().unwrap().unwrap();
     initiator.write_incoming(&reply);
     initiator.process_new_packets().unwrap();
@@ -158,13 +152,17 @@ fn retry_refreshes_handshake_and_ignores_superseded_reply() {
 
 #[test]
 fn wrong_psk_cannot_establish_initiator() {
-    let (mut initiator, mut responder) = pair(PacketLayout::default());
+    let (mut initiator, _) = pair(PacketLayout::default());
+    let mut responder = Tunnel::new(
+        PacketLayout::default(),
+        [2; 32],
+        liveness(),
+        public_key(&[1; 32]),
+        Some([9; 32]),
+    );
     initiator.process_new_packets().unwrap();
     responder.write_incoming(&initiator.read_outbound().unwrap().unwrap());
     responder.process_new_packets().unwrap();
-    responder
-        .approve_pending(Some([9; 32]), liveness())
-        .unwrap();
     initiator.write_incoming(&responder.read_outbound().unwrap().unwrap());
     assert!(initiator.process_new_packets().is_err());
     assert!(matches!(initiator.state, State::Initiated { .. }));
@@ -203,7 +201,7 @@ fn keepalive_is_authenticated_discarded_and_rescheduled() {
 }
 
 #[test]
-fn responder_can_rekey_with_approved_identity_and_psk() {
+fn responder_rekeys_with_fixed_identity_psk_and_liveness() {
     let (mut initiator, mut responder) = pair(PacketLayout::default());
     establish(&mut initiator, &mut responder);
     if let State::Established { last_seen, .. } = &mut responder.state {
@@ -213,8 +211,7 @@ fn responder_can_rekey_with_approved_identity_and_psk() {
     responder.process_new_packets().unwrap();
     let initiation = responder.read_outbound().unwrap().unwrap();
     initiator.write_incoming(&initiation);
-    assert!(initiator.process_new_packets().unwrap().is_some());
-    initiator.approve_pending(PSK, liveness()).unwrap();
+    initiator.process_new_packets().unwrap();
     let reply = initiator.read_outbound().unwrap().unwrap();
     responder.write_incoming(&reply);
     responder.process_new_packets().unwrap();
@@ -242,34 +239,33 @@ fn simultaneous_initiation_exchanges_data() {
             PacketLayout::default(),
             keys[0],
             liveness,
-            Some(public_key(&keys[1])),
+            public_key(&keys[1]),
             psk,
-        )
-        .unwrap();
+        );
         let mut responder = Tunnel::new(
             PacketLayout::default(),
             keys[1],
             liveness,
-            Some(public_key(&keys[0])),
+            public_key(&keys[0]),
             psk,
-        )
-        .unwrap();
+        );
+        initiator.initiate().unwrap();
+        responder.initiate().unwrap();
         initiator.push_packet(b"to responder");
         responder.push_packet(b"to initiator");
-        assert!(initiator.process_new_packets().unwrap().is_none());
-        assert!(responder.process_new_packets().unwrap().is_none());
+        initiator.process_new_packets().unwrap();
+        responder.process_new_packets().unwrap();
 
         if deliver_competing {
             let competing = responder.read_outbound().unwrap().unwrap();
             initiator.write_incoming(&competing);
-            assert!(initiator.process_new_packets().unwrap().is_none());
+            initiator.process_new_packets().unwrap();
             assert!(matches!(initiator.state, State::Initiated { .. }));
         }
 
         let initiation = initiator.read_outbound().unwrap().unwrap();
         responder.write_incoming(&initiation);
-        assert!(responder.process_new_packets().unwrap().is_some());
-        responder.approve_pending(psk, liveness).unwrap();
+        responder.process_new_packets().unwrap();
         let reply = responder.read_outbound().unwrap().unwrap();
         let mut parsed = BytesMut::from(reply.as_ref());
         assert!(matches!(
@@ -277,15 +273,15 @@ fn simultaneous_initiation_exchanges_data() {
             Some(Ok(Packet::Reply(_)))
         ));
         initiator.write_incoming(&reply);
-        assert!(initiator.process_new_packets().unwrap().is_none());
+        initiator.process_new_packets().unwrap();
 
         let data = initiator.read_outbound().unwrap().unwrap();
         responder.write_incoming(&data);
-        assert!(responder.process_new_packets().unwrap().is_none());
+        responder.process_new_packets().unwrap();
         assert_eq!(responder.read_packet().unwrap(), b"to responder");
         let data = responder.read_outbound().unwrap().unwrap();
         initiator.write_incoming(&data);
-        assert!(initiator.process_new_packets().unwrap().is_none());
+        initiator.process_new_packets().unwrap();
         assert_eq!(initiator.read_packet().unwrap(), b"to initiator");
     }
 }
@@ -297,10 +293,8 @@ fn parsed_packets_establish_and_deliver_without_stream_buffering() {
     responder
         .process_incoming_packet(initiator.read_outbound_packet().unwrap())
         .unwrap();
-    let pending = responder.process_new_packets().unwrap().unwrap();
-    assert_eq!(pending.public_key, public_key(&initiator.local_sk));
-    assert!(matches!(responder.state, State::Idle));
-    responder.approve_pending(PSK, liveness()).unwrap();
+    responder.process_new_packets().unwrap();
+    assert!(responder.is_live());
     initiator
         .process_incoming_packet(responder.read_outbound_packet().unwrap())
         .unwrap();
@@ -363,4 +357,54 @@ fn parsed_data_checks_index_and_authentication_before_delivery() {
         }))
         .unwrap();
     assert_eq!(responder.read_packet().unwrap(), b"authenticated payload");
+}
+
+#[test]
+fn decoded_initiation_exposes_identity_and_retains_replay_checks() {
+    let (mut initiator, mut responder) = pair(PacketLayout::default());
+    initiator.process_new_packets().unwrap();
+    let Packet::Initiating(initiation) = initiator.read_outbound_packet().unwrap() else {
+        panic!("expected initiation");
+    };
+    let decoded = DecodedInitiation::decode(&responder.local_sk, initiation.clone()).unwrap();
+    assert_eq!(decoded.public_key, public_key(&initiator.local_sk));
+    responder.process_initiation(decoded).unwrap();
+    responder.process_new_packets().unwrap();
+    let reply = responder.read_outbound_packet().unwrap();
+    initiator.process_incoming_packet(reply).unwrap();
+    let established = responder.established_at();
+
+    let replay = DecodedInitiation::decode(&responder.local_sk, initiation.clone()).unwrap();
+    responder.process_initiation(replay).unwrap();
+    responder.process_new_packets().unwrap();
+    assert_eq!(responder.established_at(), established);
+    assert!(responder.read_outbound_packet().is_none());
+    transfer(&mut initiator, &mut responder, b"session preserved");
+
+    let mut tampered = initiation;
+    tampered.enc_ts[0] ^= 1;
+    assert!(DecodedInitiation::decode(&responder.local_sk, tampered).is_err());
+}
+
+#[test]
+fn configured_tunnel_stays_passive_until_explicitly_initiated() {
+    let mut tunnel = Tunnel::new(
+        PacketLayout::default(),
+        [1; 32],
+        liveness(),
+        public_key(&[2; 32]),
+        PSK,
+    );
+    tunnel.push_packet(b"waiting for a route");
+    tunnel.process_new_packets().unwrap();
+    assert!(tunnel.local_index().is_none());
+    assert!(!tunnel.is_live());
+    assert!(tunnel.read_outbound_packet().is_none());
+    tunnel.initiate().unwrap();
+    tunnel.process_new_packets().unwrap();
+    assert!(matches!(
+        tunnel.read_outbound_packet(),
+        Some(Packet::Initiating(_))
+    ));
+    assert_eq!(tunnel.queue.front().unwrap(), b"waiting for a route");
 }

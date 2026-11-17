@@ -2,8 +2,7 @@ use crate::{
     Result,
     codec::{self, DataFlags, Packet},
     config::{Config, PeerTransport},
-    crypto,
-    sans::Tunnel,
+    sans::{DecodedInitiation, Tunnel},
     transport::{State, TransportEndpoint},
 };
 use serde::Deserialize;
@@ -91,13 +90,16 @@ pub async fn create_udp_endpoint(
         let liveness = peer
             .liveness
             .unpack_with_fallback(&config.interface.liveness);
-        let tunnel = Tunnel::new(
+        let mut tunnel = Tunnel::new(
             config.layout,
             *config.interface.private_key.0,
             liveness,
-            address.map(|_| *peer.public_key.0),
+            *peer.public_key.0,
             peer.pre_shared_key.as_ref().map(|key| *key.0),
-        )?;
+        );
+        if address.is_some() {
+            tunnel.initiate()?;
+        }
         peers.insert(
             peer.id,
             PeerTunnel {
@@ -141,7 +143,7 @@ async fn run_udp(
                 let Some((id, packet)) = request else { return Ok(()) };
                 if let Some(peer) = peers.get_mut(&id) {
                     peer.tunnel.push_packet(&packet);
-                    if let Err(err) = advance(peer, id, config, state) {
+                    if let Err(err) = advance(peer, id, state) {
                         trace!(%id, %err, "Failed to process UDP tunnel");
                     }
                     flush(socket, peer, id, state, config).await?;
@@ -149,7 +151,7 @@ async fn run_udp(
             }
             _ = timer.tick() => {
                 for (&id, peer) in peers.iter_mut() {
-                    if let Err(err) = advance(peer, id, config, state) {
+                    if let Err(err) = advance(peer, id, state) {
                         trace!(%id, %err, "Failed to maintain UDP tunnel");
                     }
                     flush(socket, peer, id, state, config).await?;
@@ -164,14 +166,17 @@ async fn run_udp(
                     Some(Ok((packet, consumed))) if consumed == len => packet,
                     _ => { trace!(%address, "Discarding malformed UDP datagram"); continue; }
                 };
+                let mut decoded_initiation = None;
                 let id = match &packet {
                     Packet::Initiating(initiation) => {
-                        // Identify the configured peer before selecting its tunnel.
-                        // Acceptance, replay checks and key establishment stay in Tunnel.
-                        let Ok((key, _)) = crypto::pre_reply(&config.interface.private_key.0, initiation) else {
-                            continue;
-                        };
-                        config.peers.iter().find(|peer| *peer.public_key.0 == key).map(|peer| peer.id)
+                        let Ok(decoded) = DecodedInitiation::decode(
+                            &config.interface.private_key.0, initiation.clone(),
+                        ) else { continue };
+                        let id = config.peers.iter()
+                            .find(|peer| *peer.public_key.0 == decoded.public_key)
+                            .map(|peer| peer.id);
+                        decoded_initiation = Some(decoded);
+                        id
                     }
                     Packet::Reply(reply) => peers.iter().find(|(_, peer)| {
                         peer.tunnel.local_index() == Some(reply.receiver_idx)
@@ -184,8 +189,11 @@ async fn run_udp(
                 let Some(peer) = peers.get_mut(&id) else { continue };
                 let before = peer.tunnel.established_at();
                 let is_data = matches!(packet, Packet::Data(_));
-                match peer.tunnel.process_incoming_packet(packet)
-                    .and_then(|()| advance(peer, id, config, state))
+                let result = match decoded_initiation {
+                    Some(decoded) => peer.tunnel.process_initiation(decoded),
+                    None => peer.tunnel.process_incoming_packet(packet),
+                };
+                match result.and_then(|()| advance(peer, id, state))
                 {
                     Ok(()) => {
                         // Learn/migrate routes only after accepted handshakes or
@@ -202,22 +210,8 @@ async fn run_udp(
     }
 }
 
-fn advance(peer: &mut PeerTunnel, id: Uuid, config: &Config, state: &State) -> Result<()> {
-    if let Some(pending) = peer.tunnel.process_new_packets()? {
-        let configured = config.peers.iter().find(|p| p.id == id).unwrap();
-        if pending.public_key == *configured.public_key.0 {
-            peer.tunnel.approve_pending(
-                configured.pre_shared_key.as_ref().map(|key| *key.0),
-                configured
-                    .liveness
-                    .unpack_with_fallback(&config.interface.liveness),
-            )?;
-            // Emit the reply before any queued data.
-            peer.tunnel.process_new_packets()?;
-        } else {
-            peer.tunnel.reject_pending();
-        }
-    }
+fn advance(peer: &mut PeerTunnel, id: Uuid, state: &State) -> Result<()> {
+    peer.tunnel.process_new_packets()?;
     let established = peer.tunnel.established_at();
     if established.is_some() && established != peer.established {
         state.record_established(id);
