@@ -366,50 +366,6 @@ fn test_encode_round_trip() {
 }
 
 #[test]
-fn layout_legacy_names_and_internal_aliases_are_compatible() {
-    let legacy = "m=1548&oty=1&oip=0&oieph=80&oiepk=29&oiets=2&oisidx=114&orp=0&oreph=4&orsidx=44&orridx=38&odridx=20&odctr=9&oddl=3&odp=0&odf=25&odd=30";
-    let layout: PacketLayout = legacy.parse().unwrap();
-    assert_eq!(
-        (
-            layout.mask,
-            layout.oisi,
-            layout.orsi,
-            layout.orri,
-            layout.odri,
-            layout.odct
-        ),
-        (1548, 114, 44, 38, 20, 9)
-    );
-    let serialized = layout.to_string();
-    for external in ["m", "oisidx", "orsidx", "orridx", "odridx", "odctr"] {
-        assert!(
-            serialized
-                .split('&')
-                .any(|pair| pair.starts_with(&format!("{external}=")))
-        );
-    }
-    let aliases = legacy
-        .replace("m=", "mask=")
-        .replace("oisidx=", "oisi=")
-        .replace("orsidx=", "orsi=")
-        .replace("orridx=", "orri=")
-        .replace("odridx=", "odri=")
-        .replace("odctr=", "odct=");
-    assert_eq!(
-        aliases.parse::<PacketLayout>().unwrap().to_string(),
-        serialized
-    );
-    assert_eq!(
-        serialized.parse::<PacketLayout>().unwrap().to_string(),
-        serialized
-    );
-    assert_eq!(
-        "m=4294967295".parse::<PacketLayout>().unwrap().mask,
-        u32::MAX
-    );
-}
-
-#[test]
 fn layout_parser_rejects_unknown_overlapping_and_out_of_range_fields() {
     for invalid in [
         "typo=7",

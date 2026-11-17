@@ -57,18 +57,13 @@ mkconfig! {
     oieph: u8, // (initiating) offset of ephemeral key
     oiepk: u8, // (initiating) offset of encrypted public key
     oiets: u8, // (initiating) offset of encrypted timestamp
-    #[serde(rename = "oisidx", alias = "oisi")]
     oisi: u8,  // (initiating) offset of sender index
     oip: u16,   // (initiating) pad to this len
     oreph: u8, // (replying) offset of ephemeral key
-    #[serde(rename = "orsidx", alias = "orsi")]
     orsi: u8,  // (replying) offset of sender index
-    #[serde(rename = "orridx", alias = "orri")]
     orri: u8,  // (replying) offset of receiver index
     orp: u16,   // (replying) pad to this len
-    #[serde(rename = "odridx", alias = "odri")]
     odri: u8,  // (data) offset of receiver index
-    #[serde(rename = "odctr", alias = "odct")]
     odct: u8,  // (data) offset of counter
     odf: u8,   // (data) offset of flags
     oddl: u8,  // (data) offset of data length
@@ -126,18 +121,18 @@ impl PacketLayout {
         let ([odri, odct, odf, oddl], data_end) = offsets(oty, [4, 8, 1, 4]);
         Self {
             mask: fastrand::u32(..),
-            oty: oty.try_into().expect("generated offset fits field type"),
-            oieph: oieph.try_into().expect("generated offset fits field type"),
-            oiepk: oiepk.try_into().expect("generated offset fits field type"),
-            oiets: oiets.try_into().expect("generated offset fits field type"),
-            oisi: oisi.try_into().expect("generated offset fits field type"),
-            oreph: oreph.try_into().expect("generated offset fits field type"),
-            orsi: orsi.try_into().expect("generated offset fits field type"),
-            orri: orri.try_into().expect("generated offset fits field type"),
-            odri: odri.try_into().expect("generated offset fits field type"),
-            odct: odct.try_into().expect("generated offset fits field type"),
-            odf: odf.try_into().expect("generated offset fits field type"),
-            oddl: oddl.try_into().expect("generated offset fits field type"),
+            oty: oty as _,
+            oieph: oieph as _,
+            oiepk: oiepk as _,
+            oiets: oiets as _,
+            oisi: oisi as _,
+            oreph: oreph as _,
+            orsi: orsi as _,
+            orri: orri as _,
+            odri: odri as _,
+            odct: odct as _,
+            odf: odf as _,
+            oddl: oddl as _,
             odd: (data_end + fastrand::usize(0..=MAX_PADDING))
                 .try_into()
                 .expect("generated offset fits field type"),
@@ -153,12 +148,12 @@ impl PacketLayout {
         let ranges = [
             r("oieph", usize::from(self.oieph), 32),
             r("oiepk", usize::from(self.oiepk), 48),
-            r("oisidx", usize::from(self.oisi), 4),
+            r("oisi", usize::from(self.oisi), 4),
             r("oiets", usize::from(self.oiets), 24),
             r("oreph", usize::from(self.oreph), 32),
-            r("orsidx", usize::from(self.orsi), 4),
-            r("orridx", usize::from(self.orri), 4),
-            r("odridx", usize::from(self.odri), 4),
+            r("orsi", usize::from(self.orsi), 4),
+            r("orri", usize::from(self.orri), 4),
+            r("odri", usize::from(self.odri), 4),
             r("odctr", usize::from(self.odct), 8),
             r("oddl", usize::from(self.oddl), 4),
             r("odf", usize::from(self.odf), 1),
