@@ -7,7 +7,6 @@ use covert::transport::IcmpTransportPeerConfig;
 async fn raw_socket_suppresses_kernel_reply_and_cleans_up() {
     use tokio::time::timeout;
     let listener = IcmpListenerConfig {
-        id: 1339,
         mode: IcmpMode::EchoReply,
     };
     let config = config([1; 32], public_key(&[2; 32]), None, &listener);
@@ -16,6 +15,7 @@ async fn raw_socket_suppresses_kernel_reply_and_cleans_up() {
     let endpoint = create_icmp_endpoint(&state, &config, &listener)
         .await
         .unwrap();
+    let probe_filter = ReplyFilter::install(1339).unwrap();
     let raw = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4)).unwrap();
     raw.set_nonblocking(true).unwrap();
     let raw = unsafe {
@@ -25,10 +25,7 @@ async fn raw_socket_suppresses_kernel_reply_and_cleans_up() {
     };
     let payload = b"kernel probe";
     let header = etherparse::Icmpv4Header::with_checksum(
-        etherparse::Icmpv4Type::EchoRequest(etherparse::IcmpEchoHeader {
-            id: listener.id,
-            seq: 1,
-        }),
+        etherparse::Icmpv4Type::EchoRequest(etherparse::IcmpEchoHeader { id: 1339, seq: 1 }),
         payload,
     );
     let mut wire = header.to_bytes().to_vec();
@@ -56,6 +53,7 @@ async fn raw_socket_suppresses_kernel_reply_and_cleans_up() {
     );
     drop(rx);
     drop(endpoint);
+    drop(probe_filter);
     wait_for_firewall_cleanup().await;
 }
 
@@ -100,7 +98,10 @@ fn filters_echo_identifier_checksum_and_ipv4_options() {
             echo_payload(&bytes, 1340, IcmpMode::EchoReply).is_some(),
             !ty
         );
-        assert!(echo_payload(&bytes, 1340, IcmpMode::OnlyEcho).is_none());
+        assert_eq!(
+            echo_payload(&bytes, 1340, IcmpMode::OnlyEcho).is_some(),
+            !ty
+        );
         for end in 0..bytes.len() {
             assert!(echo_payload(&bytes[..end], 1339, IcmpMode::EchoReply).is_none());
         }
@@ -163,7 +164,7 @@ async fn request_reply_handshake_and_bidirectional_data() {
                     mtu: 1400,
                     private_key: sk,
                     listener: ListenerConfig::Icmp {
-                        icmp: IcmpListenerConfig { id: 5555, mode },
+                        icmp: IcmpListenerConfig { mode },
                     },
                 },
                 peers: vec![Peer {
@@ -192,7 +193,7 @@ async fn request_reply_handshake_and_bidirectional_data() {
         let (b_tx, mut b_rx) = tokio::sync::mpsc::channel(4);
         let a_state = Arc::new(State::new(a_tx));
         let b_state = Arc::new(State::new(b_tx));
-        let listener = IcmpListenerConfig { id: 5555, mode };
+        let listener = IcmpListenerConfig { mode };
         let mut a_endpoint = create_icmp_endpoint(&a_state, &a_config, &listener)
             .await
             .unwrap();
@@ -283,7 +284,6 @@ struct Node {
     rx: mpsc::Receiver<Vec<u8>>,
     peers: HashMap<Uuid, PeerTunnel<IcmpRoute>>,
     encoder: EchoEncoder,
-    listener: IcmpListenerConfig,
     source: Ipv4Addr,
 }
 
@@ -295,7 +295,7 @@ impl Node {
         remote: Option<Ipv4Addr>,
         mode: IcmpMode,
     ) -> Self {
-        let listener = IcmpListenerConfig { id: 5555, mode };
+        let listener = IcmpListenerConfig { mode };
         let config = config(sk, pk, remote, &listener);
         let (tx, rx) = mpsc::channel(16);
         let state = State::new(tx);
@@ -303,14 +303,14 @@ impl Node {
         let peer =
             PeerTunnel::new(&config, &config.peers[0], remote.map(IcmpRoute::request)).unwrap();
         let peers = HashMap::from([(id, peer)]);
-        let encoder = EchoEncoder::new(config.layout, &listener);
+        let mut encoder = EchoEncoder::new(config.layout, &listener);
+        encoder.id = u16::from(source.octets()[3]) + 5554;
         Self {
             config,
             state,
             rx,
             peers,
             encoder,
-            listener,
             source,
         }
     }
@@ -356,7 +356,7 @@ impl Node {
             &mut self.peers,
             &self.state,
             wire,
-            &self.listener,
+            &self.encoder,
             None,
         )?;
         if let Some(id) = id {
@@ -449,11 +449,7 @@ async fn invalid_data_does_not_change_session_route_or_reply_metadata() {
         wrong_id[24] ^= 1;
         *wrong_id.last_mut().unwrap() ^= 1;
         recalculate_checksum(&mut wrong_id);
-        if mode == IcmpMode::EchoReply {
-            assert!(b.receive(&wrong_id).await.is_err()); // New IDs still require valid AEAD.
-        } else {
-            assert!(b.receive(&wrong_id).await.unwrap().is_none());
-        }
+        assert!(b.receive(&wrong_id).await.is_err()); // New IDs still require valid AEAD.
         let mut trailing = valid.clone();
         trailing.push(0);
         let len = trailing.len() as u16;
@@ -622,7 +618,6 @@ fn nat_reply_filter_migrates_and_keeps_shared_pairs() {
     let b = Uuid::new_v4();
     let address = Ipv4Addr::new(192, 0, 2, 1);
     let listener = IcmpListenerConfig {
-        id: 43396,
         mode: IcmpMode::EchoReply,
     };
     let cfg = config([1; 32], public_key(&[2; 32]), None, &listener);

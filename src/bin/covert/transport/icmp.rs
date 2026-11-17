@@ -92,7 +92,7 @@ impl EchoEncoder {
     fn new(layout: PacketLayout, listener: &IcmpListenerConfig) -> Self {
         Self {
             layout,
-            id: listener.id,
+            id: fastrand::u16(1..=u16::MAX),
             mode: listener.mode,
             sequence: 0,
             buffer: BytesMut::new(),
@@ -126,22 +126,22 @@ pub async fn create_icmp_endpoint(
         peers.insert(peer.id, PeerTunnel::new(config, peer, address)?);
     }
     let icmp = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?;
-    icmp.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, listener.id).into())?;
+    icmp.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into())?;
     icmp.set_mark(SOCKET_MARK)?;
     icmp.set_nonblocking(true)?;
     // The AsyncFd owns the descriptor until the worker exits.
     let socket = unsafe { AsyncFd::register(icmp).map_err(|err| err.into_parts().1)? };
-    let firewall = ReplyFilter::install(listener.id)?;
+    let encoder = EchoEncoder::new(config.layout, listener);
+    let firewall = ReplyFilter::install(encoder.id)?;
     let (sender, receiver) = mpsc::channel(512);
     let state = state.clone();
     let config = config.clone();
-    let listener = listener.clone();
     tokio::spawn(async move {
         for id in peers.keys() {
             state.connected.insert(*id, false);
         }
         if let Err(err) = run_icmp(
-            &socket, &state, &config, &listener, &firewall, &mut peers, receiver,
+            &socket, &state, &config, encoder, &firewall, &mut peers, receiver,
         )
         .await
         {
@@ -158,13 +158,12 @@ async fn run_icmp(
     socket: &AsyncFd<Socket>,
     state: &State,
     config: &Config,
-    listener: &IcmpListenerConfig,
+    mut encoder: EchoEncoder,
     firewall: &ReplyFilter,
     peers: &mut HashMap<Uuid, PeerTunnel<IcmpRoute>>,
     mut receiver: mpsc::Receiver<(Uuid, Vec<u8>)>,
 ) -> Result<()> {
     let mut buffer = vec![MaybeUninit::<u8>::uninit(); 65535];
-    let mut encoder = EchoEncoder::new(config.layout, listener);
     let mut timer = interval(Duration::from_millis(100));
     timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
@@ -192,7 +191,7 @@ async fn run_icmp(
                 let len = incoming?;
                 // recv initialized exactly the returned number of bytes.
                 let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), len) };
-                match process_echo(config, peers, state, bytes, listener, Some(firewall)) {
+                match process_echo(config, peers, state, bytes, &encoder, Some(firewall)) {
                     Ok(Some(id)) => {
                         let peer = peers.get_mut(&id).unwrap();
                         flush(socket, peer, id, state, &mut encoder).await?;
@@ -210,10 +209,10 @@ fn process_echo(
     peers: &mut HashMap<Uuid, PeerTunnel<IcmpRoute>>,
     state: &State,
     bytes: &[u8],
-    listener: &IcmpListenerConfig,
+    encoder: &EchoEncoder,
     firewall: Option<&ReplyFilter>,
 ) -> Result<Option<Uuid>> {
-    let Some((address, payload)) = echo_payload(bytes, listener.id, listener.mode) else {
+    let Some((address, payload)) = echo_payload(bytes, encoder.id, encoder.mode) else {
         return Ok(None);
     };
     let packet = match codec::parse_slice(payload, &config.layout) {
@@ -224,7 +223,7 @@ fn process_echo(
     let is_request = bytes[offset] == 8;
     let echo_id = u16::from_be_bytes([bytes[offset + 4], bytes[offset + 5]]);
     let sequence = u16::from_be_bytes([bytes[offset + 6], bytes[offset + 7]]);
-    if listener.mode == IcmpMode::EchoReply
+    if encoder.mode == IcmpMode::EchoReply
         && matches!(
             (&packet, is_request),
             (Packet::Initiating(_), false) | (Packet::Reply(_), true)
@@ -240,7 +239,7 @@ fn process_echo(
     if is_data
         && !peer.address.as_ref().is_some_and(|route| {
             route.address == address
-                && (listener.mode == IcmpMode::OnlyEcho || route.reply.is_some() == is_request)
+                && (encoder.mode == IcmpMode::OnlyEcho || route.reply.is_some() == is_request)
         })
     {
         return Ok(None);
@@ -252,7 +251,7 @@ fn process_echo(
     }
     peer.advance(id, state)?;
     if peer.tunnel.is_live() && (is_data || peer.tunnel.established_at() != before) {
-        let route = if listener.mode == IcmpMode::EchoReply && is_request {
+        let route = if is_request {
             IcmpRoute::response(address, echo_id, sequence)
         } else {
             IcmpRoute::request(address)
@@ -420,7 +419,7 @@ fn echo_payload(bytes: &[u8], id: u16, mode: IcmpMode) -> Option<(Ipv4Addr, &[u8
         // Echo-request IDs belong to the sender and can be rewritten by NAT.
         // Peer selection/authentication happens before learning the reply route.
         || (u16::from_be_bytes([icmp[4], icmp[5]]) != id
-            && !(mode == IcmpMode::EchoReply && icmp[0] == 8))
+            && icmp[0] != 8)
     {
         return None;
     }

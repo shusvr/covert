@@ -11,14 +11,8 @@ pub enum IcmpMode {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct IcmpListenerConfig {
-    #[serde(default = "default_icmp_id")]
-    pub id: u16,
     #[serde(default)]
     pub mode: IcmpMode,
-}
-
-fn default_icmp_id() -> u16 {
-    1339
 }
 
 #[derive(Debug, Clone, Deserialize)]

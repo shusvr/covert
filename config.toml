@@ -96,11 +96,10 @@ Port = 40676
 
 # ICMP alternative: replace the UDP listener table above with these two lines.
 # Requires raw-socket/firewall privileges and nft; listens for IPv4 ICMP.
-# Id is optional and defaults to 1339 for locally originated requests.
+# Locally originated requests use an automatically generated identifier.
 # EchoReply responders learn NAT-rewritten request IDs after authenticating
-# the peer and echo that observed ID in replies. OnlyEcho requires matching IDs.
+# the peer and echo that observed ID in replies.
 # [Interface.Listener.Icmp.icmp]
-# Id = 1339
 # Mode = "EchoReply"  # Default: initiator requests, responder replies.
 # Alternative: "OnlyEcho" sends requests both ways.
 # Both ends must select the same mode.
