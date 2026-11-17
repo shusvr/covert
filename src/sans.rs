@@ -314,8 +314,11 @@ impl Tunnel {
         };
     }
 
-    pub fn process_new_packets(&mut self) -> Result<()> {
-        self.process_received()?;
+    pub fn process_new_packets(&mut self, flush_on_err: bool) -> Result<()> {
+        let result = self.process_received();
+        if result.is_err() && flush_on_err {
+            self.received.clear();
+        }
 
         match &mut self.state {
             State::Idle => {}

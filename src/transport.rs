@@ -50,7 +50,11 @@ impl<A: Adapter> Endpoint<A> {
             if p.allowed_ips.iter().any(|n| n.contains(&dst)) {
                 let pt = self.peers.get_mut(&p.id).unwrap();
                 pt.transmit(&mut self.state, packet);
-                pt.advance(&mut self.state);
+
+                if let Err(err) = pt.advance(&mut self.state) {
+                    error!("Failed to advance peer tunnel: {err}");
+                    continue;
+                }
 
                 while let Some((route, packet)) =
                     pt.address.as_ref().zip(pt.tunnel.read_outbound_packet())
@@ -91,7 +95,11 @@ impl<A: Adapter> Endpoint<A> {
 
     pub fn advance(&mut self) {
         for pt in self.peers.values_mut() {
-            pt.advance(&mut self.state);
+            if let Err(err) = pt.advance(&mut self.state) {
+                error!("Failed to advance peer tunnel: {err}");
+                continue;
+            }
+
             while let Some((route, packet)) =
                 pt.address.as_ref().zip(pt.tunnel.read_outbound_packet())
             {
@@ -104,7 +112,7 @@ impl<A: Adapter> Endpoint<A> {
         if let Some((peer_id, inv)) = self.identify(&packet)? {
             let pt = self.peers.get_mut(&peer_id).unwrap();
             if let Some(decoded) = inv {
-                pt.tunnel.accept_initiation(decoded);
+                pt.tunnel.accept_initiation(decoded)?;
             } else {
                 pt.tunnel.process_incoming_packet(packet)?;
             }
@@ -180,7 +188,7 @@ impl<R> PeerTunnel<R> {
     }
 
     fn advance(&mut self, state: &mut State) -> Result<()> {
-        self.tunnel.process_new_packets()?;
+        self.tunnel.process_new_packets(true)?;
         let established = self.tunnel.established_at();
         if established.is_some() && established != self.established {
             state.record_established(self.peer_id);

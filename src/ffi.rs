@@ -456,15 +456,15 @@ pub unsafe extern "C" fn covert_tunnel_new(
     })
 }
 macro_rules! tunnel_action {
-    ($name:ident, $method:ident) => {
+    ($name:ident, $method:ident $(, ($($aname:ident: $aty:ty),* $(,)?))?) => {
         #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn $name(t: *mut Tunnel) -> i32 {
-            guard(|| unsafe { get_mut(t)? }.$method().map_err(|_| FAILED))
+        pub unsafe extern "C" fn $name(t: *mut Tunnel $(, $($aname: $aty)*)?) -> i32 {
+            guard(|| unsafe { get_mut(t)? }.$method($($($aname),*)?).map_err(|_| FAILED))
         }
     };
 }
 tunnel_action!(covert_tunnel_initiate, initiate);
-tunnel_action!(covert_tunnel_process, process_new_packets);
+tunnel_action!(covert_tunnel_process, process_new_packets, (flush_on_err: bool));
 macro_rules! tunnel_write {
     ($name:ident, $method:ident) => {
         #[unsafe(no_mangle)]
