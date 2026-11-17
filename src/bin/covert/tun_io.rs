@@ -1,5 +1,5 @@
 //! Keep Linux virtio/offload framing local to the TUN; transports carry plain IP.
-use std::io;
+use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 use tun::AsyncDevice;
 
@@ -30,12 +30,13 @@ impl Reader {
         }
     }
 
-    pub async fn recv(&mut self, device: &AsyncDevice) -> io::Result<usize> {
+    pub async fn recv(&mut self, device: &AsyncDevice) -> Result<usize> {
         #[cfg(target_os = "linux")]
         {
             device
                 .recv_multiple(&mut self.original, &mut self.packets, &mut self.sizes, 0)
                 .await
+                .context("Failed to read TUN packets")
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -63,7 +64,7 @@ impl Writer {
         device: &AsyncDevice,
         packet: Vec<u8>,
         receiver: &mut mpsc::Receiver<Vec<u8>>,
-    ) -> Result<(), crate::error::Error> {
+    ) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
             self.packets.clear();
@@ -87,10 +88,10 @@ impl Writer {
             let _ = receiver;
             let written = device.send(&packet).await?;
             if written != packet.len() {
-                return Err(crate::error::Error::IncompleteTunWrite {
-                    written,
-                    expected: packet.len(),
-                });
+                anyhow::bail!(
+                    "Incomplete TUN write: wrote {written} of {} bytes",
+                    packet.len()
+                );
             }
         }
         Ok(())

@@ -270,12 +270,14 @@ async fn closing_tun_stops_udp_worker_and_plaintext_sender() {
     timeout(Duration::from_secs(3), endpoint.sender.closed())
         .await
         .unwrap();
-    assert!(matches!(
+    assert_eq!(
         endpoint
             .trasmit(&state, &config, config.peers[0].id, b"closed")
-            .await,
-        Err(crate::error::Error::EndpointStopped { transport: "UDP" })
-    ));
+            .await
+            .unwrap_err()
+            .to_string(),
+        "UDP endpoint stopped",
+    );
     assert_eq!(state.status(&config).peers[0].status, "disconnected");
 }
 

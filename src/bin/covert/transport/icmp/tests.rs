@@ -519,22 +519,24 @@ async fn simultaneous_icmp_initiations_converge_in_both_modes() {
 }
 
 #[tokio::test]
-async fn closed_channels_return_concrete_errors() {
+async fn closed_channels_report_context() {
     let (mut a, mut b) = connected_pair(IcmpMode::EchoReply).await;
     let (sender, receiver) = mpsc::channel(1);
     drop(receiver);
     let mut endpoint = IcmpEndpoint { sender };
-    assert!(matches!(
+    assert_eq!(
         endpoint
             .trasmit(&b.state, &b.config, b.id(), b"closed")
-            .await,
-        Err(crate::error::Error::EndpointStopped { transport: "ICMP" })
-    ));
+            .await
+            .unwrap_err()
+            .to_string(),
+        "ICMP endpoint stopped",
+    );
     b.rx.close();
     a.peer().tunnel.push_packet(b"closed TUN");
     a.advance();
-    assert!(matches!(
-        b.receive(&a.outgoing()).await,
-        Err(crate::error::Error::TunReceiverClosed)
-    ));
+    assert_eq!(
+        b.receive(&a.outgoing()).await.unwrap_err().to_string(),
+        "TUN receiver closed"
+    );
 }

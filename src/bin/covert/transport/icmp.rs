@@ -1,9 +1,9 @@
 use crate::{
     codec::{self, Packet, PacketLayout},
     config::{Config, PeerTransport},
-    error::Result,
     transport::{PeerTunnel, State, TransportEndpoint, identify, plaintext_len},
 };
+use anyhow::{Context, Result};
 use bytes::BytesMut;
 use serde::Deserialize;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -96,7 +96,7 @@ impl TransportEndpoint for IcmpEndpoint {
         self.sender
             .send((peer_id, packet.to_vec()))
             .await
-            .map_err(|_| crate::error::Error::EndpointStopped { transport: "ICMP" })?;
+            .context("ICMP endpoint stopped")?;
         Ok(())
     }
 }
@@ -326,10 +326,11 @@ impl ReplyFilter {
         child.stdin.take().unwrap().write_all(rules.as_bytes())?;
         let output = child.wait_with_output()?;
         if !output.status.success() {
-            return Err(crate::error::Error::IcmpFirewallSetup {
-                status: output.status,
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            });
+            anyhow::bail!(
+                "Failed to install ICMP firewall rule ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr),
+            );
         }
         Ok(Self(table))
     }

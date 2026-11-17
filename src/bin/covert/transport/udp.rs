@@ -1,9 +1,9 @@
 use crate::{
     codec::{self, Packet},
     config::{Config, PeerTransport},
-    error::Result,
     transport::{PeerTunnel, State, TransportEndpoint, identify, plaintext_len},
 };
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
@@ -61,7 +61,7 @@ impl TransportEndpoint for UdpEndpoint {
         self.sender
             .send((peer_id, packet.to_vec()))
             .await
-            .map_err(|_| crate::error::Error::EndpointStopped { transport: "UDP" })?;
+            .context("UDP endpoint stopped")?;
         Ok(())
     }
 }
@@ -156,7 +156,7 @@ async fn run_udp(
                     Some(decoded) => peer.tunnel.process_initiation(decoded),
                     None => peer.tunnel.process_incoming_packet(packet),
                 };
-                match result.map_err(crate::error::Error::from).and_then(|()| peer.advance(id, state))
+                match result.map_err(anyhow::Error::from).and_then(|()| peer.advance(id, state))
                 {
                     Ok(()) => {
                         // Learn/migrate routes only after accepted handshakes or

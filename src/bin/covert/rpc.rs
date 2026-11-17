@@ -1,7 +1,8 @@
 //! Read-only Unix-socket status stream. Each line is one complete JSON snapshot.
 use crate::{config::Config, transport::State};
+use anyhow::{Context, Result};
 use std::{
-    fs, io,
+    fs,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
@@ -13,18 +14,6 @@ use tokio::{
     task::JoinSet,
     time::{MissedTickBehavior, interval, timeout},
 };
-
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("runtime directory is unavailable; specify --rpc PATH")]
-    RuntimeDirectoryUnavailable,
-    #[error("RPC I/O: {0}")]
-    Io(#[from] io::Error),
-    #[error("Failed to serialize RPC status: {0}")]
-    Serialize(#[from] serde_json::Error),
-    #[error("RPC client is not reading")]
-    ClientTimeout(#[from] tokio::time::error::Elapsed),
-}
 
 pub struct Server {
     listener: UnixListener,
@@ -51,13 +40,14 @@ impl Drop for SocketPath {
     }
 }
 
-pub fn default_path(device: &str) -> Result<PathBuf, Error> {
-    let directory = dirs::runtime_dir().ok_or(Error::RuntimeDirectoryUnavailable)?;
+pub fn default_path(device: &str) -> Result<PathBuf> {
+    let directory =
+        dirs::runtime_dir().context("runtime directory is unavailable; specify --rpc PATH")?;
     Ok(directory.join(format!("covert.{device}.sock")))
 }
 
 impl Server {
-    pub fn bind(path: &Path) -> io::Result<Self> {
+    pub fn bind(path: &Path) -> Result<Self> {
         // No mkdir, stale-socket removal, or fallback directory: bind must fail
         // for an existing path or an unusable parent directory.
         let listener = UnixListener::bind(path)?;
@@ -74,7 +64,7 @@ impl Server {
         })
     }
 
-    pub async fn serve(&self, state: Arc<State>, config: Arc<Config>) -> io::Result<()> {
+    pub async fn serve(&self, state: Arc<State>, config: Arc<Config>) -> Result<()> {
         let mut clients = JoinSet::new();
         loop {
             tokio::select! {
@@ -99,14 +89,18 @@ async fn stream_status(
     mut stream: UnixStream,
     state: Arc<State>,
     config: Arc<Config>,
-) -> Result<(), Error> {
+) -> Result<()> {
     let mut ticks = interval(Duration::from_secs(1));
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         ticks.tick().await;
-        let mut line = serde_json::to_vec(&state.status(&config))?;
+        let mut line =
+            serde_json::to_vec(&state.status(&config)).context("Failed to serialize RPC status")?;
         line.push(b'\n');
-        timeout(Duration::from_secs(5), stream.write_all(&line)).await??;
+        timeout(Duration::from_secs(5), stream.write_all(&line))
+            .await
+            .context("RPC client is not reading")?
+            .context("Failed to write RPC status")?;
     }
 }
 
@@ -201,10 +195,12 @@ mod tests {
     fn default_socket_uses_runtime_directory_directly() {
         match dirs::runtime_dir() {
             Some(dir) => assert_eq!(default_path("co1").unwrap(), dir.join("covert.co1.sock")),
-            None => assert!(matches!(
-                default_path("co1"),
-                Err(Error::RuntimeDirectoryUnavailable)
-            )),
+            None => assert!(
+                default_path("co1")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("runtime directory is unavailable")
+            ),
         }
     }
 }

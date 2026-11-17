@@ -21,7 +21,6 @@ use tokio::sync::mpsc;
 use tracing::{Level, error, info, trace, warn};
 
 mod config;
-mod error;
 mod rpc;
 mod transport;
 mod tun_io;
@@ -416,7 +415,7 @@ mod tests {
                 _config: &Config,
                 peer_id: uuid::Uuid,
                 packet: &[u8],
-            ) -> std::result::Result<(), error::Error> {
+            ) -> Result<()> {
                 self.0.push((peer_id, packet.to_vec()));
                 Ok(())
             }

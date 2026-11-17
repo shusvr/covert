@@ -1,9 +1,9 @@
 use crate::{
     codec::{DataFlags, Packet},
     config::{Config, Peer},
-    error::Result,
     sans::{DecodedInitiation, Tunnel},
 };
+use anyhow::{Context, Result};
 use dashmap::DashMap;
 use serde::Serialize;
 use std::{
@@ -196,7 +196,7 @@ impl<R> PeerTunnel<R> {
                 .tun_in_tx
                 .send(packet)
                 .await
-                .map_err(|_| crate::error::Error::TunReceiverClosed)?;
+                .context("TUN receiver closed")?;
         }
         Ok(())
     }
