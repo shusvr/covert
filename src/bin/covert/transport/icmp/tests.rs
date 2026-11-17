@@ -233,13 +233,13 @@ async fn request_reply_handshake_and_bidirectional_data() {
     }
 }
 
-fn public_key(sk: &crate::Key) -> crate::Key {
+fn public_key(sk: &covert::crypto::Key) -> covert::crypto::Key {
     crate::crypto::pk_to_bytes(&crate::crypto::to_sk(sk).compute_public_key().unwrap())
 }
 
 fn config(
-    sk: crate::Key,
-    pk: crate::Key,
+    sk: covert::crypto::Key,
+    pk: covert::crypto::Key,
     endpoint: Option<Ipv4Addr>,
     listener: &IcmpListenerConfig,
 ) -> Arc<Config> {
@@ -284,8 +284,8 @@ struct Node {
 
 impl Node {
     fn new(
-        sk: crate::Key,
-        pk: crate::Key,
+        sk: covert::crypto::Key,
+        pk: covert::crypto::Key,
         source: Ipv4Addr,
         remote: Option<Ipv4Addr>,
         mode: IcmpMode,
@@ -528,13 +528,13 @@ async fn closed_channels_return_concrete_errors() {
         endpoint
             .trasmit(&b.state, &b.config, b.id(), b"closed")
             .await,
-        Err(crate::Error::EndpointStopped { transport: "ICMP" })
+        Err(crate::error::Error::EndpointStopped { transport: "ICMP" })
     ));
     b.rx.close();
     a.peer().tunnel.push_packet(b"closed TUN");
     a.advance();
     assert!(matches!(
         b.receive(&a.outgoing()).await,
-        Err(crate::Error::TunReceiverClosed)
+        Err(crate::error::Error::TunReceiverClosed)
     ));
 }

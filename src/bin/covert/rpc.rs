@@ -1,5 +1,5 @@
 //! Read-only Unix-socket status stream. Each line is one complete JSON snapshot.
-use covert::{config::Config, transport::State};
+use crate::{config::Config, transport::State};
 use std::{
     fs, io,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
@@ -160,7 +160,7 @@ mod tests {
     async fn streams_immediate_and_periodic_json_to_multiple_clients() {
         let dir = Directory::new();
         let path = dir.0.join("status.sock");
-        let config: Config = toml::from_str(include_str!("../config.toml")).unwrap();
+        let config: Config = toml::from_str(include_str!("../../../config.toml")).unwrap();
         let config = Arc::new(config);
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
         let state = Arc::new(State::new(tx));

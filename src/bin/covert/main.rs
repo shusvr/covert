@@ -1,11 +1,14 @@
+use crate::{
+    config::{Config, ListenerConfig},
+    transport::{State, TransportEndpoint},
+};
 use anyhow::{Context, Result, bail};
 use base64::prelude::*;
 use clap::{Parser, Subcommand};
 use covert::{
-    codec::PacketLayout,
-    config::{Config, ListenerConfig},
-    crypto::{pk_to_bytes, random_sk, sk_to_bytes, to_sk},
-    transport::{State, TransportEndpoint},
+    codec::{self, PacketLayout},
+    crypto::{self, pk_to_bytes, random_sk, sk_to_bytes, to_sk},
+    sans,
 };
 use etherparse::IpSlice;
 use std::{
@@ -17,7 +20,10 @@ use std::{
 use tokio::sync::mpsc;
 use tracing::{Level, error, info, trace, warn};
 
+mod config;
+mod error;
 mod rpc;
+mod transport;
 mod tun_io;
 
 #[derive(Parser)]
@@ -116,7 +122,7 @@ async fn main() -> Result<()> {
                     .context("private key must be valid base64")?,
             );
             let key = zeroize::Zeroizing::new(
-                <covert::Key>::try_from(decoded.as_slice())
+                <crypto::Key>::try_from(decoded.as_slice())
                     .map_err(|_| anyhow::anyhow!("private key must be 32 bytes"))?,
             );
             let public_key = to_sk(&key)
@@ -322,13 +328,11 @@ async fn serve(
     let endpoint = async {
         match &config.interface.listener {
             ListenerConfig::Udp { udp } => {
-                let endpoint =
-                    covert::transport::udp::create_udp_endpoint(&state, &config, udp).await?;
+                let endpoint = transport::udp::create_udp_endpoint(&state, &config, udp).await?;
                 run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
             }
             ListenerConfig::Icmp { icmp } => {
-                let endpoint =
-                    covert::transport::icmp::create_icmp_endpoint(&state, &config, icmp).await?;
+                let endpoint = transport::icmp::create_icmp_endpoint(&state, &config, icmp).await?;
                 run_endpoint(tun, state, config.clone(), endpoint, tun_in_rx).await
             }
         }
@@ -412,12 +416,12 @@ mod tests {
                 _config: &Config,
                 peer_id: uuid::Uuid,
                 packet: &[u8],
-            ) -> std::result::Result<(), covert::Error> {
+            ) -> std::result::Result<(), error::Error> {
                 self.0.push((peer_id, packet.to_vec()));
                 Ok(())
             }
         }
-        let mut config: Config = toml::from_str(include_str!("../config.toml")).unwrap();
+        let mut config: Config = toml::from_str(include_str!("../../../config.toml")).unwrap();
         config.peers[0].allowed_ips = vec![
             "192.0.2.2/32".parse().unwrap(),
             "2001:db8::2/128".parse().unwrap(),
@@ -546,7 +550,7 @@ mod tests {
 
     #[test]
     fn hooks_accept_single_commands_arrays_and_defaults() {
-        let reference = include_str!("../config.toml");
+        let reference = include_str!("../../../config.toml");
         let default: Config = toml::from_str(reference).unwrap();
         assert!(default.interface.hooks.pre_up.is_empty());
         let configured = reference.replace(

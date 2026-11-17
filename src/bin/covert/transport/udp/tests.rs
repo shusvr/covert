@@ -6,11 +6,14 @@ use crate::{
 };
 use tokio::time::timeout;
 
-fn public_key(sk: &crate::Key) -> crate::Key {
+fn public_key(sk: &covert::crypto::Key) -> covert::crypto::Key {
     crypto::pk_to_bytes(&crypto::to_sk(sk).compute_public_key().unwrap())
 }
 
-fn config(sk: crate::Key, peers: &[(crate::Key, Option<SocketAddr>)]) -> Arc<Config> {
+fn config(
+    sk: covert::crypto::Key,
+    peers: &[(covert::crypto::Key, Option<SocketAddr>)],
+) -> Arc<Config> {
     Arc::new(Config {
         dev_name: String::new(),
         layout: PacketLayout::default(),
@@ -271,7 +274,7 @@ async fn closing_tun_stops_udp_worker_and_plaintext_sender() {
         endpoint
             .trasmit(&state, &config, config.peers[0].id, b"closed")
             .await,
-        Err(crate::Error::EndpointStopped { transport: "UDP" })
+        Err(crate::error::Error::EndpointStopped { transport: "UDP" })
     ));
     assert_eq!(state.status(&config).peers[0].status, "disconnected");
 }

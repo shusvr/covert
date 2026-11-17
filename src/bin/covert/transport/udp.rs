@@ -1,7 +1,7 @@
 use crate::{
-    Result,
     codec::{self, Packet},
     config::{Config, PeerTransport},
+    error::Result,
     transport::{PeerTunnel, State, TransportEndpoint, identify, plaintext_len},
 };
 use serde::Deserialize;
@@ -39,9 +39,11 @@ pub struct UdpTransportPeerConfig {
 /// Sends plaintext to the task owning the socket and all UDP tunnels.
 pub struct UdpEndpoint {
     sender: mpsc::Sender<(Uuid, Vec<u8>)>,
+    #[cfg(test)]
     local_addr: SocketAddr,
 }
 
+#[cfg(test)]
 impl UdpEndpoint {
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
@@ -59,7 +61,7 @@ impl TransportEndpoint for UdpEndpoint {
         self.sender
             .send((peer_id, packet.to_vec()))
             .await
-            .map_err(|_| crate::Error::EndpointStopped { transport: "UDP" })?;
+            .map_err(|_| crate::error::Error::EndpointStopped { transport: "UDP" })?;
         Ok(())
     }
 }
@@ -70,6 +72,7 @@ pub async fn create_udp_endpoint(
     listener: &UdpListenerConfig,
 ) -> Result<UdpEndpoint> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, listener.port)).await?;
+    #[cfg(test)]
     let local_addr = socket.local_addr()?;
     let mut peers = HashMap::new();
     for peer in &config.peers {
@@ -94,7 +97,11 @@ pub async fn create_udp_endpoint(
             state.connected.insert(*id, false);
         }
     });
-    Ok(UdpEndpoint { sender, local_addr })
+    Ok(UdpEndpoint {
+        sender,
+        #[cfg(test)]
+        local_addr,
+    })
 }
 
 async fn run_udp(
@@ -149,7 +156,7 @@ async fn run_udp(
                     Some(decoded) => peer.tunnel.process_initiation(decoded),
                     None => peer.tunnel.process_incoming_packet(packet),
                 };
-                match result.and_then(|()| peer.advance(id, state))
+                match result.map_err(crate::error::Error::from).and_then(|()| peer.advance(id, state))
                 {
                     Ok(()) => {
                         // Learn/migrate routes only after accepted handshakes or

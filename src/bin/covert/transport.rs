@@ -1,7 +1,7 @@
 use crate::{
-    Result,
     codec::{DataFlags, Packet},
     config::{Config, Peer},
+    error::Result,
     sans::{DecodedInitiation, Tunnel},
 };
 use dashmap::DashMap;
@@ -196,7 +196,7 @@ impl<R> PeerTunnel<R> {
                 .tun_in_tx
                 .send(packet)
                 .await
-                .map_err(|_| crate::Error::TunReceiverClosed)?;
+                .map_err(|_| crate::error::Error::TunReceiverClosed)?;
         }
         Ok(())
     }

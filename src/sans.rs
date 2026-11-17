@@ -6,11 +6,39 @@ use std::{
 use bytes::{Bytes, BytesMut};
 
 use crate::{
-    Key, Result,
     codec::{self, Data, DataFlags, Packet, PacketLayout},
-    config::Liveness,
-    crypto::{self, Cipher, Initiating},
+    crypto::{self, Cipher, Initiating, Key},
 };
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("Codec: {0}")]
+    Codec(#[from] codec::Error),
+    #[error("Crypto error")]
+    Crypto(#[from] aws_lc_rs::error::Unspecified),
+}
+
+pub type Result<T = ()> = std::result::Result<T, Error>;
+
+#[derive(Debug, Clone, Copy)]
+pub struct Liveness {
+    pub timeout: u64,
+    pub max_age: u64,
+    pub ka_delay: u32,
+    pub ka_jitter: u32,
+}
+
+impl Liveness {
+    pub fn has_expired(&self, since_established: Duration, since_last_seen: Duration) -> bool {
+        (since_established > Duration::from_secs(self.max_age) && self.max_age != 0)
+            || (since_last_seen > Duration::from_secs(self.timeout) && self.timeout != 0)
+    }
+
+    pub fn next_ka(&self) -> u64 {
+        ((self.ka_delay as f64 + (self.ka_jitter as f64 * (fastrand::f64() * 2.0 - 1.0))) * 1000.0)
+            .max(1000.0) as u64
+    }
+}
 
 enum State {
     Idle,

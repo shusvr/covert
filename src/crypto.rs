@@ -1,6 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{Key, SealedKey, SealedTimestamp};
 use aws_lc_rs::{
     aead::{self, Aad, LessSafeKey, Nonce},
     agreement::{
@@ -13,6 +12,10 @@ use aws_lc_rs::{
     hkdf::{self, HKDF_SHA256},
     rand::SystemRandom,
 };
+
+pub type Key = [u8; 32];
+pub type SealedKey = [u8; 48];
+pub type SealedTimestamp = [u8; 24];
 
 #[cfg(test)]
 mod tests;
@@ -40,10 +43,10 @@ pub fn sk_to_bytes(sk: &PrivateKey) -> Key {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Initiating {
-    pub(crate) enc_ts: SealedTimestamp,
-    pub(crate) sender_idx: u32,
-    pub(crate) enc_pub_key: SealedKey,
-    pub(crate) ephemeral: Key,
+    pub enc_ts: SealedTimestamp,
+    pub sender_idx: u32,
+    pub enc_pub_key: SealedKey,
+    pub ephemeral: Key,
 }
 
 // Hash canonical fields rather than layout bytes, masks or random padding.
@@ -153,10 +156,10 @@ pub fn pre_reply(local_sk: &Key, initiating: &Initiating) -> Result<(Key, u64), 
 
 #[derive(Debug, Clone, Copy)]
 pub struct Replying {
-    pub(crate) eph: Key,
-    pub(crate) sender_idx: u32,
-    pub(crate) receiver_idx: u32,
-    pub(crate) auth_tag: [u8; 16],
+    pub eph: Key,
+    pub sender_idx: u32,
+    pub receiver_idx: u32,
+    pub auth_tag: [u8; 16],
 }
 
 // The reply is bound to the entire original initiation, not just its index.

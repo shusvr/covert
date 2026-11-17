@@ -2,7 +2,6 @@ use crate::crypto::{Initiating, Replying};
 
 use bitflags::bitflags;
 use bytes::{Buf, Bytes, BytesMut};
-use futures::channel::mpsc;
 use std::{io, str::FromStr};
 use thiserror::Error;
 use tokio_util::codec::{Decoder, Encoder};
@@ -291,10 +290,10 @@ bitflags! {
 
 #[derive(Debug)]
 pub struct Data {
-    pub(crate) receiver_idx: u32,
-    pub(crate) flags: DataFlags,
-    pub(crate) counter: u64,
-    pub(crate) ciphertext: Vec<u8>,
+    pub receiver_idx: u32,
+    pub flags: DataFlags,
+    pub counter: u64,
+    pub ciphertext: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -324,8 +323,6 @@ pub enum Error {
     UnkownLayoutParam(String),
     #[error("Layout params `{0}` and `{1}` will cause overlap")]
     LayoutFieldsOverlap(String, String),
-    #[error("Channel was closed or full")]
-    ChannelError(#[from] mpsc::SendError),
     #[error("Io: {0}")]
     Io(#[from] io::Error),
 }
@@ -342,10 +339,7 @@ pub fn parse(buf: &mut BytesMut, layout: &PacketLayout) -> Option<Result<Packet,
 }
 
 /// Parses a borrowed packet without copying the encoded header or advancing a buffer.
-pub(crate) fn parse_slice(
-    buf: &[u8],
-    layout: &PacketLayout,
-) -> Option<Result<(Packet, usize), Error>> {
+pub fn parse_slice(buf: &[u8], layout: &PacketLayout) -> Option<Result<(Packet, usize), Error>> {
     if buf.len() < layout.oty + 1 {
         return None;
     }

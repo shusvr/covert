@@ -63,7 +63,7 @@ impl Writer {
         device: &AsyncDevice,
         packet: Vec<u8>,
         receiver: &mut mpsc::Receiver<Vec<u8>>,
-    ) -> Result<(), covert::Error> {
+    ) -> Result<(), crate::error::Error> {
         #[cfg(target_os = "linux")]
         {
             self.packets.clear();
@@ -87,7 +87,7 @@ impl Writer {
             let _ = receiver;
             let written = device.send(&packet).await?;
             if written != packet.len() {
-                return Err(covert::Error::IncompleteTunWrite {
+                return Err(crate::error::Error::IncompleteTunWrite {
                     written,
                     expected: packet.len(),
                 });
