@@ -213,11 +213,14 @@ pub struct Peer {
 }
 
 macro_rules! make_listen_peer_cfgs {
-    ($($var:ident, $lower:ident, $listen:ident, $peer:ident);* $(;)?) => {
+    ($($var:ident, $lower:ident, $str:literal, $listen:ident, $peer:ident);* $(;)?) => {
         #[derive(Debug, Clone, Serialize, Deserialize)]
-        #[serde(rename_all = "PascalCase")]
+        #[serde(untagged)]
         pub enum ListenerConfig {
-            $($var { $lower: $listen }),*
+            $($var {
+                #[serde(rename = $str)]
+                $lower: $listen
+            }),*
         }
 
         impl ListenerConfig {
@@ -229,9 +232,12 @@ macro_rules! make_listen_peer_cfgs {
         }
 
         #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-        #[serde(rename_all = "PascalCase")]
+        #[serde(untagged)]
         pub enum PeerTransport {
-            $($var { $lower: $peer }),*,
+            $($var {
+                #[serde(rename = $str)]
+                $lower: $peer
+            }),*,
             #[default]
             None,
         }
@@ -254,8 +260,8 @@ impl PeerTransport {
 }
 
 make_listen_peer_cfgs!(
-    Udp, udp, UdpListenerConfig, UdpTransportPeerConfig;
-    Icmp, icmp, IcmpListenerConfig, IcmpTransportPeerConfig;
+    Udp, udp, "Udp", UdpListenerConfig, UdpTransportPeerConfig;
+    Icmp, icmp, "Icmp", IcmpListenerConfig, IcmpTransportPeerConfig;
 );
 
 impl ListenerConfig {

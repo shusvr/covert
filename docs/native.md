@@ -132,5 +132,6 @@ Neither workflow uses an emulator.
 percent encoding. It returns a new owned handle (null on failure). Free it with
 `covert_config_free`. `covert_config_to_json(config, &buffer)` exports the same
 config as UTF-8 JSON; free the output with `covert_buffer_free`. Both query and
-JSON contain private key material. Android uses this path for configuration links
-and asks for confirmation before saving the resulting profile.
+JSON contain private key material. Android imports configuration links as owned
+Config handles and reads their fields through getters, without a JSON conversion.
+It asks for confirmation before saving the resulting profile.

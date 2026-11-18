@@ -533,6 +533,27 @@ mod query_tests {
     }
 
     #[test]
+    fn flat_transport_query_parses_port_endpoint_and_keys() {
+        let query = concat!(
+            "Interface[Addresses][0]=10.111.111.3/32&Interface[Mtu]=1450&",
+            "Interface[PrivateKey]=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE%3D&",
+            "Interface[Listener][Udp][Port]=5551&",
+            "Peer[0][PublicKey]=AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI%3D&",
+            "Peer[0][AllowedIPs][0]=0.0.0.0/0&",
+            "Peer[0][Transport][Udp][Endpoint]=141.98.253.234:5551"
+        );
+        let config = ConfigHandle::from_query(query).unwrap();
+        assert!(
+            matches!(config.interface.listener, ListenerConfig::Udp { ref udp } if udp.port == 5551)
+        );
+        assert!(
+            matches!(config.peers[0].transport, PeerTransport::Udp { ref udp } if udp.endpoint.unwrap().port() == 5551)
+        );
+        assert_eq!(config.interface.addresses[0].to_string(), "10.111.111.3/32");
+        assert!(ConfigHandle::from_query(&query.replace("Port]=5551", "Port]=65536")).is_err());
+    }
+
+    #[test]
     fn bad_queries_clear_output_without_allocating_a_handle() {
         unsafe {
             for text in [b"a=b".as_slice(), b"", &[0xff]] {

@@ -281,7 +281,7 @@ fn add_peer(
     }
     result?;
     if output.is_none() {
-        println!("{}", exported.as_str());
+        println!("covert:/?{}", exported.as_str());
     }
     Ok(())
 }
