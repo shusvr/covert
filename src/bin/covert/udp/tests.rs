@@ -165,3 +165,203 @@ async fn closing_tun_receiver_stops_socket_worker() {
         .unwrap();
     assert!(node.sender.send(packet(2, 1, 1)).await.is_err());
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn recvmmsg_reads_multiple_sources_in_one_batch_and_reuses_storage() {
+    use crate::{
+        network::Socket as _,
+        network::{MAX_DATAGRAM, ReceiveBatch},
+    };
+    let cfg = harness::config(2, &[(1, None)]);
+    let (socket, _) = Udp::bind(&cfg, &UdpListenerConfig { port: 0 })
+        .await
+        .unwrap();
+    let address = SocketAddr::from((
+        Ipv4Addr::LOCALHOST,
+        socket.socket.local_addr().unwrap().port(),
+    ));
+    let a = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let b = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    for i in 0..batch::BATCH_SIZE {
+        let source = if i % 2 == 0 { &a } else { &b };
+        source.send_to(&[i as u8; 17], address).await.unwrap();
+    }
+    let mut received = ReceiveBatch::new(batch::BATCH_SIZE, MAX_DATAGRAM);
+    let allocation = received.buffer.as_ptr();
+    timeout(Duration::from_secs(1), socket.receive(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.packets.len(), batch::BATCH_SIZE);
+    for (i, (source, range)) in received.packets.iter().enumerate() {
+        assert_eq!(
+            *source,
+            if i % 2 == 0 {
+                a.local_addr().unwrap()
+            } else {
+                b.local_addr().unwrap()
+            }
+        );
+        assert_eq!(&received.buffer[range.clone()], &[i as u8; 17]);
+    }
+    received.packets.clear();
+    a.send_to(b"x", address).await.unwrap();
+    timeout(Duration::from_secs(1), socket.receive(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.buffer.as_ptr(), allocation);
+    assert_eq!(received.packets.len(), 1);
+    assert_eq!(&received.buffer[received.packets[0].1.clone()], b"x");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn recvmmsg_drops_truncation_but_preserves_empty_and_following_datagrams() {
+    use std::os::fd::AsRawFd;
+    let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let address = receiver.local_addr().unwrap();
+    sender.send_to(&[1; 20], address).await.unwrap();
+    sender.send_to(&[], address).await.unwrap();
+    sender.send_to(b"abc", address).await.unwrap();
+    let mut received = crate::network::ReceiveBatch::new(4, 4);
+    batch::receive(receiver.as_raw_fd(), &mut received).unwrap();
+    assert_eq!(received.packets.len(), 2);
+    assert!(received.packets[0].1.is_empty());
+    assert_eq!(&received.buffer[received.packets[1].1.clone()], b"abc");
+    received.packets.clear();
+    assert_eq!(
+        batch::receive(receiver.as_raw_fd(), &mut received)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn sendmmsg_partial_prefix_reports_progress_before_invalid_datagram() {
+    use bytes::Bytes;
+    use std::os::fd::AsRawFd;
+    let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let address = receiver.local_addr().unwrap();
+    let packets = vec![
+        (address, Bytes::from_static(b"first")),
+        (address, Bytes::from(vec![0; 65508])),
+        (address, Bytes::from_static(b"last")),
+    ];
+    assert_eq!(batch::send(sender.as_raw_fd(), &packets).unwrap(), 1);
+    assert_eq!(
+        batch::send(sender.as_raw_fd(), &packets[1..])
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EMSGSIZE)
+    );
+    assert_eq!(batch::send(sender.as_raw_fd(), &packets[2..]).unwrap(), 1);
+    let mut buffer = [0; 32];
+    for expected in [b"first".as_slice(), b"last"] {
+        let len = timeout(Duration::from_secs(1), receiver.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..len], expected);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn flush_handles_multiple_batches_and_partial_sends_without_duplicates() {
+    use crate::network::Socket as _;
+    let cfg = harness::config(2, &[(1, None)]);
+    let (socket, endpoint) = Udp::bind(&cfg, &UdpListenerConfig { port: 0 })
+        .await
+        .unwrap();
+    let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let address = receiver.local_addr().unwrap();
+    let count = batch::BATCH_SIZE * 2 + 3;
+    for i in 0..count {
+        // Force sendmmsg to stop after a valid prefix, then fail on its tail.
+        if i == 3 {
+            endpoint.adapter().deliver(
+                address,
+                Packet::Data(Data {
+                    receiver_idx: 1,
+                    counter: 9999,
+                    flags: DataFlags::empty(),
+                    ciphertext: vec![0; 65536],
+                }),
+            );
+        }
+        endpoint.adapter().deliver(
+            address,
+            Packet::Data(Data {
+                receiver_idx: 1,
+                counter: i as u64,
+                flags: DataFlags::empty(),
+                ciphertext: vec![i as u8; 16],
+            }),
+        );
+    }
+    socket.flush(endpoint.adapter()).await.unwrap();
+    let mut buffer = [0; 1024];
+    for i in 0..count {
+        let len = timeout(Duration::from_secs(1), receiver.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        let (packet, used) = codec::parse_slice(&buffer[..len], &cfg.layout)
+            .unwrap()
+            .unwrap();
+        assert_eq!(used, len);
+        let Packet::Data(data) = packet else {
+            panic!("expected data")
+        };
+        assert_eq!(data.counter, i as u64);
+        assert_eq!(data.ciphertext, vec![i as u8; 16]);
+    }
+    assert!(receiver.try_recv(&mut buffer).is_err());
+    assert!(endpoint.adapter().pending.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn encrypted_udp_burst_survives_receive_and_send_batch_boundaries() {
+    let (address, mut server) = start(&harness::config(2, &[(1, None)])).await;
+    let (_, mut client) = start(&harness::config(1, &[(2, Some(address))])).await;
+    connected(&client).await;
+    // More than two syscall batches, with concurrent draining to exercise the
+    // bounded TUN queues in both directions rather than overflowing them.
+    let count = 75;
+    let send = async {
+        for i in 0..count {
+            client.sender.send(packet(1, 2, i + 1)).await.unwrap();
+        }
+    };
+    let read = async {
+        for i in 0..count {
+            assert_eq!(receive(&mut server).await, packet(1, 2, i + 1));
+        }
+    };
+    timeout(Duration::from_secs(5), async {
+        tokio::join!(send, read);
+    })
+    .await
+    .unwrap();
+    let send = async {
+        for i in 0..count {
+            server.sender.send(packet(2, 1, i + 1)).await.unwrap();
+        }
+    };
+    let read = async {
+        for i in 0..count {
+            assert_eq!(receive(&mut client).await, packet(2, 1, i + 1));
+        }
+    };
+    timeout(Duration::from_secs(5), async {
+        tokio::join!(send, read);
+    })
+    .await
+    .unwrap();
+}

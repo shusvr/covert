@@ -7,7 +7,6 @@ use covert::{
 };
 use std::{
     net::{Ipv4Addr, SocketAddr},
-    ops::Range,
     sync::Mutex,
 };
 use tokio::net::UdpSocket;
@@ -58,14 +57,57 @@ impl Udp {
 }
 impl network::Socket for Udp {
     type Adapter = UdpAdapter;
-    async fn receive(&self, buffer: &mut [u8]) -> Result<Option<(SocketAddr, Range<usize>)>> {
-        let (len, address) = self.socket.recv_from(buffer).await?;
-        Ok(Some((address, 0..len)))
+    #[cfg(target_os = "linux")]
+    const RECEIVE_BATCH: usize = batch::BATCH_SIZE;
+
+    async fn receive(&self, received: &mut network::ReceiveBatch<SocketAddr>) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            self.socket
+                .async_io(tokio::io::Interest::READABLE, || {
+                    batch::receive(self.socket.as_raw_fd(), received)
+                })
+                .await?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let (len, address) = self.socket.recv_from(&mut received.buffer).await?;
+            received.packets.push((address, 0..len));
+        }
+        Ok(())
     }
     async fn flush(&self, adapter: &UdpAdapter) -> Result<()> {
         let pending = std::mem::take(&mut *adapter.pending.lock().unwrap());
-        for (address, packet) in pending {
-            let bytes = packet.to_bytes(&self.layout)?;
+        let packets = pending
+            .into_iter()
+            .map(|(address, packet)| packet.to_bytes(&self.layout).map(|bytes| (address, bytes)))
+            .collect::<covert::Result<Vec<_>>>()?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let mut sent = 0;
+            while sent < packets.len() {
+                let remaining = &packets[sent..packets.len().min(sent + batch::BATCH_SIZE)];
+                match self
+                    .socket
+                    .async_io(tokio::io::Interest::WRITABLE, || {
+                        batch::send(self.socket.as_raw_fd(), remaining)
+                    })
+                    .await
+                {
+                    // sendmmsg may send only a prefix. Retry precisely the tail.
+                    Ok(count) => sent += count,
+                    Err(err) => {
+                        // A bad destination must not discard later valid datagrams.
+                        trace!(address = %packets[sent].0, %err, "Failed to send UDP datagram");
+                        sent += 1;
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        for (address, bytes) in packets {
             if let Err(err) = self.socket.send_to(&bytes, address).await {
                 trace!(%address, %err, "Failed to send UDP datagram");
             }
@@ -76,3 +118,6 @@ impl network::Socket for Udp {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(target_os = "linux")]
+mod batch;

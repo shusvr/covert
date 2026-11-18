@@ -7,12 +7,32 @@ use tokio::{
     time::{MissedTickBehavior, interval},
 };
 
+pub const MAX_DATAGRAM: usize = 65535;
+const WORK_BATCH: usize = 32;
+
+/// Reusable receive slots; each packet retains its own source and byte range.
+pub struct ReceiveBatch<R> {
+    pub buffer: Vec<u8>,
+    pub packets: Vec<(R, Range<usize>)>,
+    pub slot_size: usize,
+}
+impl<R> ReceiveBatch<R> {
+    pub fn new(slots: usize, slot_size: usize) -> Self {
+        Self {
+            buffer: vec![0; slots * slot_size],
+            packets: Vec::with_capacity(slots),
+            slot_size,
+        }
+    }
+}
+
 pub trait Socket: Send + Sync {
     type Adapter: Adapter + Send + Sync;
+    const RECEIVE_BATCH: usize = 1;
     fn receive(
         &self,
-        buffer: &mut [u8],
-    ) -> impl Future<Output = Result<Option<(<Self::Adapter as Adapter>::Route, Range<usize>)>>> + Send;
+        batch: &mut ReceiveBatch<<Self::Adapter as Adapter>::Route>,
+    ) -> impl Future<Output = Result<()>> + Send;
     fn flush(&self, adapter: &Self::Adapter) -> impl Future<Output = Result<()>> + Send;
 }
 
@@ -23,7 +43,7 @@ pub async fn run<S: Socket>(
     tun: mpsc::Sender<Vec<u8>>,
     status: watch::Sender<StatusSnapshot>,
 ) -> Result<()> {
-    let mut buffer = vec![0; 65535];
+    let mut incoming_batch = ReceiveBatch::new(S::RECEIVE_BATCH, MAX_DATAGRAM);
     let mut timer = interval(Duration::from_millis(100));
     timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
@@ -34,14 +54,23 @@ pub async fn run<S: Socket>(
                 if let Err(err) = endpoint.tun_write(&packet) {
                     tracing::trace!(%err, "Discarding invalid TUN packet");
                 }
+                // Coalesce already queued TUN packets without waiting for a timer.
+                // Bound work so maintenance and inbound traffic remain responsive.
+                for _ in 1..WORK_BATCH {
+                    let Ok(packet) = requests.try_recv() else { break };
+                    if let Err(err) = endpoint.tun_write(&packet) {
+                        tracing::trace!(%err, "Discarding invalid TUN packet");
+                    }
+                }
             }
             _ = timer.tick() => {
                 endpoint.advance();
                 status.send_replace(endpoint.status());
             }
-            incoming = socket.receive(&mut buffer) => {
-                if let Some((route, bytes)) = incoming? {
-                    endpoint.out_write_datagram(route, &buffer[bytes]);
+            incoming = socket.receive(&mut incoming_batch) => {
+                incoming?;
+                for (route, bytes) in incoming_batch.packets.drain(..) {
+                    endpoint.out_write_datagram(route, &incoming_batch.buffer[bytes]);
                 }
             }
         }

@@ -173,7 +173,8 @@ impl Icmp {
 }
 impl network::Socket for Icmp {
     type Adapter = EchoAdapter;
-    async fn receive(&self, buffer: &mut [u8]) -> Result<Option<(IcmpRoute, Range<usize>)>> {
+    async fn receive(&self, batch: &mut network::ReceiveBatch<IcmpRoute>) -> Result<()> {
+        let buffer = &mut batch.buffer;
         // Initialized bytes may safely be exposed as MaybeUninit to recv.
         let uninit = unsafe {
             std::slice::from_raw_parts_mut(
@@ -186,7 +187,10 @@ impl network::Socket for Icmp {
             .async_io(tokio::io::Interest::READABLE, |socket| socket.recv(uninit))
             .await?;
         let encoder = self.encoder.lock().unwrap();
-        Ok(incoming(&buffer[..len], &encoder))
+        if let Some(packet) = incoming(&buffer[..len], &encoder) {
+            batch.packets.push(packet);
+        }
+        Ok(())
     }
     async fn flush(&self, adapter: &EchoAdapter) -> Result<()> {
         let pending = std::mem::take(&mut *adapter.pending.lock().unwrap());
