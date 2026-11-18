@@ -64,7 +64,7 @@ pub fn send(fd: RawFd, packets: &[(SocketAddr, Bytes)]) -> io::Result<usize> {
             fd,
             messages.as_mut_ptr(),
             count as _,
-            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            (libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as _,
         )
     })?;
     if sent == 0 {
@@ -116,7 +116,7 @@ pub fn receive(fd: RawFd, batch: &mut ReceiveBatch<SocketAddr>) -> io::Result<()
             fd,
             messages.as_mut_ptr(),
             count as _,
-            libc::MSG_DONTWAIT,
+            libc::MSG_DONTWAIT as _,
             ptr::null_mut(),
         )
     })?;
