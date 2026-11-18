@@ -67,9 +67,10 @@ supported by the fixed-remote client adapter.
 Android's `NativeConfig` owns this handle with `AutoCloseable`, serializes access,
 and keeps it alive throughout the native polling loop. Java edits and reads the
 core fields through JNI; the endpoint copies the resulting main Config. The
-hostname, DNS servers and editable UI draft stay in Android because they are not
-fields of the core Config. Name resolution uses Android's selected network, then
-writes the resolved numeric peer endpoint through the FFI. The encrypted profile
+endpoint IP input, DNS servers and editable UI draft stay in Android. Endpoint
+addresses must be numeric literals: Android parses them without DNS and writes
+the numeric peer endpoint through the FFI before binding the protected socket to
+the selected physical network. The encrypted profile
 format is unchanged, so existing saved profiles still load.
 
 ## Client endpoint API
@@ -125,3 +126,11 @@ the real JNI loopback test, including native config ownership and closed-handle
 checks. `scripts/test-icmp-server.sh /path/to/covert` checks an Android-style ping
 socket against the CLI and a real TUN in a disposable Linux network namespace.
 Neither workflow uses an emulator.
+
+`covert_config_from_query(data, len, &config)` parses UTF-8 query parameters with
+`Config::from_query`; pass only the query, without `covert:/?`, and preserve its
+percent encoding. It returns a new owned handle (null on failure). Free it with
+`covert_config_free`. `covert_config_to_json(config, &buffer)` exports the same
+config as UTF-8 JSON; free the output with `covert_buffer_free`. Both query and
+JSON contain private key material. Android uses this path for configuration links
+and asks for confirmation before saving the resulting profile.

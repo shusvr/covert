@@ -118,6 +118,41 @@ pub unsafe extern "C" fn covert_config_new(out: *mut *mut ConfigHandle) -> i32 {
         Ok(())
     })
 }
+/// Parse a UTF-8 query into a new owned Config. Output is null on failure.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn covert_config_from_query(
+    data: *const u8,
+    len: usize,
+    out: *mut *mut ConfigHandle,
+) -> i32 {
+    guard(|| {
+        let out = unsafe { get_mut(out)? };
+        *out = ptr::null_mut();
+        let text = std::str::from_utf8(unsafe { bytes(data, len)? })
+            .map_err(|_| Error::InvalidArgument("query must be UTF-8"))?;
+        let config = ConfigHandle::from_query(text)?;
+        validate(&config)?;
+        *out = Box::into_raw(Box::new(config));
+        Ok(())
+    })
+}
+
+/// Serialize a Config as UTF-8 JSON; release the buffer with covert_buffer_free.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn covert_config_to_json(
+    config: *const ConfigHandle,
+    out: *mut Buffer,
+) -> i32 {
+    guard(|| {
+        let out = unsafe { get_mut(out)? };
+        out.data = ptr::null_mut();
+        out.len = 0;
+        let config = unsafe { get(config)? };
+        output(out, config.to_json(false)?.into_bytes());
+        Ok(())
+    })
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn covert_config_add_peer(config: *mut ConfigHandle, out: *mut usize) -> i32 {
     guard(|| {
@@ -459,4 +494,59 @@ pub unsafe extern "C" fn covert_config_public_key(
         output(out, STANDARD.encode(public.as_ref()).into_bytes());
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+
+    #[test]
+    fn query_roundtrip_owns_config_and_exports_json() {
+        unsafe {
+            let mut original = ptr::null_mut();
+            assert_eq!(covert_config_new(&mut original), OK);
+            (*original).interface.addresses = vec!["10.0.0.2/32".parse().unwrap()];
+            (*original).interface.private_key = [255; 32].into();
+            (*original).interface.liveness.timeout = Some(28);
+            let mut query = (*original).to_query().unwrap();
+            // Query encoding must preserve key '+' characters through one decoding pass.
+            let mut parsed = ptr::null_mut();
+            assert_eq!(
+                covert_config_from_query(query.as_ptr(), query.len(), &mut parsed),
+                OK
+            );
+            assert_eq!(*(*parsed).interface.private_key.0, [255; 32]);
+            assert_eq!((*parsed).interface.liveness.timeout, Some(28));
+            let mut json = Buffer {
+                data: ptr::null_mut(),
+                len: 0,
+            };
+            assert_eq!(covert_config_to_json(parsed, &mut json), OK);
+            let decoded: ConfigHandle =
+                serde_json::from_slice(bytes(json.data, json.len).unwrap()).unwrap();
+            assert_eq!(decoded.interface.addresses, (*original).interface.addresses);
+            covert_buffer_free(&mut json);
+            covert_config_free(parsed);
+            covert_config_free(original);
+            query.clear();
+        }
+    }
+
+    #[test]
+    fn bad_queries_clear_output_without_allocating_a_handle() {
+        unsafe {
+            for text in [b"a=b".as_slice(), b"", &[0xff]] {
+                let mut out = ptr::dangling_mut::<ConfigHandle>();
+                assert_ne!(
+                    covert_config_from_query(text.as_ptr(), text.len(), &mut out),
+                    OK
+                );
+                assert!(out.is_null());
+            }
+            assert_eq!(
+                covert_config_from_query(ptr::null(), 1, ptr::null_mut()),
+                INVALID
+            );
+        }
+    }
 }

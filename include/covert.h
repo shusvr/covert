@@ -129,6 +129,10 @@ enum { COVERT_CONFIG_LAYOUT = 0, COVERT_CONFIG_DEV_NAME = 1,
     COVERT_CONFIG_MAX_AGE = 21, COVERT_CONFIG_KEEPALIVE = 22,
     COVERT_CONFIG_KEEPALIVE_JITTER = 23 };
 int32_t covert_config_new(CovertConfig **out);
+/* UTF-8 query (without URL prefix); *out is null on failure. Free with covert_config_free. */
+int32_t covert_config_from_query(const uint8_t *data, size_t len, CovertConfig **out);
+/* UTF-8 JSON output, including private keys. Release with covert_buffer_free. */
+int32_t covert_config_to_json(const CovertConfig *config, CovertBuffer *out);
 int32_t covert_config_free(CovertConfig *config);
 int32_t covert_config_add_peer(CovertConfig *config, size_t *index);
 int32_t covert_config_remove_peer(CovertConfig *config, size_t index);

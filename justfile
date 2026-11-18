@@ -12,3 +12,7 @@ android:
 # Build the host library and check its public C ABI.
 test-ffi:
     scripts/test-ffi.sh
+
+install:
+    cross build --release --target x86_64-unknown-linux-gnu
+    sudo install ./target/x86_64-unknown-linux-gnu/release/covert /usr/local/bin/covert

@@ -273,9 +273,15 @@ fn queued_bidirectional_ipv4_and_ipv6_roundtrip_with_layouts_and_psk() {
             assert_eq!(a.tun_read().collect::<Vec<_>>(), responses);
             assert!(a.tun_read().next().is_none());
             assert!(b.tun_read().next().is_none());
-            assert_eq!(sent(&a), requests.iter().map(|p| p.len() as u64).sum());
+            assert_eq!(
+                sent(&a),
+                requests.iter().map(|p| p.len() as u64).sum::<u64>()
+            );
             assert_eq!(received(&b), sent(&a));
-            assert_eq!(sent(&b), responses.iter().map(|p| p.len() as u64).sum());
+            assert_eq!(
+                sent(&b),
+                responses.iter().map(|p| p.len() as u64).sum::<u64>()
+            );
             assert_eq!(received(&a), sent(&b));
             assert_eq!(route(&a), Some(3));
             assert_eq!(route(&b), Some(2));

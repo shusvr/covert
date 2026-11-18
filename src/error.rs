@@ -7,8 +7,10 @@ pub enum Error {
     PacketOverflow,
     #[error("Invalid packet layout({0})")]
     InvalidLayout(&'static str),
-    #[error("Failed to parse layout: {0}")]
-    LayoutParseErr(#[from] serde_urlencoded::de::Error),
+    #[error("{0}")]
+    Json(#[from] serde_json::Error),
+    #[error("{0}")]
+    LayoutParseErr(#[from] serde_qs::Error),
     #[error("Layout param `{0}` doesn't exist")]
     UnkownLayoutParam(String),
     #[error("Layout params `{0}` and `{1}` will cause overlap")]
@@ -36,7 +38,7 @@ impl Error {
     }
 }
 
-pub type Result<T = ()> = std::result::Result<T, Error>;
+pub type Result<T = (), E = Error> = std::result::Result<T, E>;
 
 #[cfg(test)]
 mod tests {

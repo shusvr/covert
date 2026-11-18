@@ -160,7 +160,7 @@ mod tests {
     async fn streams_immediate_and_periodic_json_to_multiple_clients() {
         let dir = Directory::new();
         let path = dir.0.join("status.sock");
-        let config: Config = toml::from_str(include_str!("../../../config.toml")).unwrap();
+        let config: Config = toml_edit::de::from_str(include_str!("../../../config.toml")).unwrap();
         struct Capture;
         impl Adapter for Capture {
             type Route = ();

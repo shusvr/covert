@@ -1,3 +1,4 @@
+use crate::Result;
 use crate::{
     codec::PacketLayout,
     transport::{
@@ -6,7 +7,7 @@ use crate::{
 };
 use base64::prelude::*;
 use ipnet::IpNet;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{
     fmt::{Debug, Display},
     net::IpAddr,
@@ -15,16 +16,54 @@ use std::{
 };
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Config {
     #[serde(skip, default)]
     pub dev_name: String,
-    #[serde(deserialize_with = "de_packet_layout", default)]
+    #[serde(
+        deserialize_with = "de_packet_layout",
+        serialize_with = "ser_packet_layout",
+        default
+    )]
+    #[serde(skip_serializing_if = "PacketLayout::is_default")]
     pub layout: PacketLayout,
     pub interface: Interface,
     #[serde(rename = "Peer", default)]
     pub peers: Vec<Peer>,
+}
+
+impl Config {
+    pub fn to_json(&self, pretty: bool) -> Result<String> {
+        if pretty {
+            Ok(serde_json::to_string_pretty(self)?)
+        } else {
+            Ok(serde_json::to_string(self)?)
+        }
+    }
+
+    pub fn from_json(&self, json: &str) -> Result<Self> {
+        let conf = serde_json::from_str::<Self>(json)?;
+        conf.layout.check()?;
+        Ok(conf)
+    }
+
+    pub fn to_query(&self) -> Result<String> {
+        Ok(serde_qs::to_string(self)?)
+    }
+
+    pub fn from_query(query: &str) -> Result<Self> {
+        let conf = serde_qs::from_str::<Self>(query)?;
+        conf.layout.check()?;
+        Ok(conf)
+    }
+}
+
+fn ser_packet_layout<S: serde::Serializer>(
+    layout: &PacketLayout,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&layout.to_string())
 }
 
 fn de_packet_layout<'de, D: Deserializer<'de>>(de: D) -> Result<PacketLayout, D::Error> {
@@ -57,14 +96,45 @@ impl Liveness {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(rename_all = "PascalCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "PascalCase")]
 pub struct LivenessOptions {
-    #[serde(default)]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_optional_u32"
+    )]
     pub timeout: Option<u32>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_optional_u32"
+    )]
     pub keepalive: Option<u32>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_optional_u32"
+    )]
     pub keepalive_jitter: Option<u32>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_optional_u32"
+    )]
     pub max_age: Option<u32>,
+}
+
+// Flattened fields arrive as strings when deserializing query parameters.
+fn de_optional_u32<'de, D: Deserializer<'de>>(de: D) -> Result<Option<u32>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Number {
+        Integer(u32),
+        Text(String),
+    }
+    Option::<Number>::deserialize(de)?
+        .map(|number| match number {
+            Number::Integer(value) => Ok(value),
+            Number::Text(value) => value.parse().map_err(serde::de::Error::custom),
+        })
+        .transpose()
 }
 
 impl LivenessOptions {
@@ -84,7 +154,7 @@ impl LivenessOptions {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Interface {
     #[serde(alias = "Address", deserialize_with = "deserialize_addrs")]
@@ -96,11 +166,11 @@ pub struct Interface {
     #[serde(flatten)]
     pub liveness: LivenessOptions,
     pub listener: ListenerConfig,
-    #[serde(flatten)]
+    #[serde(flatten, skip_serializing)]
     pub hooks: InterfaceHooks,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct InterfaceHooks {
     #[serde(default, deserialize_with = "deserialize_hooks")]
@@ -126,16 +196,17 @@ fn deserialize_hooks<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<String>, D:
     })
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Peer {
-    #[serde(default = "random_uuid")]
+    #[serde(skip_serializing, default = "random_uuid")]
     pub id: Uuid,
     pub public_key: PubKey,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pre_shared_key: Option<PrivKey>,
     #[serde(rename = "AllowedIPs", deserialize_with = "deserialize_addrs")]
     pub allowed_ips: Vec<IpNet>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "PeerTransport::is_none", default)]
     pub transport: PeerTransport,
     #[serde(flatten)]
     pub liveness: LivenessOptions,
@@ -143,7 +214,7 @@ pub struct Peer {
 
 macro_rules! make_listen_peer_cfgs {
     ($($var:ident, $lower:ident, $listen:ident, $peer:ident);* $(;)?) => {
-        #[derive(Debug, Clone, Deserialize)]
+        #[derive(Debug, Clone, Serialize, Deserialize)]
         #[serde(rename_all = "PascalCase")]
         pub enum ListenerConfig {
             $($var { $lower: $listen }),*
@@ -157,7 +228,7 @@ macro_rules! make_listen_peer_cfgs {
             }
         }
 
-        #[derive(Debug, Clone, Deserialize, Default)]
+        #[derive(Debug, Clone, Serialize, Deserialize, Default)]
         #[serde(rename_all = "PascalCase")]
         pub enum PeerTransport {
             $($var { $lower: $peer }),*,
@@ -172,10 +243,14 @@ macro_rules! make_listen_peer_cfgs {
                     Self::None {} => "none",
                 }
             }
-
-
         }
     };
+}
+
+impl PeerTransport {
+    fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
 }
 
 make_listen_peer_cfgs!(
@@ -256,6 +331,15 @@ pub type PrivKey = Key<true>;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Key<const PRIV: bool>(pub zeroize::Zeroizing<[u8; 32]>);
+
+impl<const PRIV: bool> Serialize for Key<PRIV> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        zeroize::Zeroizing::new(BASE64_STANDARD.encode(&self.0)).serialize(serializer)
+    }
+}
 
 impl<const PRIV: bool> From<[u8; 32]> for Key<PRIV> {
     fn from(bytes: [u8; 32]) -> Self {

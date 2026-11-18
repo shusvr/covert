@@ -28,7 +28,7 @@ const DEFAULT_LAYOUT: PacketLayout = PacketLayout {
 
 macro_rules! mkconfig {
     ($( $(#[$($fattr:tt)*])? $fname:ident: $fty:ty),* $(,)?) => {
-        #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+        #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
         #[serde(deny_unknown_fields)]
         pub struct PacketLayout {
             $($(#[$($fattr)*])? pub $fname: $fty),*
@@ -79,7 +79,11 @@ impl Default for PacketLayout {
 
 impl PacketLayout {
     pub fn to_string(&self) -> String {
-        serde_urlencoded::to_string(self).unwrap()
+        serde_qs::to_string(self).unwrap()
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == DEFAULT_LAYOUT
     }
 }
 
@@ -87,7 +91,7 @@ impl FromStr for PacketLayout {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        let patch = serde_urlencoded::from_str(s).map_err(Error::LayoutParseErr)?;
+        let patch = serde_qs::from_str(s).map_err(Error::LayoutParseErr)?;
         let layout = DEFAULT_LAYOUT.apply(patch);
         layout.check()?;
         Ok(layout)
