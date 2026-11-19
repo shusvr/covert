@@ -154,7 +154,7 @@ impl LivenessOptions {
     }
 }
 
-pub const DEFAULT_FWMARK: u16 = 0xDEAD;
+pub const DEFAULT_FWMARK: u32 = 0xDEADBEE6;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -164,7 +164,7 @@ pub struct Interface {
     #[serde(default = "default_mtu")]
     pub mtu: u16,
     #[serde(skip, default = "default_fwmark")]
-    pub fwmark: u16,
+    pub fwmark: u32,
     #[serde(skip_serializing, default = "default_on")]
     pub table: bool,
     pub private_key: PrivKey,
@@ -180,7 +180,7 @@ fn default_on() -> bool {
     true
 }
 
-fn default_fwmark() -> u16 {
+fn default_fwmark() -> u32 {
     DEFAULT_FWMARK
 }
 
@@ -217,7 +217,7 @@ pub struct Peer {
     pub id: Uuid,
     pub public_key: PubKey,
     #[serde(skip_serializing, default = "default_metric")]
-    pub metric: u16,
+    pub metric: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pre_shared_key: Option<PrivKey>,
     #[serde(rename = "AllowedIPs", deserialize_with = "deserialize_addrs")]
@@ -228,7 +228,7 @@ pub struct Peer {
     pub liveness: LivenessOptions,
 }
 
-fn default_metric() -> u16 {
+fn default_metric() -> u32 {
     600
 }
 

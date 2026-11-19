@@ -50,7 +50,6 @@ impl IcmpRoute {
     }
 }
 
-const SOCKET_MARK: u32 = 0x434f5654;
 
 struct EchoEncoder {
     layout: PacketLayout,
@@ -151,11 +150,11 @@ impl Icmp {
     ) -> Result<(Self, Endpoint<EchoAdapter>)> {
         let socket = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?;
         socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into())?;
-        socket.set_mark(SOCKET_MARK)?;
+        socket.set_mark(config.interface.fwmark)?;
         socket.set_nonblocking(true)?;
         let socket = unsafe { AsyncFd::register(socket).map_err(|err| err.into_parts().1)? };
         let encoder = EchoEncoder::new(config.layout, listener);
-        let firewall = ReplyFilter::install(encoder.id)?;
+        let firewall = ReplyFilter::install(encoder.id, config.interface.fwmark)?;
         let adapter = EchoAdapter {
             mode: listener.mode,
             pending: Mutex::new(Vec::new()),
@@ -257,7 +256,7 @@ impl ReplyFilter {
         Ok(())
     }
 
-    fn install(id: u16) -> Result<Self> {
+    fn install(id: u16, mark: u32) -> Result<Self> {
         let table = format!("covert_icmp_{}_{}", std::process::id(), fastrand::u32(..));
         // Keep the locally originated request-ID rule and add destination/ID pairs learned after
         // authentication. Unrelated ping replies retain their normal behavior.
@@ -265,8 +264,8 @@ impl ReplyFilter {
             "add table ip {table}\n\
              add set ip {table} reply_peers {{ typeof ip daddr . icmp id; }}\n\
              add chain ip {table} output {{ type filter hook output priority 0; policy accept; }}\n\
-             add rule ip {table} output icmp type echo-reply icmp id {id} meta mark != {SOCKET_MARK} drop\n\
-             add rule ip {table} output icmp type echo-reply ip daddr . icmp id @reply_peers meta mark != {SOCKET_MARK} drop\n"
+             add rule ip {table} output icmp type echo-reply icmp id {id} meta mark != {mark} drop\n\
+             add rule ip {table} output icmp type echo-reply ip daddr . icmp id @reply_peers meta mark != {mark} drop\n"
         ))?;
         Ok(Self { table })
     }

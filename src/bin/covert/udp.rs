@@ -1,5 +1,5 @@
 use crate::network;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use covert::{
     codec::{Packet, PacketLayout},
     config::{Config, ListenerConfig, Peer, PeerTransport},
@@ -49,6 +49,11 @@ impl Udp {
         listener: &UdpListenerConfig,
     ) -> Result<(Self, Endpoint<UdpAdapter>)> {
         let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, listener.port)).await?;
+        if config.interface.fwmark != 0 {
+            socket2::SockRef::from(&socket)
+                .set_mark(config.interface.fwmark)
+                .context("failed to set UDP socket mark")?;
+        }
         let adapter = UdpAdapter {
             quic: matches!(config.interface.listener, ListenerConfig::Quic { .. }),
             ..UdpAdapter::default()

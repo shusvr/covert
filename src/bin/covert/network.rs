@@ -163,7 +163,7 @@ pub mod tests {
                 listener: ListenerConfig::Udp {
                     udp: UdpListenerConfig { port: 0 },
                 },
-                fwmark: DEFAULT_FWMARK,
+                fwmark: 0,
                 table: false,
             },
             peers: peers

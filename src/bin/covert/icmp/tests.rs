@@ -77,6 +77,7 @@ fn initiator_requests_increment_and_responder_replies_echo_query_metadata() {
 
 fn config(local: u8, remote: u8, active: bool, mode: IcmpMode) -> Config {
     let mut cfg = harness::config(local, &[(remote, None)]);
+    cfg.interface.fwmark = covert::config::DEFAULT_FWMARK;
     cfg.interface.listener = covert::config::ListenerConfig::Icmp {
         icmp: IcmpListenerConfig { mode },
     };
@@ -391,7 +392,7 @@ async fn raw_socket_handshake_and_bidirectional_data_in_both_modes() {
 #[test]
 #[ignore = "requires isolated net namespace with CAP_NET_ADMIN and nft"]
 fn reply_filter_migrates_and_retains_shared_pairs() {
-    let filter = ReplyFilter::install(43396).unwrap();
+    let filter = ReplyFilter::install(43396, covert::config::DEFAULT_FWMARK).unwrap();
     let address = Ipv4Addr::new(192, 0, 2, 1);
     let old = IcmpRoute::response(address, 14655, 7);
     let new = IcmpRoute::response(address, 14656, 7);
