@@ -3,7 +3,7 @@ Address = "10.111.111.2/24"
 PrivateKey = "Z2LubJGUXNxmVPqEHNDRWaeqzYLHjPyMN9i6gvNfXKU="
 
 
-[[Interface.Listener.Udp]]
+[Interface.Listener.Udp]
 Port = 5551
 
 
