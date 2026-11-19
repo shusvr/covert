@@ -52,6 +52,7 @@ fn endpoint(local: u8, remote: u8, active: bool) -> Endpoint<Capture> {
                 } else {
                     PeerTransport::None
                 },
+                metric: 600,
             }],
         },
     )

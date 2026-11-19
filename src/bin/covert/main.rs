@@ -196,6 +196,7 @@ fn add_peer(
         allowed_ips: vec![host],
         transport: PeerTransport::None,
         liveness: LivenessOptions::default(),
+        metric: 600,
     };
     let encoded = toml_edit::ser::to_string(&peer)?;
     let table = encoded.parse::<toml_edit::DocumentMut>()?.into_table();
@@ -248,6 +249,7 @@ fn add_peer(
             },
         },
         liveness: LivenessOptions::default(),
+        metric: 600,
     }];
     let exported = zeroize::Zeroizing::new(if json {
         client.to_json(std::io::stdout().is_terminal())?

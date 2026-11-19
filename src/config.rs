@@ -216,6 +216,8 @@ pub struct Peer {
     #[serde(skip_serializing, default = "random_uuid")]
     pub id: Uuid,
     pub public_key: PubKey,
+    #[serde(skip_serializing, default = "default_metric")]
+    pub metric: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pre_shared_key: Option<PrivKey>,
     #[serde(rename = "AllowedIPs", deserialize_with = "deserialize_addrs")]
@@ -224,6 +226,10 @@ pub struct Peer {
     pub transport: PeerTransport,
     #[serde(flatten)]
     pub liveness: LivenessOptions,
+}
+
+fn default_metric() -> u16 {
+    600
 }
 
 macro_rules! make_listen_peer_cfgs {

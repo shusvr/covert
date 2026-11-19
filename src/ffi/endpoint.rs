@@ -106,6 +106,7 @@ pub unsafe extern "C" fn covert_endpoint_client_new(
                 allowed_ips: vec!["0.0.0.0/0".parse().unwrap(), "::/0".parse().unwrap()],
                 transport: PeerTransport::None,
                 liveness: Default::default(),
+                metric: 600,
             }],
         };
         *out = Box::into_raw(Box::new(from_engine(config, mode == 1)?));

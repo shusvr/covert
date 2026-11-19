@@ -184,6 +184,7 @@ pub mod tests {
                             endpoint: *endpoint,
                         },
                     },
+                    metric: 600,
                 })
                 .collect(),
         }

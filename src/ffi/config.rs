@@ -168,6 +168,7 @@ pub unsafe extern "C" fn covert_config_add_peer(config: *mut ConfigHandle, out: 
             allowed_ips: vec![],
             transport: PeerTransport::None,
             liveness: Default::default(),
+            metric: 600,
         });
         Ok(())
     })
