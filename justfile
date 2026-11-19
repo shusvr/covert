@@ -14,5 +14,5 @@ test-ffi:
     scripts/test-ffi.sh
 
 install:
-    cross build --release --target x86_64-unknown-linux-gnu
-    sudo install ./target/x86_64-unknown-linux-gnu/release/covert /usr/local/bin/covert
+    cargo build --release --target x86_64-unknown-linux-musl
+    sudo install ./target/x86_64-unknown-linux-musl/release/covert /usr/local/bin/covert

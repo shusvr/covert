@@ -16,6 +16,7 @@ pub(super) fn add_peer(
     output: Option<PathBuf>,
     ip: Option<IpAddr>,
     psk: bool,
+    no_initiate: bool,
     json: bool,
     query: bool,
 ) -> anyhow::Result<()> {
@@ -40,7 +41,11 @@ pub(super) fn add_peer(
         pre_shared_key: shared.clone(),
         allowed_ips: vec![host],
         transport: PeerTransport::None,
-        liveness: LivenessOptions::default(),
+        liveness: LivenessOptions {
+            max_age: no_initiate.then_some(0),
+            timeout: no_initiate.then_some(0),
+            ..LivenessOptions::default()
+        },
         metric: 600,
     };
     let encoded = toml_edit::ser::to_string(&peer)?;
@@ -269,6 +274,7 @@ mod tests {
                 Some(output.clone()),
                 None,
                 true,
+                false,
                 json,
                 query,
             )
@@ -375,6 +381,7 @@ mod tests {
                 Some(output.clone()),
                 None,
                 false,
+                false,
                 true,
                 false
             )
@@ -387,6 +394,7 @@ mod tests {
             "203.0.113.1".parse().unwrap(),
             Some(output.clone()),
             Some("10.42.0.3".parse().unwrap()),
+            false,
             false,
             true,
             false,
@@ -450,6 +458,7 @@ mod tests {
                 "203.0.113.1".parse().unwrap(),
                 Some(output.clone()),
                 None,
+                false,
                 false,
                 false,
                 false

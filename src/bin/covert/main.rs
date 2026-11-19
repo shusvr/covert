@@ -74,6 +74,9 @@ enum Command {
         /// Generate pre shared key
         #[arg(long)]
         psk: bool,
+        /// Sets MaxAge=0 Timeout=0 so we never initiate connections to this peer.
+        #[arg(short = 'N')]
+        no_initiate: bool,
         /// Output file path; write to stdout when omitted.
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -157,6 +160,7 @@ async fn main() -> Result<()> {
             ip,
             psk,
             config,
+            no_initiate,
             output,
             json,
             query,
@@ -171,7 +175,7 @@ async fn main() -> Result<()> {
                 )
             };
 
-            peer_config::add_peer(&config, endpoint, output, ip, psk, json, query)
+            peer_config::add_peer(&config, endpoint, output, ip, psk, no_initiate, json, query)
         }
     }
 }
