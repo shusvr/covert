@@ -718,14 +718,12 @@ async fn run_endpoint<S: network::Socket>(
                     .context("Socket worker stopped")?;
             }
         }
-        #[allow(unreachable_code)]
-        Ok::<(), anyhow::Error>(())
     };
     let write = async {
         while let Some(packet) = in_rx.recv().await {
             writer.send(tun, packet, &mut in_rx).await?;
         }
-        Ok::<(), anyhow::Error>(())
+        Ok(())
     };
     let rpc = async {
         match rpc {
