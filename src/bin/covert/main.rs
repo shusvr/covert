@@ -9,7 +9,7 @@ use covert::{
 };
 use std::{
     fs,
-    io::{self, Read},
+    io::{self, IsTerminal, Read},
     net::IpAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -250,9 +250,9 @@ fn add_peer(
         liveness: LivenessOptions::default(),
     }];
     let exported = zeroize::Zeroizing::new(if json {
-        client.to_json(true)?
+        client.to_json(std::io::stdout().is_terminal())?
     } else if query {
-        client.to_query()?
+        "covert:/?".to_owned() + &client.to_query()?
     } else {
         toml_edit::ser::to_string_pretty(&client)?
     });
@@ -286,7 +286,7 @@ fn add_peer(
     }
     result?;
     if output.is_none() {
-        println!("covert:/?{}", exported.as_str());
+        println!("{}", exported.as_str());
     }
     Ok(())
 }
