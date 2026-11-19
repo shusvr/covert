@@ -1,6 +1,6 @@
 //! Transport-independent tunnel state machine.
 //!
-//! Emits `tracing` events under `covert::sans`: info for established sessions,
+//! Emits `tracing` events under `covert::tunnel`: info for established sessions,
 //! debug for handshakes/expiry/rejections, trace for packet metadata/keepalives,
 //! and warn for local processing failures. Keys and packet contents are omitted.
 //! The host application is responsible for installing a tracing subscriber.
@@ -483,5 +483,5 @@ fn timestamp() -> u64 {
 }
 
 #[cfg(test)]
-#[path = "./tests/sans.rs"]
+#[path = "./tests/tunnel.rs"]
 mod tests;
