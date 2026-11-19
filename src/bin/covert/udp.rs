@@ -2,8 +2,8 @@ use crate::network;
 use anyhow::Result;
 use covert::{
     codec::{Packet, PacketLayout},
-    config::{Config, Peer, PeerTransport},
-    transport::{Adapter, Endpoint, UdpListenerConfig},
+    config::{Config, ListenerConfig, Peer, PeerTransport},
+    transport::{Adapter, Endpoint, UdpListenerConfig, encode_datagram},
 };
 use std::{
     net::{Ipv4Addr, SocketAddr},
@@ -14,19 +14,22 @@ use tracing::trace;
 
 #[derive(Default)]
 pub struct UdpAdapter {
+    quic: bool,
     pending: Mutex<Vec<(SocketAddr, Packet)>>,
 }
 impl Adapter for UdpAdapter {
     type Route = SocketAddr;
     fn supports_peer(&self, peer: &Peer) -> bool {
-        matches!(
-            peer.transport,
-            PeerTransport::Udp { .. } | PeerTransport::None
-        )
+        match peer.transport {
+            PeerTransport::Udp { .. } => !self.quic,
+            PeerTransport::Quic { .. } => self.quic,
+            PeerTransport::None => true,
+            _ => false,
+        }
     }
     fn peer_route(&self, peer: &Peer) -> Option<SocketAddr> {
         match &peer.transport {
-            PeerTransport::Udp { udp } => udp.endpoint,
+            PeerTransport::Udp { udp } | PeerTransport::Quic { quic: udp } => udp.endpoint,
             _ => None,
         }
     }
@@ -38,6 +41,7 @@ impl Adapter for UdpAdapter {
 pub struct Udp {
     socket: UdpSocket,
     layout: PacketLayout,
+    listener: ListenerConfig,
 }
 impl Udp {
     pub async fn bind(
@@ -45,11 +49,16 @@ impl Udp {
         listener: &UdpListenerConfig,
     ) -> Result<(Self, Endpoint<UdpAdapter>)> {
         let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, listener.port)).await?;
-        let endpoint = Endpoint::new(UdpAdapter::default(), config.clone())?;
+        let adapter = UdpAdapter {
+            quic: matches!(config.interface.listener, ListenerConfig::Quic { .. }),
+            ..UdpAdapter::default()
+        };
+        let endpoint = Endpoint::new(adapter, config.clone())?;
         Ok((
             Self {
                 socket,
                 layout: config.layout,
+                listener: config.interface.listener.clone(),
             },
             endpoint,
         ))
@@ -79,10 +88,16 @@ impl network::Socket for Udp {
     }
     async fn flush(&self, adapter: &UdpAdapter) -> Result<()> {
         let pending = std::mem::take(&mut *adapter.pending.lock().unwrap());
-        let packets = pending
-            .into_iter()
-            .map(|(address, packet)| packet.to_bytes(&self.layout).map(|bytes| (address, bytes)))
-            .collect::<covert::Result<Vec<_>>>()?;
+        let mut packets = Vec::with_capacity(pending.len());
+        for (address, packet) in pending {
+            match encode_datagram(packet, &self.listener, &self.layout) {
+                Ok(bytes) => packets.push((address, bytes)),
+                Err(covert::Error::PacketOverflow) => {
+                    trace!(%address, "Discarding oversized outbound datagram");
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;

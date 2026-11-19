@@ -4,7 +4,7 @@ use crate::codec::{Packet, PacketLayout};
 use crate::config::DEFAULT_FWMARK;
 use crate::{
     config::{Config, Interface, ListenerConfig, LivenessOptions, Peer, PeerTransport},
-    transport::{Adapter, Endpoint, UdpListenerConfig},
+    transport::{Adapter, Endpoint, UdpListenerConfig, encode_datagram},
 };
 use std::{collections::VecDeque, sync::Mutex};
 
@@ -29,6 +29,7 @@ impl Adapter for Frames {
 pub struct ClientEndpoint {
     endpoint: Endpoint<Frames>,
     layout: PacketLayout,
+    listener: ListenerConfig,
 }
 #[repr(C)]
 pub struct EndpointStatus {
@@ -40,7 +41,7 @@ pub struct EndpointStatus {
 }
 free_handle!(covert_endpoint_free, ClientEndpoint);
 
-/// mode: 0 = bidirectional UDP, 1 = initiating-only ICMP EchoReply client.
+/// mode: 0 = UDP, 1 = initiating-only ICMP EchoReply, 2 = QUIC-shaped UDP.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn covert_endpoint_client_new(
     layout: *const PacketLayout,
@@ -54,7 +55,7 @@ pub unsafe extern "C" fn covert_endpoint_client_new(
     guard(|| {
         let out = unsafe { get_mut(out)? };
         *out = ptr::null_mut();
-        if mode > 1 {
+        if mode > 2 {
             return Err(Error::InvalidArgument("invalid FFI argument"));
         }
         let live = unsafe { get(liveness)? };
@@ -86,8 +87,14 @@ pub unsafe extern "C" fn covert_endpoint_client_new(
                 private_key: unsafe { key(secret)? }.into(),
                 hooks: Default::default(),
                 liveness,
-                listener: ListenerConfig::Udp {
-                    udp: UdpListenerConfig { port: 0 },
+                listener: if mode == 2 {
+                    ListenerConfig::Quic {
+                        quic: UdpListenerConfig { port: 0 },
+                    }
+                } else {
+                    ListenerConfig::Udp {
+                        udp: UdpListenerConfig { port: 0 },
+                    }
                 },
                 fwmark: DEFAULT_FWMARK,
                 table: false,
@@ -157,7 +164,10 @@ pub unsafe extern "C" fn covert_endpoint_read_outbound(
             .unwrap()
             .pop_front()
             .ok_or(Error::Empty)?;
-        output(out, packet.to_bytes(&client.layout)?.to_vec());
+        output(
+            out,
+            encode_datagram(packet, &client.listener, &client.layout)?.to_vec(),
+        );
         Ok(())
     })
 }
@@ -199,12 +209,17 @@ pub unsafe extern "C" fn covert_endpoint_status(
 
 fn from_engine(config: Config, echo_reply_client: bool) -> Result<ClientEndpoint> {
     let layout = config.layout;
+    let listener = config.interface.listener.clone();
     let adapter = Frames {
         outbound: Mutex::new(VecDeque::new()),
         echo_reply_client,
     };
     let endpoint = Endpoint::new(adapter, config)?;
-    Ok(ClientEndpoint { endpoint, layout })
+    Ok(ClientEndpoint {
+        endpoint,
+        layout,
+        listener,
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -224,7 +239,7 @@ pub unsafe extern "C" fn covert_endpoint_from_config(
             return super::config::report(error, "Invalid packet layout or interface MTU");
         }
         let echo_reply_client = match config.interface.listener {
-            ListenerConfig::Udp { .. } => false,
+            ListenerConfig::Udp { .. } | ListenerConfig::Quic { .. } => false,
             ListenerConfig::Icmp { ref icmp }
                 if icmp.mode == crate::transport::IcmpMode::EchoReply =>
             {

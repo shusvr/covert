@@ -94,6 +94,13 @@ KeepaliveJitter = 3   # Uniform +/- jitter: defaults give 7..13 seconds.
 [Interface.Listener.Udp.udp]
 Port = 40676
 
+# QUIC-shaped UDP alternative: replace the UDP listener table above with
+# this table. Both ends must select Quic. This carries Covert packets using
+# QUIC v1-shaped headers and works only with another Covert endpoint.
+# Use Mtu = 1400 with the default packet layout on a 1500-byte IPv4 path.
+# [Interface.Listener.Quic]
+# Port = 443
+
 # ICMP alternative: replace the UDP listener table above with these two lines.
 # Requires raw-socket/firewall privileges and nft; listens for IPv4 ICMP.
 # Locally originated requests use an automatically generated identifier.
@@ -135,6 +142,11 @@ AllowedIPs = ["10.111.111.2/32"]
 # UDP Endpoint is a numeric IP:port (not a hostname).
 [Peer.Transport.Udp.udp]
 Endpoint = "192.0.2.2:40676"
+
+# QUIC-shaped UDP alternative: replace the UDP peer table above with this
+# table when selecting the Quic listener. Endpoint is optional.
+# [Peer.Transport.Quic]
+# Endpoint = "192.0.2.2:443"
 
 # ICMP alternative: replace the UDP peer table above with these lines when
 # selecting the ICMP listener. Endpoint accepts a numeric IPv4 address only.

@@ -175,14 +175,14 @@ Address = "$local_ip/30"
 Mtu = $payload_mtu
 PrivateKey = "$private"
 
-[Interface.Listener.Udp.udp]
+[Interface.Listener.Udp]
 Port = 40676
 
 [[Peer]]
 AllowedIPs = "$remote_ip/32"
 PublicKey = "$public"
 
-[Peer.Transport.Udp.udp]
+[Peer.Transport.Udp]
 Endpoint = "$endpoint:40676"
 EOF
     }
@@ -200,11 +200,11 @@ EOF
 
     server_addr=10.111.111.2
     client_addr=10.111.111.1
-    printf 'Waiting for the VPN tunnel...\n' >&2
+    printf 'Waiting for the VPN tunnel (up to 30 probes)...\n' >&2
     ready=false
     for ((attempt = 0; attempt < 30; attempt++)); do
         kill -0 "$vpn_a" "$vpn_b" 2>/dev/null || die 'A VPN peer exited during startup'
-        if "${client_prefix[@]}" ping -n -c 1 -W 1 "$server_addr" >/dev/null 2>&1; then
+        if "${client_prefix[@]}" ping -n -c 1 -w 1 -I "$client_addr" "$server_addr" >"$workdir/vpn-probe.log" 2>&1; then
             ready=true
             break
         fi

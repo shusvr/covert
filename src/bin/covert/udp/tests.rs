@@ -365,3 +365,42 @@ async fn encrypted_udp_burst_survives_receive_and_send_batch_boundaries() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn quic_shaped_udp_connects_and_carries_full_mtu_in_both_directions() {
+    fn quic_config(local: u8, peer: u8, address: Option<SocketAddr>) -> Config {
+        let mut config = harness::config(local, &[(peer, address)]);
+        config.interface.listener = ListenerConfig::Quic {
+            quic: UdpListenerConfig { port: 0 },
+        };
+        config.peers[0].transport = PeerTransport::Quic {
+            quic: covert::transport::UdpTransportPeerConfig { endpoint: address },
+        };
+        assert_eq!(
+            config.interface.listener.suggested_mtu(&config.layout),
+            Some(1401)
+        );
+        config
+    }
+
+    let example = include_str!("../../../../config.toml")
+        .replace(
+            "[Interface.Listener.Udp.udp]\nPort = 40676",
+            "[Interface.Listener.Quic]\nPort = 443",
+        )
+        .replace("[Peer.Transport.Udp.udp]", "[Peer.Transport.Quic]");
+    let config: Config = toml_edit::de::from_str(&example).unwrap();
+    assert!(matches!(config.interface.listener, ListenerConfig::Quic { quic } if quic.port == 443));
+    assert!(
+        matches!(&config.peers[0].transport, PeerTransport::Quic { quic } if quic.endpoint.is_some())
+    );
+
+    let (address, mut server) = start(&quic_config(2, 1, None)).await;
+    let (_, mut client) = start(&quic_config(1, 2, Some(address))).await;
+    connected(&client).await;
+    connected(&server).await;
+    client.sender.send(packet(1, 2, 1380)).await.unwrap();
+    server.sender.send(packet(2, 1, 1380)).await.unwrap();
+    assert_eq!(receive(&mut server).await, packet(1, 2, 1380));
+    assert_eq!(receive(&mut client).await, packet(2, 1, 1380));
+}

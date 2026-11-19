@@ -15,11 +15,11 @@ static void transfer(CovertEndpoint *from, CovertEndpoint *to) {
     assert(status == COVERT_EMPTY);
 }
 static void clients(CovertLayout *layout, const uint8_t *ask, const uint8_t *apk,
-        const uint8_t *bsk, const uint8_t *bpk, const uint8_t *shared) {
+        const uint8_t *bsk, const uint8_t *bpk, const uint8_t *shared, uint32_t mode) {
     CovertLiveness live = {0,0,10,0};
     CovertEndpoint *a = NULL, *b = NULL; CovertEndpointStatus status = {0};
-    OK(covert_endpoint_client_new(layout,ask,bpk,shared,&live,COVERT_CLIENT_UDP,&a));
-    OK(covert_endpoint_client_new(layout,bsk,apk,shared,&live,COVERT_CLIENT_UDP,&b));
+    OK(covert_endpoint_client_new(layout,ask,bpk,shared,&live,mode,&a));
+    OK(covert_endpoint_client_new(layout,bsk,apk,shared,&live,mode,&b));
     OK(covert_endpoint_tun_write(a,packet,sizeof(packet)));
     OK(covert_endpoint_status(a,&status));
     assert(status.sent == sizeof(packet) && status.connected == 0 && status.first_established_at == 0);
@@ -84,7 +84,10 @@ int main(void) {
     for(int random=0;random<2;random++) {
         CovertLayout *layout=NULL;
         if(random) OK(covert_layout_random(&layout)); else OK(covert_layout_new(NULL,0,&layout));
-        clients(layout,ask,apk,bsk,bpk,NULL); clients(layout,ask,apk,bsk,bpk,shared);
+        clients(layout,ask,apk,bsk,bpk,NULL,COVERT_CLIENT_UDP);
+        clients(layout,ask,apk,bsk,bpk,shared,COVERT_CLIENT_UDP);
+        clients(layout,ask,apk,bsk,bpk,NULL,COVERT_CLIENT_QUIC_SHAPED_UDP);
+        clients(layout,ask,apk,bsk,bpk,shared,COVERT_CLIENT_QUIC_SHAPED_UDP);
         echo_client(layout,ask,apk,bsk,bpk);
         CovertLiveness live={0,0,10,0}; CovertEndpoint *out=NULL;
         assert(covert_endpoint_client_new(layout,ask,bpk,NULL,&live,99,&out) == COVERT_INVALID && out == NULL);

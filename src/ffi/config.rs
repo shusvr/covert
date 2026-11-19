@@ -244,6 +244,13 @@ pub unsafe extern "C" fn covert_config_set_string(
                                     })?),
                                 },
                             },
+                            PeerTransport::Quic { .. } => PeerTransport::Quic {
+                                quic: UdpTransportPeerConfig {
+                                    endpoint: Some(text.parse().map_err(|_| {
+                                        Error::InvalidArgument("invalid FFI argument")
+                                    })?),
+                                },
+                            },
                             PeerTransport::Icmp { .. } => PeerTransport::Icmp {
                                 icmp: IcmpTransportPeerConfig {
                                     endpoint: Some(text.parse().map_err(|_| {
@@ -254,6 +261,13 @@ pub unsafe extern "C" fn covert_config_set_string(
                             PeerTransport::None => match config.interface.listener {
                                 ListenerConfig::Udp { .. } => PeerTransport::Udp {
                                     udp: UdpTransportPeerConfig {
+                                        endpoint: Some(text.parse().map_err(|_| {
+                                            Error::InvalidArgument("invalid FFI argument")
+                                        })?),
+                                    },
+                                },
+                                ListenerConfig::Quic { .. } => PeerTransport::Quic {
+                                    quic: UdpTransportPeerConfig {
                                         endpoint: Some(text.parse().map_err(|_| {
                                             Error::InvalidArgument("invalid FFI argument")
                                         })?),
@@ -317,7 +331,9 @@ pub unsafe extern "C" fn covert_config_get_string(
                 .collect::<Vec<_>>()
                 .join(","),
             (index, 7) => match &peer(config, index)?.transport {
-                PeerTransport::Udp { udp } => udp.endpoint.ok_or(Error::Empty)?.to_string(),
+                PeerTransport::Udp { udp } | PeerTransport::Quic { quic: udp } => {
+                    udp.endpoint.ok_or(Error::Empty)?.to_string()
+                }
                 PeerTransport::Icmp { icmp } => icmp.endpoint.ok_or(Error::Empty)?.to_string(),
                 PeerTransport::None => return Err(Error::Empty),
             },
@@ -352,6 +368,9 @@ pub unsafe extern "C" fn covert_config_set_u32(
                     0 => ListenerConfig::Udp {
                         udp: UdpListenerConfig { port: 40676 },
                     },
+                    3 => ListenerConfig::Quic {
+                        quic: UdpListenerConfig { port: 40676 },
+                    },
                     1 => ListenerConfig::Icmp {
                         icmp: IcmpListenerConfig {
                             mode: IcmpMode::EchoReply,
@@ -369,11 +388,14 @@ pub unsafe extern "C" fn covert_config_set_u32(
                         icmp: IcmpTransportPeerConfig { endpoint: None },
                     },
                     2 => PeerTransport::None,
+                    3 => PeerTransport::Quic {
+                        quic: UdpTransportPeerConfig { endpoint: None },
+                    },
                     _ => return Err(Error::InvalidArgument("invalid FFI argument")),
                 }
             }
             (INTERFACE, 18) => match &mut config.interface.listener {
-                ListenerConfig::Udp { udp } => {
+                ListenerConfig::Udp { udp } | ListenerConfig::Quic { quic: udp } => {
                     udp.port = value
                         .try_into()
                         .map_err(|_| Error::InvalidArgument("invalid FFI argument"))?
@@ -419,14 +441,18 @@ pub unsafe extern "C" fn covert_config_get_u32(
             (INTERFACE, 17) => match config.interface.listener {
                 ListenerConfig::Udp { .. } => 0,
                 ListenerConfig::Icmp { .. } => 1,
+                ListenerConfig::Quic { .. } => 3,
             },
             (index, 17) => match peer(config, index)?.transport {
                 PeerTransport::Udp { .. } => 0,
                 PeerTransport::Icmp { .. } => 1,
                 PeerTransport::None => 2,
+                PeerTransport::Quic { .. } => 3,
             },
             (INTERFACE, 18) => match &config.interface.listener {
-                ListenerConfig::Udp { udp } => u32::from(udp.port),
+                ListenerConfig::Udp { udp } | ListenerConfig::Quic { quic: udp } => {
+                    u32::from(udp.port)
+                }
                 _ => return Err(Error::InvalidArgument("invalid FFI argument")),
             },
             (INTERFACE, 19) => match &config.interface.listener {
@@ -552,6 +578,15 @@ mod query_tests {
             matches!(config.peers[0].transport, PeerTransport::Udp { ref udp } if udp.endpoint.unwrap().port() == 5551)
         );
         assert_eq!(config.interface.addresses[0].to_string(), "10.111.111.3/32");
+
+        let config = ConfigHandle::from_query(&query.replace("[Udp]", "[Quic]")).unwrap();
+        let reparsed = ConfigHandle::from_query(&config.to_query().unwrap()).unwrap();
+        assert!(
+            matches!(reparsed.interface.listener, ListenerConfig::Quic { quic } if quic.port == 5551)
+        );
+        assert!(
+            matches!(reparsed.peers[0].transport, PeerTransport::Quic { ref quic } if quic.endpoint.unwrap().port() == 5551)
+        );
         assert!(ConfigHandle::from_query(&query.replace("Port]=5551", "Port]=65536")).is_err());
     }
 

@@ -233,6 +233,11 @@ fn add_peer(
                     endpoint: Some(std::net::SocketAddr::new(endpoint, udp.port)),
                 },
             },
+            ListenerConfig::Quic { quic } => PeerTransport::Quic {
+                quic: covert::transport::UdpTransportPeerConfig {
+                    endpoint: Some(std::net::SocketAddr::new(endpoint, quic.port)),
+                },
+            },
             ListenerConfig::Icmp { .. } => PeerTransport::Icmp {
                 icmp: covert::transport::IcmpTransportPeerConfig {
                     endpoint: Some(match endpoint {
@@ -562,7 +567,7 @@ async fn serve(
 ) -> Result<()> {
     let capacity = usize::from(chanlen.unwrap_or(512)).max(1);
     match &config.interface.listener {
-        ListenerConfig::Udp { udp } => {
+        ListenerConfig::Udp { udp } | ListenerConfig::Quic { quic: udp } => {
             let (socket, endpoint) = udp::Udp::bind(config, udp).await?;
             run_endpoint(tun, config, socket, endpoint, capacity, rpc).await
         }

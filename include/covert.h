@@ -107,10 +107,10 @@ int32_t covert_tunnel_local_index(const CovertTunnel *tunnel, uint32_t *out);
  * Strings are UTF-8. Keys use Base64; IP ranges use comma/whitespace-separated
  * numeric CIDRs (bare IPs imply /32 or /128). Empty PSK clears it; empty endpoint
  * selects passive/unspecified transport. Endpoints must already be resolved:
- * UDP uses IP:port ([IPv6]:port), ICMP uses IPv4. Unknown scope/field combinations
- * return INVALID. Invalid setters leave the config unchanged.
- * TRANSPORT is UDP=0/ICMP=1; peers also support unspecified=2. ICMP_MODE is
- * EchoReply=0/OnlyEcho=1. Changing transport initializes its transport defaults;
+ * UDP and QUIC-shaped UDP use IP:port ([IPv6]:port). ICMP uses IPv4. Unknown
+ * scope/field combinations return INVALID. Invalid setters leave the config unchanged.
+ * TRANSPORT is UDP=0, ICMP=1, or QUIC-shaped UDP=3. Peers also support
+ * unspecified=2. ICMP_MODE is EchoReply=0/OnlyEcho=1. Changing transport initializes its transport defaults;
  * configure its port/mode/endpoint afterward. Interface changes do not rewrite
  * peer transports. Optional PSK/endpoint/liveness getters return EMPTY if unset.
  * Liveness u32 fields are optional; clear restores the normal fallback rules.
@@ -146,13 +146,15 @@ int32_t covert_config_validate(const CovertConfig *config, CovertBuffer *error);
 /* Derives the interface public key as Base64 text, without a trailing NUL. */
 int32_t covert_config_public_key(const CovertConfig *config, CovertBuffer *out);
 /* Copies the main Config into a fixed-remote client endpoint. Exactly one peer
- * and UDP or ICMP EchoReply are required. Config can then be edited/freed. */
+ * and UDP, QUIC-shaped UDP, or ICMP EchoReply are required. The config can then
+ * be edited or freed. */
 int32_t covert_endpoint_from_config(const CovertConfig *config, CovertEndpoint **out, CovertBuffer *error);
 
 /* Fixed-remote single-peer client API, backed by the shared Endpoint engine.
  * The host owns/protects/binds the socket and handles UDP or ICMP framing.
  * Both IPv4 and IPv6 IP packets are accepted; select routes in the host VPN.
- * mode: UDP supports either handshake role; ICMP_ECHO_REPLY only initiates and
+ * UDP and QUIC_SHAPED_UDP support either handshake role. Send and receive their
+ * encoded datagrams as UDP payloads. ICMP_ECHO_REPLY only initiates and
  * rejects reflected initiations. ICMP inputs must already be unwrapped replies.
  * Advance once after creation and periodically (e.g. every 100ms). Writes drive
  * immediate work too. Drain both output queues until COVERT_EMPTY each tick.
@@ -164,7 +166,8 @@ int32_t covert_endpoint_from_config(const CovertConfig *config, CovertEndpoint *
  * receive bytes are counted when drained by tun_read. Timestamps are Unix ms,
  * with zero meaning never established. connected is 0 or 1.
  */
-enum { COVERT_CLIENT_UDP = 0, COVERT_CLIENT_ICMP_ECHO_REPLY = 1 };
+enum { COVERT_CLIENT_UDP = 0, COVERT_CLIENT_ICMP_ECHO_REPLY = 1,
+    COVERT_CLIENT_QUIC_SHAPED_UDP = 2 };
 typedef struct {
     uint64_t sent, received, first_established_at, last_established_at;
     uint8_t connected;

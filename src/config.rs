@@ -275,6 +275,7 @@ impl PeerTransport {
 
 make_listen_peer_cfgs!(
     Udp, udp, "Udp", UdpListenerConfig, UdpTransportPeerConfig;
+    Quic, quic, "Quic", UdpListenerConfig, UdpTransportPeerConfig;
     Icmp, icmp, "Icmp", IcmpListenerConfig, IcmpTransportPeerConfig;
 );
 
@@ -285,6 +286,7 @@ impl ListenerConfig {
     pub fn suggested_mtu(&self, layout: &PacketLayout) -> Option<usize> {
         let budget = match self {
             Self::Udp { .. } | Self::Icmp { .. } => 1500 - 28,
+            Self::Quic { .. } => 1500 - 28 - crate::transport::QUIC_DATA_OVERHEAD,
         };
         if usize::from(layout.odp) > budget {
             return Some(0);

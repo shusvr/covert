@@ -11,8 +11,23 @@ use tracing::error;
 use uuid::Uuid;
 
 mod config;
+mod quic;
 pub use crate::state::{PeerStatus, StatusSnapshot};
 pub use config::*;
+pub(crate) use quic::DATA_OVERHEAD as QUIC_DATA_OVERHEAD;
+
+/// Serialize an outbound packet for the selected interface transport.
+pub fn encode_datagram(
+    packet: Packet,
+    listener: &crate::config::ListenerConfig,
+    layout: &codec::PacketLayout,
+) -> Result<bytes::Bytes> {
+    if matches!(listener, crate::config::ListenerConfig::Quic { .. }) {
+        quic::encode(packet, layout)
+    } else {
+        packet.to_bytes(layout)
+    }
+}
 
 pub trait Adapter {
     type Route: Clone;
@@ -109,8 +124,15 @@ impl<A: Adapter> Endpoint<A> {
             .flat_map(|pt| std::iter::from_fn(|| pt.delivered(&self.state)))
     }
 
-    /// Write a packet that came from outside
+    /// Write incoming frames. QUIC-shaped framing requires a single UDP datagram.
     pub fn out_write(&mut self, route: A::Route, mut buf: &[u8]) {
+        if matches!(
+            self.config.interface.listener,
+            crate::config::ListenerConfig::Quic { .. }
+        ) {
+            self.out_write_datagram(route, buf);
+            return;
+        }
         while let Some(res) = codec::parse_slice(buf, &self.config.layout) {
             match res {
                 Ok((packet, len)) => {
@@ -138,6 +160,12 @@ impl<A: Adapter> Endpoint<A> {
 
     /// Process one datagram, reporting whether it was authenticated and accepted.
     pub fn process_datagram(&mut self, route: A::Route, buf: &[u8]) -> Result<bool> {
+        if matches!(
+            self.config.interface.listener,
+            crate::config::ListenerConfig::Quic { .. }
+        ) {
+            return self.process_incoming(route, quic::decode(buf, &self.config.layout)?);
+        }
         match codec::parse_slice(buf, &self.config.layout) {
             Some(Ok((packet, consumed))) if consumed == buf.len() => {
                 self.process_incoming(route, packet)
