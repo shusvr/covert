@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     codec::{Data, DataFlags},
-    config::{Interface, ListenerConfig, PeerTransport},
+    config::{DEFAULT_FWMARK, Interface, ListenerConfig, PeerTransport},
     crypto,
 };
 use std::{cell::RefCell, sync::atomic::Ordering};
@@ -34,6 +34,8 @@ fn endpoint(local: u8, remote: u8, active: bool) -> Endpoint<Capture> {
                 listener: ListenerConfig::Udp {
                     udp: UdpListenerConfig { port: 40676 },
                 },
+                fwmark: DEFAULT_FWMARK,
+                table: false,
             },
             peers: vec![Peer {
                 id: Uuid::new_v4(),

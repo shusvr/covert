@@ -3,7 +3,7 @@ use super::*;
 pub use crate::config::Config as ConfigHandle;
 use crate::{
     codec::PacketLayout,
-    config::{Interface, ListenerConfig, LivenessOptions, Peer, PeerTransport},
+    config::{DEFAULT_FWMARK, Interface, ListenerConfig, LivenessOptions, Peer, PeerTransport},
     transport::{
         IcmpListenerConfig, IcmpMode, IcmpTransportPeerConfig, UdpListenerConfig,
         UdpTransportPeerConfig,
@@ -112,6 +112,8 @@ pub unsafe extern "C" fn covert_config_new(out: *mut *mut ConfigHandle) -> i32 {
                 listener: ListenerConfig::Udp {
                     udp: UdpListenerConfig { port: 40676 },
                 },
+                fwmark: DEFAULT_FWMARK,
+                table: false,
             },
             peers: vec![],
         }));

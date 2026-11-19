@@ -154,6 +154,8 @@ impl LivenessOptions {
     }
 }
 
+pub const DEFAULT_FWMARK: u16 = 0xDEAD;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Interface {
@@ -161,6 +163,10 @@ pub struct Interface {
     pub addresses: Vec<IpNet>,
     #[serde(default = "default_mtu")]
     pub mtu: u16,
+    #[serde(skip, default = "default_fwmark")]
+    pub fwmark: u16,
+    #[serde(skip_serializing, default = "default_on")]
+    pub table: bool,
     pub private_key: PrivKey,
 
     #[serde(flatten)]
@@ -168,6 +174,14 @@ pub struct Interface {
     pub listener: ListenerConfig,
     #[serde(flatten, skip_serializing)]
     pub hooks: InterfaceHooks,
+}
+
+fn default_on() -> bool {
+    true
+}
+
+fn default_fwmark() -> u16 {
+    DEFAULT_FWMARK
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

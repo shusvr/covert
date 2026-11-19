@@ -1,6 +1,7 @@
 //! Fixed-remote client endpoint: the host owns sockets and transport framing.
 use super::*;
 use crate::codec::{Packet, PacketLayout};
+use crate::config::DEFAULT_FWMARK;
 use crate::{
     config::{Config, Interface, ListenerConfig, LivenessOptions, Peer, PeerTransport},
     transport::{Adapter, Endpoint, UdpListenerConfig},
@@ -88,6 +89,8 @@ pub unsafe extern "C" fn covert_endpoint_client_new(
                 listener: ListenerConfig::Udp {
                     udp: UdpListenerConfig { port: 0 },
                 },
+                fwmark: DEFAULT_FWMARK,
+                table: false,
             },
             peers: vec![Peer {
                 id: uuid::Uuid::new_v4(),
