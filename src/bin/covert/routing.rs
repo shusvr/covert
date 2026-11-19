@@ -1,16 +1,18 @@
 use anyhow::{Context, Result};
 use covert::config::Config;
+use futures::StreamExt;
 use rtnetlink::{
     Handle, RouteDelRequest, RouteMessageBuilder, RuleDelRequest,
     packet_route::{
-        route::RouteHeader,
+        route::{RouteAddress, RouteAttribute, RouteHeader},
         rule::{RuleAction, RuleAttribute, RuleFlags},
     },
 };
 use std::{
     hash::{DefaultHasher, Hasher},
-    net::IpAddr,
+    net::{IpAddr, Ipv4Addr},
 };
+use tokio::task::JoinSet;
 use tracing::{debug, error};
 
 #[derive(Default)]
@@ -43,7 +45,7 @@ impl TableCleanup {
 }
 
 pub(super) async fn setup_table(
-    handle: Handle,
+    handle: &Handle,
     config: &Config,
     ifidx: u32,
     cleanup: &mut TableCleanup,
@@ -103,4 +105,53 @@ pub(super) async fn setup_table(
     cleanup.rules.push(del);
 
     Ok(())
+}
+
+pub(super) async fn get_public_ip() -> Result<Option<Ipv4Addr>> {
+    let (conn, handle, _recv) = rtnetlink::new_connection()?;
+    let mut set = JoinSet::new();
+    set.spawn(conn);
+
+    let Some(item) = handle
+        .route()
+        .get(
+            RouteMessageBuilder::<Ipv4Addr>::new()
+                .destination_prefix(Ipv4Addr::from_octets([1; 4]), 32)
+                .build(),
+        )
+        .execute()
+        .next()
+        .await
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+
+    match item.attributes.iter().find_map(|attr| match attr {
+        RouteAttribute::PrefSource(RouteAddress::Inet(addr)) => Some(addr),
+        _ => None,
+    }) {
+        Some(x) if is_global(x) => Ok(Some(*x)),
+        _ => Ok(None),
+    }
+}
+
+fn is_global(x: &Ipv4Addr) -> bool {
+    !(x.octets()[0] == 0 // "This network"
+        || x.is_private()
+        || (x.octets()[0] == 100 && (x.octets()[1] & 0b1100_0000 == 0b0100_0000))
+        || x.is_loopback()
+        || x.is_link_local()
+        // addresses reserved for future protocols (`192.0.0.0/24`)
+        // .9 and .10 are documented as globally reachable so they're excluded
+        || (
+            x.octets()[0] == 192 && x.octets()[1] == 0 && x.octets()[2] == 0
+            && x.octets()[3] != 9 && x.octets()[3] != 10
+        )
+        // 6a44-relay anycast address (`192.88.99.2/32`)
+        || matches!(x.octets(), [192, 88, 99, 2])
+        || x.is_documentation()
+        || (x.octets()[0] == 198 && (x.octets()[1] & 0xfe) == 18)
+        || (x.octets()[0] & 240 == 240 && !x.is_broadcast())
+        || x.is_broadcast())
 }

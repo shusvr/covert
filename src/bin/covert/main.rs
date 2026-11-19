@@ -67,7 +67,7 @@ enum Command {
         config: PathBuf,
         /// Public server IP used by the generated client.
         #[arg(short, long)]
-        endpoint: IpAddr,
+        endpoint: Option<IpAddr>,
         /// Ip for new peer, must be in the interface subnet.
         #[arg(long)]
         ip: Option<IpAddr>,
@@ -160,7 +160,19 @@ async fn main() -> Result<()> {
             output,
             json,
             query,
-        } => peer_config::add_peer(&config, endpoint, output, ip, psk, json, query),
+        } => {
+            let endpoint = if let Some(x) = endpoint {
+                x
+            } else if let Some(x) = routing::get_public_ip().await? {
+                x.into()
+            } else {
+                bail!(
+                    "Couln't get a public ip address from interface & routing alone, use explicit value"
+                )
+            };
+
+            peer_config::add_peer(&config, endpoint, output, ip, psk, json, query)
+        }
     }
 }
 
@@ -295,7 +307,7 @@ async fn run(
 
     let result = async {
         if config.interface.table {
-            routing::setup_table(handle, &config, ifidx, &mut cleanup).await?;
+            routing::setup_table(&handle, &config, ifidx, &mut cleanup).await?;
         }
 
         run_hooks("PostUp", &config.interface.hooks.post_up, &config.dev_name).await?;
