@@ -532,9 +532,9 @@ mod tests {
     #[test]
     fn suggested_mtu_accounts_for_transport_layout_and_padding() {
         for (listener, expected) in [
-            ("Udp = { udp = {} }", Some(1438)),
-            ("Icmp = { icmp = {} }", Some(1438)),
-            ("Icmp = { icmp = { Mode = \"OnlyEcho\" } }", Some(1438)),
+            ("Udp = { udp = {} }", Some(1437)),
+            ("Icmp = { icmp = {} }", Some(1437)),
+            ("Icmp = { icmp = { Mode = \"OnlyEcho\" } }", Some(1437)),
         ] {
             let listener: ListenerConfig = toml_edit::de::from_str(listener).unwrap();
             let mut layout = PacketLayout::default();
@@ -552,7 +552,7 @@ mod tests {
             layout.odd = u8::MAX;
             assert_eq!(
                 listener.suggested_mtu(&layout),
-                Some(1472 - usize::from(u8::MAX) - 16)
+                Some(1472 - usize::from(u8::MAX) - 17)
             );
         }
     }

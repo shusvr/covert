@@ -19,7 +19,7 @@ typedef struct CovertCipher CovertCipher;
 typedef struct CovertTunnel CovertTunnel;
 typedef struct CovertEndpoint CovertEndpoint;
 typedef struct CovertConfig CovertConfig;
-#define COVERT_ABI_VERSION 2u
+#define COVERT_ABI_VERSION 3u
 uint32_t covert_abi_version(void);
 /* Installs Android logcat tracing; no-op on other platforms. */
 void covert_android_init_logging(void);
@@ -76,15 +76,16 @@ int32_t covert_codec_parse(const CovertLayout *layout, const uint8_t *data,
     size_t len, size_t *consumed, CovertPacket **out);
 int32_t covert_codec_encode(const CovertLayout *layout, const CovertPacket *packet,
     CovertBuffer *out);
-/* Data flags: 0 = normal, bit 0 = junk, bit 1 = ping, bit 2 = pong.
- * Scheduled keepalives use ping; receivers echo its plaintext in a pong. */
-int32_t covert_packet_data_new(uint32_t index, uint64_t counter, uint8_t flags,
+/* Data ciphertext is AEAD(payload || flags), including its 16-byte tag.
+ * Flags are the final encrypted byte before the tag: 0 = normal,
+ * bit 0 = junk, bit 1 = ping, bit 2 = pong. Authenticate before reading flags. */
+int32_t covert_packet_data_new(uint32_t index, uint64_t counter,
     const uint8_t *data, size_t len, CovertPacket **out);
 /* Kind: 0 = initiation, 1 = reply, 2 = data. */
 int32_t covert_packet_kind(const CovertPacket *packet, uint32_t *kind);
 /* Returns a copy of the ciphertext; requires a data packet. */
 int32_t covert_packet_data(const CovertPacket *packet, uint32_t *index,
-    uint64_t *counter, uint8_t *flags, CovertBuffer *out);
+    uint64_t *counter, CovertBuffer *out);
 
 int32_t covert_tunnel_new(const CovertLayout *layout, const uint8_t *secret,
     const uint8_t *public_key, const uint8_t *shared, const CovertLiveness *liveness,

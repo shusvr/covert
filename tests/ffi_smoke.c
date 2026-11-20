@@ -56,7 +56,7 @@ int main(void) {
     OK(covert_buffer_free(&plain));
 
     OK(covert_layout_new(NULL, 0, &layout));
-    OK(covert_packet_data_new(17, counter, 0, encrypted.data, encrypted.len, &data));
+    OK(covert_packet_data_new(17, counter, encrypted.data, encrypted.len, &data));
     OK(covert_codec_encode(layout, data, &wire));
     assert(covert_codec_parse(layout, wire.data, 1, &consumed, &parsed) == COVERT_EMPTY);
     assert(consumed == 0 && parsed == NULL);
@@ -64,8 +64,8 @@ int main(void) {
     assert(consumed == wire.len);
     OK(covert_packet_kind(parsed, &kind));
     assert(kind == 2);
-    OK(covert_packet_data(parsed, &index, &timestamp, &flags, &copy));
-    assert(index == 17 && timestamp == counter && flags == 0);
+    OK(covert_packet_data(parsed, &index, &timestamp, &copy));
+    assert(index == 17 && timestamp == counter);
     assert(copy.len == encrypted.len && memcmp(copy.data, encrypted.data, copy.len) == 0);
     OK(covert_buffer_free(&copy));
     OK(covert_buffer_free(&wire));

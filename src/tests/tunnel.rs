@@ -182,7 +182,15 @@ fn keepalive_ping_returns_pong_without_delivering_plaintext() {
     let Packet::Data(mut data) = codec::parse(&mut buf, &initiator.layout).unwrap().unwrap() else {
         panic!("expected keepalive data");
     };
-    assert_eq!(data.flags.bits(), DataFlags::PING.bits());
+    let State::Established { cipher, .. } = &responder.state else {
+        unreachable!()
+    };
+    assert_eq!(
+        cipher
+            .decrypt(data.counter, data.ciphertext.clone())
+            .unwrap(),
+        vec![DataFlags::PING.bits()]
+    );
     data.ciphertext[0] ^= 1;
     let tampered = Packet::Data(data).to_bytes(&initiator.layout).unwrap();
     let seen = match responder.state {
@@ -206,7 +214,15 @@ fn keepalive_ping_returns_pong_without_delivering_plaintext() {
     let Packet::Data(data) = codec::parse(&mut buf, &responder.layout).unwrap().unwrap() else {
         panic!("expected keepalive pong");
     };
-    assert_eq!(data.flags.bits(), DataFlags::PONG.bits());
+    let State::Established { cipher, .. } = &initiator.state else {
+        unreachable!()
+    };
+    assert_eq!(
+        cipher
+            .decrypt(data.counter, data.ciphertext.clone())
+            .unwrap(),
+        vec![DataFlags::PONG.bits()]
+    );
     assert!(responder.read_outbound().unwrap().is_none());
     initiator.write_incoming(&pong);
     initiator.process_new_packets(true).unwrap();
@@ -346,7 +362,6 @@ fn parsed_data_checks_index_and_authentication_before_delivery() {
     };
     let wrong_index = Data {
         receiver_idx: data.receiver_idx ^ 1,
-        flags: DataFlags::empty(),
         counter: data.counter,
         ciphertext: data.ciphertext.clone(),
     };
@@ -366,7 +381,6 @@ fn parsed_data_checks_index_and_authentication_before_delivery() {
     responder
         .process_incoming_packet(Packet::Data(Data {
             receiver_idx: responder.local_index().unwrap(),
-            flags: DataFlags::empty(),
             counter: 1,
             ciphertext,
         }))
@@ -422,4 +436,77 @@ fn configured_tunnel_stays_passive_until_explicitly_initiated() {
         Some(Packet::Initiating(_))
     ));
     assert_eq!(tunnel.queue.front().unwrap(), b"waiting for a route");
+}
+
+#[test]
+fn encrypted_flags_and_tag_must_authenticate_before_any_session_effect() {
+    for layout in [PacketLayout::default(), PacketLayout::random()] {
+        let (mut sender, mut receiver) = pair(layout);
+        establish(&mut sender, &mut receiver);
+        sender.push_packet(b"protected payload");
+        sender.process_new_packets(true).unwrap();
+        let Packet::Data(data) = sender.read_outbound_packet().unwrap() else {
+            panic!("expected encrypted data");
+        };
+        let (seen, deadline) = match receiver.state {
+            State::Established {
+                last_seen, next_ka, ..
+            } => (last_seen, next_ka),
+            _ => unreachable!(),
+        };
+        // Corrupt payload, encrypted flags, and tag independently.
+        for offset in [0, data.ciphertext.len() - 17, data.ciphertext.len() - 1] {
+            let mut ciphertext = data.ciphertext.clone();
+            ciphertext[offset] ^= 1;
+            assert!(
+                receiver
+                    .process_incoming_packet(Packet::Data(Data {
+                        receiver_idx: data.receiver_idx,
+                        counter: data.counter,
+                        ciphertext,
+                    }))
+                    .is_err()
+            );
+            assert!(receiver.read_packet().is_none());
+            assert!(receiver.read_outbound_packet().is_none());
+            assert!(
+                matches!(receiver.state, State::Established { last_seen, next_ka, .. }
+                if last_seen == seen && next_ka == deadline)
+            );
+        }
+        // The former cleartext flags offset is now padding.
+        let mut wire = Packet::Data(data).to_bytes(&layout).unwrap().to_vec();
+        wire[usize::from(layout.odf)] ^= DataFlags::PING.bits();
+        receiver.write_incoming(&wire);
+        receiver.process_new_packets(true).unwrap();
+        assert_eq!(receiver.read_packet().unwrap(), b"protected payload");
+        assert!(receiver.read_outbound_packet().is_none());
+    }
+}
+
+#[test]
+fn authenticated_data_requires_a_trailing_flags_byte() {
+    let (mut sender, mut receiver) = pair(PacketLayout::default());
+    establish(&mut sender, &mut receiver);
+    let State::Established {
+        cipher,
+        receiver_idx,
+        ..
+    } = &sender.state
+    else {
+        unreachable!()
+    };
+    let (counter, ciphertext) = cipher.encrypt(Vec::new()).unwrap();
+    let receiver_idx = *receiver_idx;
+    assert!(
+        receiver
+            .process_incoming_packet(Packet::Data(Data {
+                receiver_idx,
+                counter,
+                ciphertext,
+            }))
+            .is_err()
+    );
+    assert!(receiver.read_packet().is_none());
+    assert!(receiver.read_outbound_packet().is_none());
 }

@@ -65,7 +65,7 @@ mkconfig! {
     orp: u16,   // (replying) pad to this len
     odri: u8,  // (data) offset of receiver index
     odct: u8,  // (data) offset of counter
-    odf: u8,   // (data) offset of flags
+    odf: u8,   // (data) reserved byte retained for existing layout definitions
     oddl: u8,  // (data) offset of data length
     odd: u8,   // (data) offset of data itself
     odp: u16,   // (data) pad to this minimum total length
@@ -257,7 +257,6 @@ bitflags! {
 #[derive(Debug)]
 pub struct Data {
     pub receiver_idx: u32,
-    pub flags: DataFlags,
     pub counter: u64,
     pub ciphertext: Vec<u8>,
 }
@@ -342,9 +341,6 @@ pub fn parse_slice(buf: &[u8], layout: &PacketLayout) -> Option<Result<(Packet, 
                 u32::from_be_bytes(get_masked_at(buf, usize::from(layout.odri), layout.mask)?);
             let counter =
                 u64::from_be_bytes(get_masked_at(buf, usize::from(layout.odct), layout.mask)?);
-            let flags = DataFlags::from_bits_retain(
-                get_masked_at::<1>(buf, usize::from(layout.odf), layout.mask)?[0],
-            );
             let len =
                 u32::from_be_bytes(get_masked_at(buf, usize::from(layout.oddl), layout.mask)?);
             let end = usize::from(layout.odd).checked_add(usize::try_from(len).ok()?)?;
@@ -363,7 +359,6 @@ pub fn parse_slice(buf: &[u8], layout: &PacketLayout) -> Option<Result<(Packet, 
             return Some(Ok((
                 Packet::Data(Data {
                     receiver_idx,
-                    flags,
                     counter,
                     ciphertext: data,
                 }),
@@ -463,7 +458,6 @@ pub fn append(buf: &mut BytesMut, packet: Packet, layout: &PacketLayout) -> Resu
         }
         Packet::Data(Data {
             receiver_idx,
-            flags,
             counter,
             ciphertext: data,
         }) => {
@@ -479,7 +473,6 @@ pub fn append(buf: &mut BytesMut, packet: Packet, layout: &PacketLayout) -> Resu
                 &counter.to_be_bytes(),
                 layout.mask,
             );
-            put_masked_at(out, usize::from(layout.odf), &[flags.bits()], layout.mask);
             put_masked_at(
                 out,
                 usize::from(layout.oddl),

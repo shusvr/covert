@@ -39,14 +39,16 @@
 # Encrypted data fields (also used for ping/pong keepalives):
 #   odri    Default 1. Offset of the 4-byte receiver's local session index.
 #   odctr   Default 5. Offset of the 8-byte encryption counter/nonce value.
-#   odf     Default 13. Offset of the 1-byte flags bitset. Bit 0 (value 1)
-#           marks junk, bit 1 (2) marks ping, and bit 2 (4) marks pong.
+#   odf     Default 13. Reserved padding byte from older layout definitions.
+#           Flags are now the last plaintext byte before AEAD encryption.
+#           Bit 0 (1) marks junk, bit 1 (2) marks ping, bit 2 (4) marks pong.
 #           Ordinary data uses zero flags. Keepalives send ping and receive pong.
 #   oddl    Default 14. Offset of the 4-byte ciphertext length in bytes,
-#           including the authentication tag, excluding headers and padding.
+#           including encrypted flags and the tag, excluding headers and padding.
 #   odd     Default 18. Start of the variable-length encrypted payload,
 #           including its authentication tag. Everything from this offset
-#           onward is reserved for payload, so fixed data fields must precede it.
+#           onward holds encrypted payload, encrypted flags, then the 16-byte tag.
+#           Fixed data fields must precede it. Both peers require this wire format.
 #
 # Multi-byte integer fields use big-endian byte order before XOR masking.
 # Offsets may overlap between different packet types, but fields in the same

@@ -28,9 +28,20 @@ repository's build script, and packages the resulting library alongside
 `libcovert_jni.so`. JNI links against the canonical header in this checkout and
 checks `covert_abi_version()` against `COVERT_ABI_VERSION` on load.
 
-The C ABI is version 2. In particular, the legacy `covert_tunnel_process` now
-explicitly takes a `uint8_t flush_on_error` (0 or 1), matching the Rust API.
-Consumers must rebuild against the matching header and library together.
+The C ABI is version 3. Data packets carry AEAD encryption of the payload followed
+by one flags byte, with the authentication tag appended after both. The receiver
+authenticates the entire ciphertext before reading the flags. This wire format
+requires matching builds on both peers. The old layout offset `odf` remains
+reserved padding so existing layout strings can still be loaded.
+
+`CovertPacket` data handles expose receiver index, counter, and the complete
+ciphertext including encrypted flags and the tag. The `flags` arguments have
+been removed from `covert_packet_data_new` and `covert_packet_data`. Low-level
+cipher functions encrypt arbitrary bytes. Callers constructing data packets
+must append the plaintext flags byte before calling `covert_crypto_encrypt`,
+and strip that byte after a successful `covert_crypto_decrypt`.
+
+Rebuild C/JNI consumers against the matching header and library together.
 
 ## Rust errors
 

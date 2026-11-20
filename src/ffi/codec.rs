@@ -1,6 +1,6 @@
 //! Packet layouts, encoding, decoding and packet handles.
 use super::*;
-use crate::codec::{self, Data, DataFlags, Packet, PacketLayout};
+use crate::codec::{self, Data, Packet, PacketLayout};
 free_handle!(covert_layout_free, PacketLayout);
 free_handle!(covert_packet_free, Packet);
 
@@ -11,7 +11,6 @@ pub(super) fn clone_packet(p: &Packet) -> Packet {
         Packet::Data(p) => Packet::Data(Data {
             receiver_idx: p.receiver_idx,
             counter: p.counter,
-            flags: DataFlags::from_bits_retain(p.flags.bits()),
             ciphertext: p.ciphertext.clone(),
         }),
     }
@@ -96,7 +95,6 @@ pub unsafe extern "C" fn covert_codec_encode(
 pub unsafe extern "C" fn covert_packet_data_new(
     index: u32,
     counter: u64,
-    flags: u8,
     data: *const u8,
     len: usize,
     out: *mut *mut Packet,
@@ -104,12 +102,9 @@ pub unsafe extern "C" fn covert_packet_data_new(
     guard(|| {
         let out = unsafe { get_mut(out)? };
         *out = ptr::null_mut();
-        let flags =
-            DataFlags::from_bits(flags).ok_or(Error::InvalidArgument("invalid FFI argument"))?;
         let p = Packet::Data(Data {
             receiver_idx: index,
             counter,
-            flags,
             ciphertext: unsafe { bytes(data, len)? }.to_vec(),
         });
         *out = Box::into_raw(Box::new(p));
@@ -133,20 +128,17 @@ pub unsafe extern "C" fn covert_packet_data(
     packet: *const Packet,
     index: *mut u32,
     counter: *mut u64,
-    flags: *mut u8,
     out: *mut Buffer,
 ) -> i32 {
     guard(|| {
         let index = unsafe { get_mut(index)? };
         let counter = unsafe { get_mut(counter)? };
-        let flags = unsafe { get_mut(flags)? };
         let out = unsafe { get_mut(out)? };
         let Packet::Data(p) = (unsafe { get(packet)? }) else {
             return Err(Error::InvalidArgument("invalid FFI argument"));
         };
         *index = p.receiver_idx;
         *counter = p.counter;
-        *flags = p.flags.bits();
         output(out, p.ciphertext.clone());
         Ok(())
     })

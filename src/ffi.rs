@@ -113,7 +113,7 @@ pub use tunnel::*;
 /// Increment for incompatible changes to the public C ABI.
 #[unsafe(no_mangle)]
 pub extern "C" fn covert_abi_version() -> u32 {
-    2
+    3
 }
 
 #[cfg(test)]

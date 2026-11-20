@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use crate::Result;
+use crate::{Error, Result};
 use bytes::{Bytes, BytesMut};
 use tracing::{debug, info, trace, warn};
 
@@ -100,7 +100,7 @@ impl Tunnel {
     }
 
     pub fn push_packet(&mut self, packet: &[u8]) {
-        let mut buf = Vec::with_capacity(packet.len() + 16);
+        let mut buf = Vec::with_capacity(packet.len() + 17);
         buf.extend_from_slice(packet);
         self.queue.push_back(buf);
         trace!(
@@ -172,7 +172,6 @@ impl Tunnel {
             }
             Packet::Data(Data {
                 receiver_idx: incoming_idx,
-                flags,
                 counter,
                 ciphertext,
             }) => {
@@ -206,10 +205,13 @@ impl Tunnel {
                     } else {
                         // conn is live, decrypt
 
-                        let plaintext = cipher.decrypt(counter, ciphertext).inspect_err(|err| {
-                            debug!(local_idx = *local_idx, counter, %err,
+                        let mut plaintext =
+                            cipher.decrypt(counter, ciphertext).inspect_err(|err| {
+                                debug!(local_idx = *local_idx, counter, %err,
                                 "Rejected data: authentication or counter validation failed");
-                        })?;
+                            })?;
+                        let flags = plaintext.pop().ok_or(Error::MalformedDatagram)?;
+                        let flags = DataFlags::from_bits(flags).ok_or(Error::MalformedDatagram)?;
                         trace!(
                             local_idx = *local_idx,
                             counter,
@@ -218,15 +220,12 @@ impl Tunnel {
                             "Authenticated incoming data"
                         );
                         if flags.contains(DataFlags::PING) {
-                            let (counter, ciphertext) = cipher.encrypt(plaintext)?;
-
-                            let data = Data {
-                                receiver_idx: *receiver_idx,
-                                flags: DataFlags::PONG,
-                                counter,
-                                ciphertext,
-                            };
-                            self.outbound.push_back(Packet::Data(data));
+                            self.outbound.push_back(encrypt_data(
+                                cipher,
+                                *receiver_idx,
+                                plaintext,
+                                DataFlags::PONG,
+                            )?);
                             *next_ka = now + Duration::from_millis(self.liveness.next_ka());
 
                             trace!("Received ping, replying with pong");
@@ -356,39 +355,27 @@ impl Tunnel {
                     let mut added = false;
                     while let Some(packet) = self.queue.pop_front() {
                         let plaintext_len = packet.len();
-                        let (counter, ciphertext) = cipher
-                            .encrypt(packet)
+                        let data = encrypt_data(cipher, *receiver_idx, packet, DataFlags::empty())
                             .inspect_err(|err| warn!(%err, "Failed to encrypt queued packet"))?;
                         trace!(
                             receiver_idx = *receiver_idx,
-                            counter, plaintext_len, "Encrypted outgoing data"
+                            plaintext_len, "Encrypted outgoing data"
                         );
-                        let data = Data {
-                            receiver_idx: *receiver_idx,
-                            flags: DataFlags::empty(),
-                            counter,
-                            ciphertext,
-                        };
-                        self.outbound.push_back(Packet::Data(data));
+                        self.outbound.push_back(data);
                         added = true;
                     }
 
                     // if we aren't sending data, see if we need to send ka
                     if !added && now > *next_ka {
-                        let (counter, ciphertext) = cipher
-                            .encrypt(Vec::with_capacity(16))
-                            .inspect_err(|err| warn!(%err, "Failed to encrypt keepalive"))?;
-                        trace!(
-                            receiver_idx = *receiver_idx,
-                            counter, "Queued keepalive ping"
-                        );
-                        let data = Data {
-                            receiver_idx: *receiver_idx,
-                            flags: DataFlags::PING,
-                            counter,
-                            ciphertext,
-                        };
-                        self.outbound.push_back(Packet::Data(data));
+                        let data = encrypt_data(
+                            cipher,
+                            *receiver_idx,
+                            Vec::with_capacity(17),
+                            DataFlags::PING,
+                        )
+                        .inspect_err(|err| warn!(%err, "Failed to encrypt keepalive"))?;
+                        trace!(receiver_idx = *receiver_idx, "Queued keepalive ping");
+                        self.outbound.push_back(data);
                         *next_ka = now + Duration::from_millis(self.liveness.next_ka());
                     } else if added {
                         *next_ka = now + Duration::from_millis(self.liveness.next_ka());
@@ -494,6 +481,22 @@ fn timestamp() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+/// Seal the payload and trailing flags byte in one AEAD operation.
+fn encrypt_data(
+    cipher: &Cipher,
+    receiver_idx: u32,
+    mut payload: Vec<u8>,
+    flags: DataFlags,
+) -> Result<Packet> {
+    payload.push(flags.bits());
+    let (counter, ciphertext) = cipher.encrypt(payload)?;
+    Ok(Packet::Data(Data {
+        receiver_idx,
+        counter,
+        ciphertext,
+    }))
 }
 
 #[cfg(test)]

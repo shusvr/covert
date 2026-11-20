@@ -1,10 +1,7 @@
 use super::*;
 use crate::network::tests::{self as harness, Node, connected, packet, receive};
 use covert::codec::{self, PacketLayout};
-use covert::{
-    codec::{Data, DataFlags},
-    tunnel::Tunnel,
-};
+use covert::{codec::Data, tunnel::Tunnel};
 use tokio::time::{Duration, timeout};
 
 async fn start(config: &Config) -> (SocketAddr, Node) {
@@ -51,7 +48,6 @@ async fn malformed_datagrams_do_not_poison_live_sessions() {
     let bogus = Packet::Data(Data {
         receiver_idx: 123,
         counter: 1,
-        flags: DataFlags::empty(),
         ciphertext: vec![0; 16],
     })
     .to_bytes(&cfg.layout)
@@ -290,7 +286,6 @@ async fn flush_handles_multiple_batches_and_partial_sends_without_duplicates() {
                 Packet::Data(Data {
                     receiver_idx: 1,
                     counter: 9999,
-                    flags: DataFlags::empty(),
                     ciphertext: vec![0; 65536],
                 }),
             );
@@ -300,7 +295,6 @@ async fn flush_handles_multiple_batches_and_partial_sends_without_duplicates() {
             Packet::Data(Data {
                 receiver_idx: 1,
                 counter: i as u64,
-                flags: DataFlags::empty(),
                 ciphertext: vec![i as u8; 16],
             }),
         );
@@ -378,7 +372,7 @@ async fn quic_shaped_udp_connects_and_carries_full_mtu_in_both_directions() {
         };
         assert_eq!(
             config.interface.listener.suggested_mtu(&config.layout),
-            Some(1401)
+            Some(1400)
         );
         config
     }

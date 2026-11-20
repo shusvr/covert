@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     Error,
-    codec::{self, Data, DataFlags},
+    codec::{self, Data},
     config::{DEFAULT_FWMARK, Interface, ListenerConfig, PeerTransport},
     crypto,
 };
@@ -79,7 +79,6 @@ fn index(endpoint: &Endpoint<Capture>) -> u32 {
 fn invalid_data(receiver_idx: u32) -> Packet {
     Packet::Data(Data {
         receiver_idx,
-        flags: DataFlags::empty(),
         counter: 1,
         ciphertext: vec![0; 16],
     })

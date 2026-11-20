@@ -171,7 +171,7 @@ fn initial_header_len(wire: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::{Data, DataFlags};
+    use crate::codec::Data;
 
     #[test]
     fn initial_has_version_and_length_and_rejects_changed_framing() {
@@ -215,7 +215,6 @@ mod tests {
         let data = || {
             Packet::Data(Data {
                 receiver_idx: 85,
-                flags: DataFlags::empty(),
                 counter: 4,
                 ciphertext: vec![7; 16],
             })

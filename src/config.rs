@@ -300,7 +300,7 @@ impl ListenerConfig {
         Some(
             budget
                 .saturating_sub(usize::from(layout.odd))
-                .saturating_sub(16),
+                .saturating_sub(17),
         )
     }
 }

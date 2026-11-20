@@ -144,7 +144,7 @@ fn test_parse_data() {
             for (i, byte) in (payload.len() as u32).to_be_bytes().into_iter().enumerate() {
                 packet[usize::from(layout.oddl) + i] = byte ^ mask.to_be_bytes()[i % 4];
             }
-            packet[usize::from(layout.odf)] = DataFlags::JUNK.bits() ^ mask.to_be_bytes()[0];
+            packet[usize::from(layout.odf)] = 0x81; // Reserved byte is ignored.
             packet.extend_from_slice(payload);
             let expected_len = packet.len();
             for len in 0..expected_len {
@@ -158,7 +158,6 @@ fn test_parse_data() {
             let mut buf = BytesMut::from(with_trailing.as_slice());
             let Packet::Data(Data {
                 receiver_idx,
-                flags,
                 counter,
                 ciphertext: data,
             }) = parse(&mut buf, &layout).unwrap().unwrap()
@@ -167,7 +166,7 @@ fn test_parse_data() {
             };
             assert_eq!(receiver_idx, 0x12345678);
             assert_eq!(counter, 0x0123456789abcdef);
-            assert_eq!(flags.bits(), DataFlags::JUNK.bits());
+
             assert_eq!(data, payload);
             assert_eq!(&buf[..], b"trailing");
         }
@@ -241,7 +240,6 @@ fn test_padding_lengths_and_partial_packets() {
             (
                 Packet::Data(Data {
                     receiver_idx: 2,
-                    flags: DataFlags::empty(),
                     counter: 1,
                     ciphertext: vec![3; 10],
                 }),
@@ -322,7 +320,6 @@ fn test_encode_round_trip() {
             codec
                 .encode(
                     Packet::Data(Data {
-                        flags: DataFlags::from_bits_retain(0x81),
                         receiver_idx: 0x12345678,
                         counter: u64::MAX,
                         ciphertext: data,
@@ -349,7 +346,6 @@ fn test_encode_round_trip() {
         for expected in [&b"payload"[..], &b""[..]] {
             let Some(Packet::Data(Data {
                 receiver_idx,
-                flags,
                 counter,
                 ciphertext: data,
             })) = codec.decode(&mut buf).unwrap()
@@ -358,7 +354,7 @@ fn test_encode_round_trip() {
             };
             assert_eq!(receiver_idx, 0x12345678);
             assert_eq!(counter, u64::MAX);
-            assert_eq!(flags.bits(), 0x81);
+
             assert_eq!(data, expected);
         }
         assert!(buf.is_empty());
@@ -419,7 +415,6 @@ fn narrow_offsets_are_widened_before_size_arithmetic() {
         Packet::Data(Data {
             receiver_idx: 1,
             counter: 2,
-            flags: DataFlags::empty(),
             ciphertext: vec![7; 1500],
         }),
     ] {
