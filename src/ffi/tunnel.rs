@@ -81,7 +81,11 @@ pub unsafe extern "C" fn covert_tunnel_process_packet(
     t: *mut Tunnel,
     packet: *const Packet,
 ) -> i32 {
-    guard(|| unsafe { get_mut(t)? }.process_incoming_packet(clone_packet(unsafe { get(packet)? })))
+    guard(|| {
+        unsafe { get_mut(t)? }
+            .process_incoming_packet(clone_packet(unsafe { get(packet)? }))
+            .map(|_| ())
+    })
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn covert_tunnel_read_outbound(t: *mut Tunnel, out: *mut Buffer) -> i32 {

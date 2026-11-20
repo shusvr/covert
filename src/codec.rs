@@ -248,7 +248,9 @@ impl PacketLayout {
 bitflags! {
     #[derive(Debug)]
     pub struct DataFlags : u8 {
-        const JUNK = 1;
+        const JUNK = 1 << 0;
+        const PING = 1 << 1;
+        const PONG = 1 << 2;
     }
 }
 

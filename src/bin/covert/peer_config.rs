@@ -233,7 +233,7 @@ fn replace_config(path: &Path, original: &str, updated: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Cli;
+    use crate::{Cli, Command};
     use base64::prelude::*;
     use clap::Parser;
 
@@ -414,8 +414,12 @@ mod tests {
     }
 
     #[test]
-    fn addpeer_flags_require_endpoint_and_reject_conflicting_formats() {
-        assert!(Cli::try_parse_from(["covert", "addpeer", "server.toml"]).is_err());
+    fn addpeer_flags_allow_endpoint_discovery_and_reject_conflicting_formats() {
+        let cli = Cli::try_parse_from(["covert", "addpeer", "server.toml"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Addpeer { endpoint: None, .. }
+        ));
         assert!(
             Cli::try_parse_from([
                 "covert",

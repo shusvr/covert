@@ -184,7 +184,7 @@ impl<A: Adapter> Endpoint<A> {
             let accepted = if let Some(decoded) = inv {
                 pt.tunnel.accept_initiation(decoded)?
             } else {
-                pt.tunnel.process_incoming_packet_accepted(packet)?
+                pt.tunnel.process_incoming_packet(packet)?
             };
             if accepted {
                 self.adapter.route_changed(

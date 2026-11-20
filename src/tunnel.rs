@@ -148,12 +148,8 @@ impl Tunnel {
 
     /// Process an already decoded packet without buffering or parsing its bytes.
     /// Call `process_new_packets` afterward to handle outgoing work.
-    pub fn process_incoming_packet(&mut self, packet: Packet) -> Result<()> {
-        self.process_incoming_packet_accepted(packet).map(|_| ())
-    }
-
-    /// True only when this packet was authenticated and accepted by the session.
-    pub(crate) fn process_incoming_packet_accepted(&mut self, packet: Packet) -> Result<bool> {
+    /// Returns `true` only when this packet was authenticated and accepted by the session.
+    pub fn process_incoming_packet(&mut self, packet: Packet) -> Result<bool> {
         match packet {
             Packet::Initiating(initiating) => {
                 let decoded = DecodedInitiation::decode(&self.local_sk, initiating)?;
@@ -186,6 +182,7 @@ impl Tunnel {
                     local_idx,
                     established,
                     last_seen: seen,
+                    receiver_idx,
                     ..
                 } = &mut self.state
                 {
@@ -212,17 +209,28 @@ impl Tunnel {
                             debug!(local_idx = *local_idx, counter, %err,
                                 "Rejected data: authentication or counter validation failed");
                         })?;
-                        let keepalive = flags.contains(DataFlags::JUNK);
                         trace!(
                             local_idx = *local_idx,
                             counter,
-                            keepalive,
+                            ?flags,
                             plaintext_len = plaintext.len(),
                             "Authenticated incoming data"
                         );
-                        if !keepalive {
+                        if flags.contains(DataFlags::PING) {
+                            let (counter, ciphertext) = cipher.encrypt(plaintext)?;
+
+                            let data = Data {
+                                receiver_idx: *receiver_idx,
+                                flags: DataFlags::PONG,
+                                counter,
+                                ciphertext,
+                            };
+                            self.outbound.push_back(Packet::Data(data));
+                            trace!("Received ping, replying with pong");
+                        } else if !flags.intersects(DataFlags::JUNK | DataFlags::PONG) {
                             self.decrypted.push_back(plaintext);
                         }
+
                         *seen = now;
                         return Ok(true);
                     }
