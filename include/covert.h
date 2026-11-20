@@ -76,7 +76,8 @@ int32_t covert_codec_parse(const CovertLayout *layout, const uint8_t *data,
     size_t len, size_t *consumed, CovertPacket **out);
 int32_t covert_codec_encode(const CovertLayout *layout, const CovertPacket *packet,
     CovertBuffer *out);
-/* Data flags: 0 = normal, 1 = junk/keepalive. */
+/* Data flags: 0 = normal, bit 0 = junk, bit 1 = ping, bit 2 = pong.
+ * Scheduled keepalives use ping; receivers echo its plaintext in a pong. */
 int32_t covert_packet_data_new(uint32_t index, uint64_t counter, uint8_t flags,
     const uint8_t *data, size_t len, CovertPacket **out);
 /* Kind: 0 = initiation, 1 = reply, 2 = data. */

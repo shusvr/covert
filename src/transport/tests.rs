@@ -509,6 +509,13 @@ fn maintenance_emits_keepalives_without_plaintext_or_byte_counters() {
     assert!(b.tun_read().next().is_none());
     assert_eq!(sent(&a), 0);
     assert_eq!(received(&b), 0);
+    let pong = take_wire(&b);
+    assert_eq!(pong.len(), 1);
+    a.out_write(1, &pong[0].1);
+    assert!(a.tun_read().next().is_none());
+    assert!(take_wire(&a).is_empty());
+    assert_eq!(sent(&b), 0);
+    assert_eq!(received(&a), 0);
 }
 
 #[test]

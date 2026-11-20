@@ -9,8 +9,8 @@ Usage: scripts/run-local-peer.sh examples/ex1.toml
 
 Run the two example peers in separate terminals, in either order.
 The first invocation creates two network namespaces joined by a veth pair.
-Temporary config copies use that link for their endpoints. Original configs
-are preserved. Ctrl+C stops a peer. --cleanup removes the network after both
+Temporary config copies rewrite existing endpoints to use that link.
+Peers without endpoints stay passive. Ctrl+C stops a peer. --cleanup removes the network after both
 peers have stopped.
 
 Run as your normal user. Network setup and Covert use sudo.
@@ -141,7 +141,7 @@ if port != 5551:
 transport = peers[0].get("Transport", {})
 if transport and set(transport) != {"Udp"}:
     raise SystemExit("Local examples must use UDP peers")
-if transport:
+if transport.get("Udp", {}).get("Endpoint") is not None:
     pattern = r'(^\[Peer\.Transport\.Udp\][^\n]*\n)(.*?)(?=^\[|\Z)'
     def endpoint(match):
         body = re.sub(r'^\s*Endpoint\s*=.*\n?', '', match[2], flags=re.MULTILINE)
@@ -149,11 +149,9 @@ if transport:
     text, count = re.subn(pattern, endpoint, text, flags=re.MULTILINE | re.DOTALL)
     if count != 1:
         raise SystemExit("Could not locate the UDP peer table")
-else:
-    text += f'\n[Peer.Transport.Udp]\nEndpoint = "{remote}:{port}"\n'
 tomllib.loads(text)
 pathlib.Path(destination).write_text(text)
 PY
 
 printf 'Running ex%s in %s. Ctrl+C stops this peer.\n' "$peer" "$namespace"
-"${root[@]}" ip netns exec "$namespace" "$repo/target/release/covert" -v run "$workdir/ex$peer.toml"
+"${root[@]}" ip netns exec "$namespace" "$repo/target/release/covert" -vv run "$workdir/ex$peer.toml"

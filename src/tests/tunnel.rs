@@ -170,7 +170,7 @@ fn wrong_psk_cannot_establish_initiator() {
 }
 
 #[test]
-fn keepalive_is_authenticated_discarded_and_rescheduled() {
+fn keepalive_ping_returns_pong_without_delivering_plaintext() {
     let (mut initiator, mut responder) = pair(PacketLayout::default());
     establish(&mut initiator, &mut responder);
     if let State::Established { next_ka, .. } = &mut initiator.state {
@@ -182,7 +182,7 @@ fn keepalive_is_authenticated_discarded_and_rescheduled() {
     let Packet::Data(mut data) = codec::parse(&mut buf, &initiator.layout).unwrap().unwrap() else {
         panic!("expected keepalive data");
     };
-    assert!(data.flags.contains(DataFlags::JUNK));
+    assert_eq!(data.flags.bits(), DataFlags::PING.bits());
     data.ciphertext[0] ^= 1;
     let tampered = Packet::Data(data).to_bytes(&initiator.layout).unwrap();
     let seen = match responder.state {
@@ -192,10 +192,25 @@ fn keepalive_is_authenticated_discarded_and_rescheduled() {
     responder.write_incoming(&tampered);
     assert!(responder.process_new_packets(true).is_err());
     assert!(matches!(responder.state, State::Established { last_seen, .. } if last_seen == seen));
+    // A due keepalive must be postponed when the response is queued.
+    if let State::Established { next_ka, .. } = &mut responder.state {
+        *next_ka = Instant::now() - Duration::from_secs(1);
+    }
     responder.write_incoming(&wire);
     responder.process_new_packets(true).unwrap();
     assert!(responder.read_packet().is_none());
+    assert!(matches!(responder.state, State::Established { next_ka, .. }
+        if next_ka > Instant::now()));
+    let pong = responder.read_outbound().unwrap().unwrap();
+    let mut buf = BytesMut::from(pong.as_ref());
+    let Packet::Data(data) = codec::parse(&mut buf, &responder.layout).unwrap().unwrap() else {
+        panic!("expected keepalive pong");
+    };
+    assert_eq!(data.flags.bits(), DataFlags::PONG.bits());
+    assert!(responder.read_outbound().unwrap().is_none());
+    initiator.write_incoming(&pong);
     initiator.process_new_packets(true).unwrap();
+    assert!(initiator.read_packet().is_none());
     assert!(initiator.read_outbound().unwrap().is_none());
     transfer(&mut initiator, &mut responder, b"after keepalive");
 }

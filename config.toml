@@ -36,11 +36,12 @@
 # A 16-byte AEAD tag follows the last reply field (including oty), before
 # optional padding. Its offset is automatic; the default reply is 57 bytes.
 #
-# Encrypted data fields (also used for keepalives):
+# Encrypted data fields (also used for ping/pong keepalives):
 #   odri    Default 1. Offset of the 4-byte receiver's local session index.
 #   odctr   Default 5. Offset of the 8-byte encryption counter/nonce value.
 #   odf     Default 13. Offset of the 1-byte flags bitset. Bit 0 (value 1)
-#           marks a keepalive or junk packet; ordinary data uses zero flags.
+#           marks junk, bit 1 (2) marks ping, and bit 2 (4) marks pong.
+#           Ordinary data uses zero flags. Keepalives send ping and receive pong.
 #   oddl    Default 14. Offset of the 4-byte ciphertext length in bytes,
 #           including the authentication tag, excluding headers and padding.
 #   odd     Default 18. Start of the variable-length encrypted payload,
@@ -83,7 +84,7 @@ PrivateKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 # unless that peer overrides the corresponding value independently.
 Timeout = 28          # Idle lifetime since the last authenticated received packet.
 MaxAge = 300          # Absolute session lifetime, even while traffic is active.
-Keepalive = 10        # Base keepalive interval; received traffic resets its deadline.
+Keepalive = 10        # Base interval between sends; outgoing data or pong resets the deadline.
 KeepaliveJitter = 3   # Uniform +/- jitter: defaults give 7..13 seconds.
 # The effective keepalive interval is clamped to at least one second.
 # Timeout = 0 disables idle expiry; MaxAge = 0 disables age-based expiry.

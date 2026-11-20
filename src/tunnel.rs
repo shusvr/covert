@@ -183,6 +183,7 @@ impl Tunnel {
                     established,
                     last_seen: seen,
                     receiver_idx,
+                    next_ka,
                     ..
                 } = &mut self.state
                 {
@@ -226,6 +227,8 @@ impl Tunnel {
                                 ciphertext,
                             };
                             self.outbound.push_back(Packet::Data(data));
+                            *next_ka = now + Duration::from_millis(self.liveness.next_ka());
+
                             trace!("Received ping, replying with pong");
                         } else if !flags.intersects(DataFlags::JUNK | DataFlags::PONG) {
                             self.decrypted.push_back(plaintext);
@@ -375,10 +378,13 @@ impl Tunnel {
                         let (counter, ciphertext) = cipher
                             .encrypt(Vec::with_capacity(16))
                             .inspect_err(|err| warn!(%err, "Failed to encrypt keepalive"))?;
-                        trace!(receiver_idx = *receiver_idx, counter, "Queued keepalive");
+                        trace!(
+                            receiver_idx = *receiver_idx,
+                            counter, "Queued keepalive ping"
+                        );
                         let data = Data {
                             receiver_idx: *receiver_idx,
-                            flags: DataFlags::JUNK,
+                            flags: DataFlags::PING,
                             counter,
                             ciphertext,
                         };
