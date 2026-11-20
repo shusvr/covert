@@ -1,9 +1,9 @@
 use crate::network;
 use anyhow::{Context, Result};
 use covert::{
-    codec::{Packet, PacketLayout},
+    codec::Packet,
     config::{Config, ListenerConfig, Peer, PeerTransport},
-    transport::{Adapter, Endpoint, UdpListenerConfig, encode_datagram},
+    transport::{Adapter, DatagramCodec, Endpoint, UdpListenerConfig},
 };
 use std::{
     net::{Ipv4Addr, SocketAddr},
@@ -40,8 +40,7 @@ impl Adapter for UdpAdapter {
 
 pub struct Udp {
     socket: UdpSocket,
-    layout: PacketLayout,
-    listener: ListenerConfig,
+    framing: DatagramCodec,
 }
 impl Udp {
     pub async fn bind(
@@ -62,8 +61,7 @@ impl Udp {
         Ok((
             Self {
                 socket,
-                layout: config.layout,
-                listener: config.interface.listener.clone(),
+                framing: DatagramCodec::new(&config.interface.listener, config.layout),
             },
             endpoint,
         ))
@@ -95,7 +93,7 @@ impl network::Socket for Udp {
         let pending = std::mem::take(&mut *adapter.pending.lock().unwrap());
         let mut packets = Vec::with_capacity(pending.len());
         for (address, packet) in pending {
-            match encode_datagram(packet, &self.listener, &self.layout) {
+            match self.framing.encode(packet) {
                 Ok(bytes) => packets.push((address, bytes)),
                 Err(covert::Error::PacketOverflow) => {
                     trace!(%address, "Discarding oversized outbound datagram");

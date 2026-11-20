@@ -1,6 +1,7 @@
 use super::*;
 use crate::{
-    codec::{Data, DataFlags},
+    Error,
+    codec::{self, Data, DataFlags},
     config::{DEFAULT_FWMARK, Interface, ListenerConfig, PeerTransport},
     crypto,
 };

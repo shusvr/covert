@@ -1,10 +1,10 @@
-//! Fixed-remote client endpoint: the host owns sockets and transport framing.
+//! Fixed-remote client endpoint: the host owns sockets and outer IP/ICMP headers.
 use super::*;
 use crate::codec::{Packet, PacketLayout};
 use crate::config::DEFAULT_FWMARK;
 use crate::{
     config::{Config, Interface, ListenerConfig, LivenessOptions, Peer, PeerTransport},
-    transport::{Adapter, Endpoint, UdpListenerConfig, encode_datagram},
+    transport::{Adapter, DatagramCodec, Endpoint, UdpListenerConfig},
 };
 use std::{collections::VecDeque, sync::Mutex};
 
@@ -28,8 +28,7 @@ impl Adapter for Frames {
 /// Opaque single-peer endpoint, independent of Android, sockets and JNI.
 pub struct ClientEndpoint {
     endpoint: Endpoint<Frames>,
-    layout: PacketLayout,
-    listener: ListenerConfig,
+    framing: DatagramCodec,
 }
 #[repr(C)]
 pub struct EndpointStatus {
@@ -165,10 +164,7 @@ pub unsafe extern "C" fn covert_endpoint_read_outbound(
             .unwrap()
             .pop_front()
             .ok_or(Error::Empty)?;
-        output(
-            out,
-            encode_datagram(packet, &client.listener, &client.layout)?.to_vec(),
-        );
+        output(out, client.framing.encode(packet)?.to_vec());
         Ok(())
     })
 }
@@ -209,18 +205,13 @@ pub unsafe extern "C" fn covert_endpoint_status(
 }
 
 fn from_engine(config: Config, echo_reply_client: bool) -> Result<ClientEndpoint> {
-    let layout = config.layout;
-    let listener = config.interface.listener.clone();
+    let framing = DatagramCodec::new(&config.interface.listener, config.layout);
     let adapter = Frames {
         outbound: Mutex::new(VecDeque::new()),
         echo_reply_client,
     };
     let endpoint = Endpoint::new(adapter, config)?;
-    Ok(ClientEndpoint {
-        endpoint,
-        layout,
-        listener,
-    })
+    Ok(ClientEndpoint { endpoint, framing })
 }
 
 #[unsafe(no_mangle)]

@@ -1,6 +1,6 @@
 use super::*;
 use crate::network::tests::{self as harness, Node, connected, packet, receive};
-use covert::codec;
+use covert::codec::{self, PacketLayout};
 use covert::{
     codec::{Data, DataFlags},
     tunnel::Tunnel,

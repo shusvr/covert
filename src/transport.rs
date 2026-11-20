@@ -1,6 +1,6 @@
-use crate::{Error, Result};
+use crate::Result;
 use crate::{
-    codec::{self, Packet},
+    codec::Packet,
     config::{Config, Peer},
     state::State,
     tunnel::{DecodedInitiation, Tunnel},
@@ -11,23 +11,12 @@ use tracing::error;
 use uuid::Uuid;
 
 mod config;
+mod framing;
 mod quic;
 pub use crate::state::{PeerStatus, StatusSnapshot};
 pub use config::*;
-pub(crate) use quic::DATA_OVERHEAD as QUIC_DATA_OVERHEAD;
-
-/// Serialize an outbound packet for the selected interface transport.
-pub fn encode_datagram(
-    packet: Packet,
-    listener: &crate::config::ListenerConfig,
-    layout: &codec::PacketLayout,
-) -> Result<bytes::Bytes> {
-    if matches!(listener, crate::config::ListenerConfig::Quic { .. }) {
-        quic::encode(packet, layout)
-    } else {
-        packet.to_bytes(layout)
-    }
-}
+pub(crate) use framing::QUIC_DATA_OVERHEAD;
+pub use framing::{DatagramCodec, encode_datagram};
 
 pub trait Adapter {
     type Route: Clone;
@@ -67,6 +56,7 @@ pub trait Adapter {
 pub struct Endpoint<A: Adapter> {
     adapter: A,
     config: Config,
+    framing: DatagramCodec,
     state: State,
     peers: HashMap<Uuid, PeerTunnel<A::Route>>,
 }
@@ -84,6 +74,7 @@ impl<A: Adapter> Endpoint<A> {
                 .filter(|peer| adapter.supports_peer(peer))
                 .map(|p| PeerTunnel::new(&config, p, adapter.peer_route(p)).map(|x| (p.id, x)))
                 .collect::<Result<HashMap<_, _>>>()?,
+            framing: DatagramCodec::new(&config.interface.listener, config.layout),
             config,
             adapter,
             state,
@@ -126,14 +117,11 @@ impl<A: Adapter> Endpoint<A> {
 
     /// Write incoming frames. QUIC-shaped framing requires a single UDP datagram.
     pub fn out_write(&mut self, route: A::Route, mut buf: &[u8]) {
-        if matches!(
-            self.config.interface.listener,
-            crate::config::ListenerConfig::Quic { .. }
-        ) {
+        if !self.framing.supports_concatenation() {
             self.out_write_datagram(route, buf);
             return;
         }
-        while let Some(res) = codec::parse_slice(buf, &self.config.layout) {
+        while let Some(res) = self.framing.decode_raw_prefix(buf) {
             match res {
                 Ok((packet, len)) => {
                     if let Err(err) = self.process_incoming(route.clone(), packet) {
@@ -160,18 +148,8 @@ impl<A: Adapter> Endpoint<A> {
 
     /// Process one datagram, reporting whether it was authenticated and accepted.
     pub fn process_datagram(&mut self, route: A::Route, buf: &[u8]) -> Result<bool> {
-        if matches!(
-            self.config.interface.listener,
-            crate::config::ListenerConfig::Quic { .. }
-        ) {
-            return self.process_incoming(route, quic::decode(buf, &self.config.layout)?);
-        }
-        match codec::parse_slice(buf, &self.config.layout) {
-            Some(Ok((packet, consumed))) if consumed == buf.len() => {
-                self.process_incoming(route, packet)
-            }
-            _ => Err(Error::MalformedDatagram),
-        }
+        let packet = self.framing.decode(buf)?;
+        self.process_incoming(route, packet)
     }
 
     pub fn advance(&mut self) {

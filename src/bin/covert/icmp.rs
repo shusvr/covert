@@ -2,9 +2,9 @@ use crate::network;
 use anyhow::Result;
 use bytes::BytesMut;
 use covert::{
-    codec::{self, Packet, PacketLayout},
+    codec::{Packet, PacketLayout},
     config::{Config, Peer, PeerTransport},
-    transport::{Adapter, Endpoint, IcmpListenerConfig, IcmpMode},
+    transport::{Adapter, DatagramCodec, Endpoint, IcmpListenerConfig, IcmpMode},
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
@@ -50,9 +50,8 @@ impl IcmpRoute {
     }
 }
 
-
 struct EchoEncoder {
-    layout: PacketLayout,
+    framing: DatagramCodec,
     id: u16,
     mode: IcmpMode,
     sequence: u16,
@@ -62,7 +61,7 @@ struct EchoEncoder {
 impl EchoEncoder {
     fn new(layout: PacketLayout, listener: &IcmpListenerConfig) -> Self {
         Self {
-            layout,
+            framing: DatagramCodec::raw(layout),
             id: fastrand::u16(1..=u16::MAX),
             mode: listener.mode,
             sequence: 0,
@@ -75,7 +74,7 @@ impl EchoEncoder {
         let kind = route.echo_type(initiating, self.id, &mut self.sequence);
         self.buffer.clear();
         self.buffer.resize(8, 0);
-        codec::append(&mut self.buffer, packet, &self.layout)?;
+        self.framing.append(&mut self.buffer, packet)?;
         let header = etherparse::Icmpv4Header::with_checksum(kind, &self.buffer[8..]);
         self.buffer[..8].copy_from_slice(&header.to_bytes());
         Ok(&self.buffer)
